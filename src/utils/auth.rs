@@ -882,8 +882,8 @@ pub fn get_auth_token_source() -> AuthTokenSourceStatus {
         };
     }
 
-    if crate::utils::process_env::var("ANTHROPIC_AUTH_TOKEN")
-        .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
+    if std::env::var("ANTHROPIC_AUTH_TOKEN")
+        .ok()
         .is_some_and(|token| !token.is_empty())
         && !is_managed_oauth_context()
     {
@@ -967,7 +967,7 @@ pub fn get_anthropic_api_key_with_source(
     opts: GetAnthropicApiKeyOptions,
 ) -> AnthropicApiKeyWithSource {
     let config = crate::utils::config::load_global_config();
-    let get_env = |key: &str| crate::utils::process_env::var(key).or_else(|| std::env::var(key).ok());
+    let get_env = |key: &str| std::env::var(key).ok();
     if crate::utils::env_utils::is_bare_mode() {
         if let Some(api_key) = env_value(&get_env, "ANTHROPIC_API_KEY") {
             return AnthropicApiKeyWithSource {
@@ -1087,8 +1087,8 @@ pub fn is_anthropic_auth_enabled() -> bool {
     ) || crate::utils::env_utils::is_env_truthy(
         std::env::var("CLAUDE_CODE_USE_FOUNDRY").ok().as_deref(),
     );
-    let has_external_auth_token = crate::utils::process_env::var("ANTHROPIC_AUTH_TOKEN")
-        .or_else(|| std::env::var("ANTHROPIC_AUTH_TOKEN").ok())
+    let has_external_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
+        .ok()
         .is_some_and(|value| !value.is_empty())
         || get_configured_api_key_helper().is_some()
         || std::env::var("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR")
