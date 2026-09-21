@@ -133,7 +133,9 @@ pub fn is_project_config_key(key: &str) -> bool {
 // ════════════════════════════════════════════════════════════
 
 pub fn get_config_home() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+    if let Some(dir) = crate::utils::process_env::var("CLAUDE_CONFIG_DIR")
+        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
+    {
         PathBuf::from(dir)
     } else if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(".claude")
@@ -145,7 +147,9 @@ pub fn get_config_home() -> PathBuf {
 }
 
 fn get_global_config_file_home() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+    if let Some(dir) = crate::utils::process_env::var("CLAUDE_CONFIG_DIR")
+        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
+    {
         PathBuf::from(dir)
     } else if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home)

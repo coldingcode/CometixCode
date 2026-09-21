@@ -24,14 +24,14 @@ pub struct DiscoveredModel {
     pub description: Option<String>,
 }
 
-/// Contents of `~/.claude/setting_proxy_active.json`.
+/// Contents of `~/.claude/settings_proxy_active.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProxyActiveConfig {
     /// Identifier of the currently active channel, e.g. `Some("cpa")` or `None` (native).
     pub active: Option<String>,
 }
 
-/// Contents of `~/.claude/setting_<id>.json`.
+/// Contents of `~/.claude/settings_<id>.json`.
 /// Follows Style B: an `env` override block matching `settings.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelConfigFile {
@@ -40,7 +40,7 @@ pub struct ChannelConfigFile {
     pub env: IndexMap<String, String>,
 }
 
-/// Contents of `~/.claude/setting_<id>_models.json`.
+/// Contents of `~/.claude/settings_<id>_models.json`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChannelModelsCache {
     /// Base URL with which this cache was queried.

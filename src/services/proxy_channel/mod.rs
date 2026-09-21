@@ -10,11 +10,13 @@ pub mod other;
 pub mod traits;
 pub mod types;
 
-pub use active_env::{PROXY_MANAGED_ENV_KEYS, apply_active_channel_env, deactivate_active_channel_env};
+pub use active_env::{
+    activate_channel, deactivate_channel, update_active_settings_env, PROXY_MANAGED_ENV_KEYS,
+};
 pub use config::{
     active_proxy_path, channel_config_path, channel_models_cache_path, get_active_channel_id,
-    load_channel_config, load_channel_models_cache, save_channel_config, save_channel_models_cache,
-    set_active_channel_id, update_channel_env,
+    load_channel_config, load_channel_models_cache, origin_settings_path, save_channel_config,
+    save_channel_models_cache, set_active_channel_id, update_channel_env, user_settings_path,
 };
 pub use traits::ProxyChannel;
 pub use types::{ChannelConfigFile, ChannelModelsCache, DiscoveredModel, Endpoints, ProxyActiveConfig};

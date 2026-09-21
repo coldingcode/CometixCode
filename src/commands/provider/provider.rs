@@ -5,9 +5,8 @@ use tracing::warn;
 
 use crate::commands::Command;
 use crate::services::proxy_channel::{
-    all_channels, apply_active_channel_env, deactivate_active_channel_env, get_active_channel_id,
-    get_channel, load_channel_config, save_channel_config, save_channel_models_cache,
-    set_active_channel_id, update_channel_env, ChannelConfigFile, ChannelModelsCache,
+    activate_channel, deactivate_channel, get_active_channel_id, get_channel, load_channel_config,
+    save_channel_config, save_channel_models_cache, ChannelConfigFile, ChannelModelsCache,
 };
 use crate::tool::ToolUseContext;
 use crate::types::message::{RenderableMessage, RenderableMessageKind, SystemMessage};
@@ -17,7 +16,7 @@ use uuid::Uuid;
 pub const NAME: &str = "provider";
 pub const DESCRIPTION: &str =
     "Manage AI proxy channels (e.g. /provider cpa, /provider off, /provider status)";
-pub const ARGUMENT_HINT: &str = "[cpa|off|status] [base_url] [api_key]";
+pub const ARGUMENT_HINT: &str = "[cpa|off|status] [base_url] [auth_token]";
 
 /// Dispatches `/provider` command execution.
 pub fn call(
@@ -39,10 +38,9 @@ fn handle_provider_command(args: &str) -> String {
     let sub = tokens[0].to_ascii_lowercase();
     match sub.as_str() {
         "off" | "disable" | "none" | "stop" => {
-            if let Err(e) = set_active_channel_id(None) {
+            if let Err(e) = deactivate_channel() {
                 return format!("Failed to deactivate proxy channel: {e}");
             }
-            deactivate_active_channel_env();
             "Proxy channels deactivated. Reverted to direct official API configuration.".to_string()
         }
         "refresh" => {
@@ -59,7 +57,8 @@ fn handle_provider_command(args: &str) -> String {
                 .unwrap_or_default();
             let key = cfg
                 .env
-                .get("ANTHROPIC_API_KEY")
+                .get("ANTHROPIC_AUTH_TOKEN")
+                .or_else(|| cfg.env.get("ANTHROPIC_API_KEY"))
                 .cloned()
                 .unwrap_or_default();
             if let Some(channel) = get_channel(&active_id) {
@@ -82,7 +81,8 @@ fn handle_provider_command(args: &str) -> String {
                     .unwrap_or_default();
                 let key = cfg
                     .env
-                    .get("ANTHROPIC_API_KEY")
+                    .get("ANTHROPIC_AUTH_TOKEN")
+                    .or_else(|| cfg.env.get("ANTHROPIC_API_KEY"))
                     .cloned()
                     .unwrap_or_default();
                 if let Some(channel) = get_channel(channel_id) {
@@ -101,10 +101,10 @@ fn handle_provider_command(args: &str) -> String {
             let channel_opt = get_channel(channel_id);
             let display_name = channel_opt.map(|c| c.display_name()).unwrap_or(channel_id);
 
-            // Case A: User supplied connection arguments: `/provider <id> <base_url> [api_key]`
+            // Case A: User supplied connection arguments: `/provider <id> <base_url> [auth_token]`
             if tokens.len() >= 2 {
                 let base_url_input = tokens[1];
-                let api_key_input = tokens.get(2).copied().unwrap_or("");
+                let auth_token_input = tokens.get(2).copied().unwrap_or("");
 
                 let endpoints = if let Some(channel) = channel_opt {
                     match channel.normalize_endpoints(base_url_input) {
@@ -129,8 +129,8 @@ fn handle_provider_command(args: &str) -> String {
                     "ANTHROPIC_BASE_URL".to_string(),
                     endpoints.inference_base_url.clone(),
                 );
-                if !api_key_input.is_empty() {
-                    env.insert("ANTHROPIC_API_KEY".to_string(), api_key_input.to_string());
+                if !auth_token_input.is_empty() {
+                    env.insert("ANTHROPIC_AUTH_TOKEN".to_string(), auth_token_input.to_string());
                 }
 
                 // Preserve existing model mappings if present
@@ -152,14 +152,12 @@ fn handle_provider_command(args: &str) -> String {
                     return format!("Failed to save channel configuration: {e}");
                 }
 
-                if let Err(e) = set_active_channel_id(Some(channel_id)) {
+                if let Err(e) = activate_channel(channel_id) {
                     return format!("Failed to activate channel: {e}");
                 }
 
-                apply_active_channel_env();
-
                 // Spawn background model discovery if channel implementation is present
-                trigger_background_models_refresh(channel_id.to_string(), endpoints.clone(), api_key_input.to_string());
+                trigger_background_models_refresh(channel_id.to_string(), endpoints.clone(), auth_token_input.to_string());
 
                 format!(
                     "Proxy channel '{display_name}' ({channel_id}) configured and activated!\n  • Inference Base URL: {}\n  • Syncing model catalog in background...",
@@ -174,15 +172,19 @@ fn handle_provider_command(args: &str) -> String {
                         .cloned()
                         .unwrap_or_else(|| "(not set)".to_string());
 
-                    if let Err(e) = set_active_channel_id(Some(channel_id)) {
+                    if let Err(e) = activate_channel(channel_id) {
                         return format!("Failed to activate channel: {e}");
                     }
-                    apply_active_channel_env();
 
                     // Trigger background refresh with existing credentials
                     if let Some(channel) = channel_opt {
                         if let Ok(ep) = channel.normalize_endpoints(&base_url) {
-                            let key = config.env.get("ANTHROPIC_API_KEY").cloned().unwrap_or_default();
+                            let key = config
+                                .env
+                                .get("ANTHROPIC_AUTH_TOKEN")
+                                .or_else(|| config.env.get("ANTHROPIC_API_KEY"))
+                                .cloned()
+                                .unwrap_or_default();
                             trigger_background_models_refresh(channel_id.to_string(), ep, key);
                         }
                     }
@@ -195,7 +197,7 @@ fn handle_provider_command(args: &str) -> String {
                         .map(|c| c.default_base_url())
                         .unwrap_or("http://127.0.0.1:8317");
                     format!(
-                        "Channel '{display_name}' ({channel_id}) is not configured yet.\n\nQuick setup & activate syntax:\n  /provider {channel_id} <base_url> <api_key>\n\nExample:\n  /provider {channel_id} {default_url} your-api-key"
+                        "Channel '{display_name}' ({channel_id}) is not configured yet.\n\nQuick setup & activate syntax:\n  /provider {channel_id} <base_url> <auth_token>\n\nExample:\n  /provider {channel_id} {default_url} your-auth-token"
                     )
                 }
             }
@@ -203,29 +205,31 @@ fn handle_provider_command(args: &str) -> String {
     }
 }
 
-fn trigger_background_models_refresh(channel_id: String, ep: crate::services::proxy_channel::types::Endpoints, api_key: String) {
-    tokio::spawn(async move {
-        if let Some(channel) = get_channel(&channel_id) {
-            match channel.fetch_models(&ep, &api_key).await {
-                Ok(models) => {
-                    let fetched_at = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as u64)
-                        .unwrap_or(0);
+fn trigger_background_models_refresh(channel_id: String, ep: crate::services::proxy_channel::types::Endpoints, auth_token: String) {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            if let Some(channel) = get_channel(&channel_id) {
+                match channel.fetch_models(&ep, &auth_token).await {
+                    Ok(models) => {
+                        let fetched_at = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
 
-                    let cache = ChannelModelsCache {
-                        base_url: ep.inference_base_url.clone(),
-                        fetched_at,
-                        models,
-                    };
-                    let _ = save_channel_models_cache(&channel_id, &cache);
-                }
-                Err(err) => {
-                    warn!("Background fetch models for '{channel_id}' failed: {err}");
+                        let cache = ChannelModelsCache {
+                            base_url: ep.inference_base_url.clone(),
+                            fetched_at,
+                            models,
+                        };
+                        let _ = save_channel_models_cache(&channel_id, &cache);
+                    }
+                    Err(err) => {
+                        warn!("Background fetch models for '{channel_id}' failed: {err}");
+                    }
                 }
             }
-        }
-    });
+        });
+    }
 }
 
 fn render_status_view() -> String {
@@ -240,6 +244,9 @@ fn render_status_view() -> String {
             if let Some(cfg) = load_channel_config(id) {
                 let base = cfg.env.get("ANTHROPIC_BASE_URL").map(|s| s.as_str()).unwrap_or("(not set)");
                 out.push_str(&format!("  • Inference Base URL: {base}\n"));
+
+                let has_token = cfg.env.contains_key("ANTHROPIC_AUTH_TOKEN") || cfg.env.contains_key("ANTHROPIC_API_KEY");
+                out.push_str(&format!("  • Auth Token        : {}\n", if has_token { "(configured)" } else { "(not set)" }));
 
                 let sonnet = cfg.env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").map(|s| s.as_str()).unwrap_or("(default)");
                 let sonnet_1m = cfg.env.get("ANTHROPIC_DEFAULT_SONNET_1M_MODEL").map(|s| s.as_str()).unwrap_or("(follows Sonnet[1m])");
@@ -261,12 +268,12 @@ fn render_status_view() -> String {
     }
 
     out.push_str("\nAvailable commands:\n");
-    out.push_str("  /provider cpa                      - Activate CLIProxyAPI (shows setup syntax if unconfigured)\n");
-    out.push_str("  /provider cpa <base_url> <api_key> - Configure and activate CLIProxyAPI\n");
-    out.push_str("  /provider refresh                  - Refresh remote model catalog for active channel\n");
-    out.push_str("  /provider other                    - Activate generic / other proxy channel\n");
-    out.push_str("  /provider off                      - Deactivate all proxies and revert to direct official API\n");
-    out.push_str("  /model                             - Select model or press M / Tab to remap tier models\n");
+    out.push_str("  /provider cpa                        - Activate CLIProxyAPI (shows setup syntax if unconfigured)\n");
+    out.push_str("  /provider cpa <base_url> <auth_token> - Configure and activate CLIProxyAPI\n");
+    out.push_str("  /provider refresh                    - Refresh remote model catalog for active channel\n");
+    out.push_str("  /provider other                      - Activate generic / other proxy channel\n");
+    out.push_str("  /provider off                        - Deactivate all proxies and revert to direct official API\n");
+    out.push_str("  /model                               - Select model or press M / Tab to remap tier models\n");
 
     out
 }
@@ -328,6 +335,7 @@ mod tests {
 
     #[test]
     fn test_handle_provider_off() {
+        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
         let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
@@ -338,6 +346,7 @@ mod tests {
 
     #[test]
     fn test_handle_provider_status() {
+        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
         let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
@@ -348,10 +357,11 @@ mod tests {
 
     #[test]
     fn test_handle_provider_configure_and_activate() {
+        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
         let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
-        let res = handle_provider_command("cpa http://127.0.0.1:8317 12345");
+        let res = handle_provider_command("cpa http://127.0.0.1:8317 your-token");
         assert!(res.contains("configured and activated"));
         assert_eq!(get_active_channel_id(), Some("cpa".to_string()));
 
@@ -360,6 +370,9 @@ mod tests {
             cfg.env.get("ANTHROPIC_BASE_URL"),
             Some(&"http://127.0.0.1:8317".to_string())
         );
-        assert_eq!(cfg.env.get("ANTHROPIC_API_KEY"), Some(&"12345".to_string()));
+        assert_eq!(
+            cfg.env.get("ANTHROPIC_AUTH_TOKEN"),
+            Some(&"your-token".to_string())
+        );
     }
 }

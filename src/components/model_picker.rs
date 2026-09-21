@@ -914,6 +914,9 @@ pub(crate) fn ModelPicker<'a>(
                                 active_id,
                                 &[(env_key, &chosen.id)],
                             );
+                            let _ = crate::services::proxy_channel::update_active_settings_env(
+                                &[(env_key, &chosen.id)],
+                            );
                             crate::utils::process_env::set(env_key, &chosen.id);
                         }
                     }
