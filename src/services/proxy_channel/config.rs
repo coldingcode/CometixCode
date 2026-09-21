@@ -96,9 +96,26 @@ pub fn save_channel_models_cache(id: &str, cache: &ChannelModelsCache) -> Result
 mod tests {
     use super::*;
 
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("cometix-config-test-{}", uuid::Uuid::new_v4().simple()));
+            let _ = std::fs::create_dir_all(&path);
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn test_active_proxy_round_trip() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = TestDir::new();
         let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         assert_eq!(get_active_channel_id(), None);
@@ -112,7 +129,7 @@ mod tests {
 
     #[test]
     fn test_channel_config_and_env_update() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = TestDir::new();
         let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         assert!(load_channel_config("cpa").is_none());

@@ -35,11 +35,6 @@ pub fn apply_active_channel_env() {
     info!("Applying proxy channel '{active_id}' environment variable overrides");
     for (key, value) in &config.env {
         crate::utils::process_env::set(key, value);
-        // SAFETY: Synchronization into the OS environment so callers reading `std::env::var`
-        // directly (e.g. client.rs and truthy_env_var) observe the overridden values on all platforms.
-        unsafe {
-            std::env::set_var(key, value);
-        }
     }
 
     // Non-blocking background model catalog refresh on startup / reactivation if runtime is active
@@ -79,9 +74,6 @@ pub fn apply_active_channel_env() {
 pub fn deactivate_active_channel_env() {
     for key in PROXY_MANAGED_ENV_KEYS {
         crate::utils::process_env::remove(key);
-        unsafe {
-            std::env::remove_var(key);
-        }
     }
     // Reapply native environment variables from settings.json
     crate::utils::managed_env::apply_safe_config_environment_variables();
@@ -92,10 +84,27 @@ mod tests {
     use super::*;
     use crate::services::proxy_channel::config::{set_active_channel_id, update_channel_env};
 
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("cometix-active-env-test-{}", uuid::Uuid::new_v4().simple()));
+            let _ = std::fs::create_dir_all(&path);
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn test_apply_and_deactivate_active_channel_env() {
         let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = TestDir::new();
         let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         // Setup channel config

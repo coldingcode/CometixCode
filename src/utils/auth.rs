@@ -967,7 +967,7 @@ pub fn get_anthropic_api_key_with_source(
     opts: GetAnthropicApiKeyOptions,
 ) -> AnthropicApiKeyWithSource {
     let config = crate::utils::config::load_global_config();
-    let get_env = |key: &str| std::env::var(key).ok();
+    let get_env = |key: &str| crate::utils::process_env::var(key).or_else(|| std::env::var(key).ok());
     if crate::utils::env_utils::is_bare_mode() {
         if let Some(api_key) = env_value(&get_env, "ANTHROPIC_API_KEY") {
             return AnthropicApiKeyWithSource {

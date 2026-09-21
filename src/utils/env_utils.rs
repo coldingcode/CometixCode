@@ -200,7 +200,10 @@ impl Drop for PinnedProjectDir {
 /// carrier with no single CC function — the `||` operator is the source.
 /// Use this instead of `env::var(..).ok()` when porting those shapes.
 pub fn truthy_env_var(key: &str) -> Option<String> {
-    truthy_env_value(std::env::var(key).ok())
+    truthy_env_value(
+        crate::utils::process_env::var(key)
+            .or_else(|| std::env::var(key).ok()),
+    )
 }
 
 /// Value-level companion to [`truthy_env_var`] for call sites that read the

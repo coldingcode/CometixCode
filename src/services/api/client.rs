@@ -447,7 +447,7 @@ pub async fn get_anthropic_client(
                 ) {
                 Some(crate::constants::oauth::get_oauth_config()?.base_api_url)
             } else {
-                env::var("ANTHROPIC_BASE_URL").ok()
+                crate::utils::process_env::var("ANTHROPIC_BASE_URL").or_else(|| env::var("ANTHROPIC_BASE_URL").ok())
             };
 
             Ok(AnthropicClientHandle {

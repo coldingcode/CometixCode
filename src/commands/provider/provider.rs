@@ -40,17 +40,17 @@ fn handle_provider_command(args: &str) -> String {
     match sub.as_str() {
         "off" | "disable" | "none" | "stop" => {
             if let Err(e) = set_active_channel_id(None) {
-                return format!("❌ 停用代理渠道失败: {e}");
+                return format!("Failed to deactivate proxy channel: {e}");
             }
             deactivate_active_channel_env();
-            "✓ 所有代理渠道已停用，已切回原生直连配置。".to_string()
+            "Proxy channels deactivated. Reverted to direct official API configuration.".to_string()
         }
         "refresh" => {
             let Some(active_id) = get_active_channel_id() else {
-                return "ℹ 当前未激活任何代理渠道，无需刷新。".to_string();
+                return "No active proxy channel to refresh.".to_string();
             };
             let Some(cfg) = load_channel_config(&active_id) else {
-                return format!("❌ 活跃渠道 '{active_id}' 无配置文件。");
+                return format!("Active channel '{active_id}' has no configuration file.");
             };
             let base = cfg
                 .env
@@ -66,12 +66,12 @@ fn handle_provider_command(args: &str) -> String {
                 if let Ok(ep) = channel.normalize_endpoints(&base) {
                     trigger_background_models_refresh(channel.id().to_string(), ep.clone(), key);
                     return format!(
-                        "✓ 已触发渠道 '{active_id}' 的模型刷新 ({})，正在后台更新...",
+                        "Triggered model catalog refresh for '{active_id}' ({}), updating in background...",
                         ep.models_url
                     );
                 }
             }
-            "❌ 刷新模型失败：无法解析当前渠道端点。".to_string()
+            "Failed to refresh models: unable to resolve channel endpoints.".to_string()
         }
         channel_id if tokens.len() == 2 && tokens[1].eq_ignore_ascii_case("refresh") => {
             if let Some(cfg) = load_channel_config(channel_id) {
@@ -89,13 +89,13 @@ fn handle_provider_command(args: &str) -> String {
                     if let Ok(ep) = channel.normalize_endpoints(&base) {
                         trigger_background_models_refresh(channel.id().to_string(), ep.clone(), key);
                         return format!(
-                            "✓ 已触发渠道 '{channel_id}' 的模型刷新 ({})，正在后台更新...",
+                            "Triggered model catalog refresh for '{channel_id}' ({}), updating in background...",
                             ep.models_url
                         );
                     }
                 }
             }
-            format!("❌ 刷新模型失败：渠道 '{channel_id}' 未配置或端点无效。")
+            format!("Failed to refresh models: channel '{channel_id}' is not configured or endpoints are invalid.")
         }
         channel_id => {
             let channel_opt = get_channel(channel_id);
@@ -109,7 +109,7 @@ fn handle_provider_command(args: &str) -> String {
                 let endpoints = if let Some(channel) = channel_opt {
                     match channel.normalize_endpoints(base_url_input) {
                         Ok(ep) => ep,
-                        Err(e) => return format!("❌ Base URL 解析失败: {e}"),
+                        Err(e) => return format!("Failed to parse base URL: {e}"),
                     }
                 } else {
                     let raw = base_url_input.trim_end_matches('/');
@@ -149,11 +149,11 @@ fn handle_provider_command(args: &str) -> String {
                 }
 
                 if let Err(e) = save_channel_config(channel_id, &ChannelConfigFile { env }) {
-                    return format!("❌ 保存渠道配置失败: {e}");
+                    return format!("Failed to save channel configuration: {e}");
                 }
 
                 if let Err(e) = set_active_channel_id(Some(channel_id)) {
-                    return format!("❌ 激活渠道失败: {e}");
+                    return format!("Failed to activate channel: {e}");
                 }
 
                 apply_active_channel_env();
@@ -162,7 +162,7 @@ fn handle_provider_command(args: &str) -> String {
                 trigger_background_models_refresh(channel_id.to_string(), endpoints.clone(), api_key_input.to_string());
 
                 format!(
-                    "✓ 代理渠道 '{display_name}' ({channel_id}) 已保存并激活！\n  • 基础地址: {}\n  • 正在后台同步模型列表...",
+                    "Proxy channel '{display_name}' ({channel_id}) configured and activated!\n  • Inference Base URL: {}\n  • Syncing model catalog in background...",
                     endpoints.inference_base_url
                 )
             } else {
@@ -172,10 +172,10 @@ fn handle_provider_command(args: &str) -> String {
                         .env
                         .get("ANTHROPIC_BASE_URL")
                         .cloned()
-                        .unwrap_or_else(|| "未指定".to_string());
+                        .unwrap_or_else(|| "(not set)".to_string());
 
                     if let Err(e) = set_active_channel_id(Some(channel_id)) {
-                        return format!("❌ 激活渠道失败: {e}");
+                        return format!("Failed to activate channel: {e}");
                     }
                     apply_active_channel_env();
 
@@ -188,14 +188,14 @@ fn handle_provider_command(args: &str) -> String {
                     }
 
                     format!(
-                        "✓ 已激活代理渠道 '{display_name}' ({channel_id})。\n  • 当前地址: {base_url}\n  • 如需修改模型档位映射，请在 /model 界面中操作。"
+                        "Activated proxy channel '{display_name}' ({channel_id}).\n  • Base URL: {base_url}\n  • To remap tier models, use /model."
                     )
                 } else {
                     let default_url = channel_opt
                         .map(|c| c.default_base_url())
                         .unwrap_or("http://127.0.0.1:8317");
                     format!(
-                        "ℹ 渠道 '{display_name}' ({channel_id}) 尚未配置。\n\n请按如下格式快速配置并激活：\n  /provider {channel_id} <base_url> <api_key>\n\n示例：\n  /provider {channel_id} {default_url} 12345"
+                        "Channel '{display_name}' ({channel_id}) is not configured yet.\n\nQuick setup & activate syntax:\n  /provider {channel_id} <base_url> <api_key>\n\nExample:\n  /provider {channel_id} {default_url} your-api-key"
                     )
                 }
             }
@@ -231,23 +231,23 @@ fn trigger_background_models_refresh(channel_id: String, ep: crate::services::pr
 fn render_status_view() -> String {
     let active_id = get_active_channel_id();
     let mut out = String::new();
-    out.push_str("=== 代理渠道状态看板 ===\n");
+    out.push_str("=== Proxy Channel Status ===\n");
 
     match &active_id {
         Some(id) => {
             let channel_name = get_channel(id).map(|c| c.display_name()).unwrap_or(id.as_str());
-            out.push_str(&format!("● 当前激活渠道: {channel_name} ({id})\n"));
+            out.push_str(&format!("● Active channel: {channel_name} ({id})\n"));
             if let Some(cfg) = load_channel_config(id) {
-                let base = cfg.env.get("ANTHROPIC_BASE_URL").map(|s| s.as_str()).unwrap_or("(未设置)");
-                out.push_str(&format!("  • 推理地址 (Base URL): {base}\n"));
+                let base = cfg.env.get("ANTHROPIC_BASE_URL").map(|s| s.as_str()).unwrap_or("(not set)");
+                out.push_str(&format!("  • Inference Base URL: {base}\n"));
 
-                let sonnet = cfg.env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").map(|s| s.as_str()).unwrap_or("默认");
-                let sonnet_1m = cfg.env.get("ANTHROPIC_DEFAULT_SONNET_1M_MODEL").map(|s| s.as_str()).unwrap_or("(跟随 Sonnet[1m])");
-                let opus = cfg.env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").map(|s| s.as_str()).unwrap_or("默认");
-                let opus_1m = cfg.env.get("ANTHROPIC_DEFAULT_OPUS_1M_MODEL").map(|s| s.as_str()).unwrap_or("(跟随 Opus[1m])");
-                let haiku = cfg.env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(|s| s.as_str()).unwrap_or("默认");
+                let sonnet = cfg.env.get("ANTHROPIC_DEFAULT_SONNET_MODEL").map(|s| s.as_str()).unwrap_or("(default)");
+                let sonnet_1m = cfg.env.get("ANTHROPIC_DEFAULT_SONNET_1M_MODEL").map(|s| s.as_str()).unwrap_or("(follows Sonnet[1m])");
+                let opus = cfg.env.get("ANTHROPIC_DEFAULT_OPUS_MODEL").map(|s| s.as_str()).unwrap_or("(default)");
+                let opus_1m = cfg.env.get("ANTHROPIC_DEFAULT_OPUS_1M_MODEL").map(|s| s.as_str()).unwrap_or("(follows Opus[1m])");
+                let haiku = cfg.env.get("ANTHROPIC_DEFAULT_HAIKU_MODEL").map(|s| s.as_str()).unwrap_or("(default)");
 
-                out.push_str("  • 档位模型映射:\n");
+                out.push_str("  • Tier Model Mappings:\n");
                 out.push_str(&format!("    - Sonnet    : {sonnet}\n"));
                 out.push_str(&format!("    - Sonnet 1M : {sonnet_1m}\n"));
                 out.push_str(&format!("    - Opus      : {opus}\n"));
@@ -256,17 +256,17 @@ fn render_status_view() -> String {
             }
         }
         None => {
-            out.push_str("○ 当前激活渠道: 原生直连 (未激活代理)\n");
+            out.push_str("○ Active channel: Direct (no proxy active)\n");
         }
     }
 
-    out.push_str("\n可用指令:\n");
-    out.push_str("  /provider cpa                      - 激活 CLIProxyAPI (未配置时提示语法)\n");
-    out.push_str("  /provider cpa <base_url> <api_key> - 配置并激活 CLIProxyAPI\n");
-    out.push_str("  /provider refresh                  - 刷新当前活跃渠道的远端模型列表\n");
-    out.push_str("  /provider other                    - 激活通用或自定义代理渠道\n");
-    out.push_str("  /provider off                      - 停用所有代理，切回原生直连\n");
-    out.push_str("  /model                             - 选择模型或按 M / Tab 键修改档位模型映射\n");
+    out.push_str("\nAvailable commands:\n");
+    out.push_str("  /provider cpa                      - Activate CLIProxyAPI (shows setup syntax if unconfigured)\n");
+    out.push_str("  /provider cpa <base_url> <api_key> - Configure and activate CLIProxyAPI\n");
+    out.push_str("  /provider refresh                  - Refresh remote model catalog for active channel\n");
+    out.push_str("  /provider other                    - Activate generic / other proxy channel\n");
+    out.push_str("  /provider off                      - Deactivate all proxies and revert to direct official API\n");
+    out.push_str("  /model                             - Select model or press M / Tab to remap tier models\n");
 
     out
 }
@@ -309,33 +309,50 @@ fn format_command_result(
 mod tests {
     use super::*;
 
+    struct TestDir(std::path::PathBuf);
+    impl TestDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!("cometix-provider-test-{}", uuid::Uuid::new_v4().simple()));
+            let _ = std::fs::create_dir_all(&path);
+            Self(path)
+        }
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn test_handle_provider_off() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = TestDir::new();
         let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         let res = handle_provider_command("off");
-        assert!(res.contains("切回原生"));
+        assert!(res.contains("deactivated") || res.contains("Reverted"));
         assert_eq!(get_active_channel_id(), None);
     }
 
     #[test]
     fn test_handle_provider_status() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = TestDir::new();
         let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         let res = handle_provider_command("");
-        assert!(res.contains("代理渠道状态看板"));
-        assert!(res.contains("原生直连"));
+        assert!(res.contains("Proxy Channel Status"));
+        assert!(res.contains("Direct"));
     }
 
     #[test]
     fn test_handle_provider_configure_and_activate() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = TestDir::new();
         let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         let res = handle_provider_command("cpa http://127.0.0.1:8317 12345");
-        assert!(res.contains("已保存并激活"));
+        assert!(res.contains("configured and activated"));
         assert_eq!(get_active_channel_id(), Some("cpa".to_string()));
 
         let cfg = load_channel_config("cpa").expect("config should exist");

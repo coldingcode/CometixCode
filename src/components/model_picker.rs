@@ -67,7 +67,7 @@ pub(crate) enum RemapTier {
 impl RemapTier {
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Default => "Default (默认)",
+            Self::Default => "Default",
             Self::Sonnet => "Sonnet",
             Self::Sonnet1M => "Sonnet (1M context)",
             Self::Opus => "Opus",
@@ -179,8 +179,8 @@ pub(crate) fn model_picker_options(max_description_chars: usize) -> Vec<SelectOp
                 "Default (recommended)",
                 MODEL_NO_PREFERENCE,
                 &format!(
-                    "{} · [修改模型 (按 M / Tab)]",
-                    sonnet_mapping.as_deref().unwrap_or("Sonnet (默认)")
+                    "{} · [Press M / Tab to remap]",
+                    sonnet_mapping.as_deref().unwrap_or("Sonnet (default)")
                 ),
                 max_description_chars,
             ),
@@ -188,7 +188,7 @@ pub(crate) fn model_picker_options(max_description_chars: usize) -> Vec<SelectOp
                 "Sonnet",
                 "sonnet",
                 &format!(
-                    "{} · [修改模型 (按 M / Tab)]",
+                    "{} · [Press M / Tab to remap]",
                     sonnet_mapping.as_deref().unwrap_or("Sonnet 4.6")
                 ),
                 max_description_chars,
@@ -197,7 +197,7 @@ pub(crate) fn model_picker_options(max_description_chars: usize) -> Vec<SelectOp
                 "Sonnet (1M context)",
                 "sonnet[1m]",
                 &format!(
-                    "{} · [修改模型 (按 M / Tab)]",
+                    "{} · [Press M / Tab to remap]",
                     sonnet_1m_mapping.as_deref().unwrap_or("Sonnet 4.6 (1M)")
                 ),
                 max_description_chars,
@@ -206,7 +206,7 @@ pub(crate) fn model_picker_options(max_description_chars: usize) -> Vec<SelectOp
                 "Opus",
                 "opus",
                 &format!(
-                    "{} · [修改模型 (按 M / Tab)]",
+                    "{} · [Press M / Tab to remap]",
                     opus_mapping.as_deref().unwrap_or("Opus 4.6")
                 ),
                 max_description_chars,
@@ -215,7 +215,7 @@ pub(crate) fn model_picker_options(max_description_chars: usize) -> Vec<SelectOp
                 "Opus (1M context)",
                 "opus[1m]",
                 &format!(
-                    "{} · [修改模型 (按 M / Tab)]",
+                    "{} · [Press M / Tab to remap]",
                     opus_1m_mapping.as_deref().unwrap_or("Opus 4.6 (1M)")
                 ),
                 max_description_chars,
@@ -224,7 +224,7 @@ pub(crate) fn model_picker_options(max_description_chars: usize) -> Vec<SelectOp
                 "Haiku",
                 "haiku",
                 &format!(
-                    "{} · [修改模型 (按 M / Tab)]",
+                    "{} · [Press M / Tab to remap]",
                     haiku_mapping.as_deref().unwrap_or("Haiku 4.5")
                 ),
                 max_description_chars,
@@ -664,12 +664,12 @@ fn render_remap_tier_picker(
         View(flex_direction: FlexDirection::Column) {
             View(margin_bottom: 1u32, flex_direction: FlexDirection::Column) {
                 Text(
-                    content: format!("配置 [{}] 档位对应模型", tier.label()),
+                    content: format!("Configure model for [{}] tier", tier.label()),
                     color: theme.remember,
                     weight: Weight::Bold,
                 )
                 Text(
-                    content: "从代理渠道拉取的可用远端模型列表中点选绑定：".to_string(),
+                    content: "Select a model discovered from the active proxy channel:".to_string(),
                     dim: true,
                 )
             }
@@ -686,7 +686,7 @@ fn render_remap_tier_picker(
                 )
             }
             Text(
-                content: "↑/↓ 移动选择 · Enter 确认绑定并生效 · Esc 取消返回".to_string(),
+                content: "↑/↓ Move · Enter to map and save · Esc to cancel".to_string(),
                 dim: true,
                 italic: true,
             )
@@ -915,9 +915,6 @@ pub(crate) fn ModelPicker<'a>(
                                 &[(env_key, &chosen.id)],
                             );
                             crate::utils::process_env::set(env_key, &chosen.id);
-                            unsafe {
-                                std::env::set_var(env_key, &chosen.id);
-                            }
                         }
                     }
                     remap_tier.set(None);
