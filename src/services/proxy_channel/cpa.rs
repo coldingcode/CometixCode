@@ -63,10 +63,12 @@ impl CliProxyApiChannel {
         ep: &Endpoints,
         api_key: &str,
     ) -> Result<Vec<DiscoveredModel>> {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS))
-            .build()
-            .context("Failed to create HTTP client")?;
+        let mut builder = reqwest::Client::builder()
+            .timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS));
+        if ep.models_url.contains("127.0.0.1") || ep.models_url.contains("localhost") {
+            builder = builder.no_proxy();
+        }
+        let client = builder.build().context("Failed to create HTTP client")?;
 
         let request = client
             .get(&ep.models_url)

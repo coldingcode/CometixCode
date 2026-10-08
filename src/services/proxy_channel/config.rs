@@ -5,48 +5,48 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-use crate::utils::config::get_config_home;
+use crate::utils::env_utils::get_claude_config_home_dir;
 
 use super::types::{ChannelConfigFile, ChannelModelsCache, ProxyActiveConfig};
 
 /// Path to `~/.claude/settings_proxy_active.json`.
 pub fn active_proxy_path() -> PathBuf {
-    get_config_home().join("settings_proxy_active.json")
+    get_claude_config_home_dir().join("settings_proxy_active.json")
 }
 
 /// Legacy fallback path to `~/.claude/setting_proxy_active.json`.
 fn legacy_active_proxy_path() -> PathBuf {
-    get_config_home().join("setting_proxy_active.json")
+    get_claude_config_home_dir().join("setting_proxy_active.json")
 }
 
 /// Path to `~/.claude/settings_<id>.json`.
 pub fn channel_config_path(id: &str) -> PathBuf {
-    get_config_home().join(format!("settings_{id}.json"))
+    get_claude_config_home_dir().join(format!("settings_{id}.json"))
 }
 
 /// Legacy fallback path to `~/.claude/setting_<id>.json`.
 fn legacy_channel_config_path(id: &str) -> PathBuf {
-    get_config_home().join(format!("setting_{id}.json"))
+    get_claude_config_home_dir().join(format!("setting_{id}.json"))
 }
 
 /// Path to `~/.claude/settings_<id>_models.json`.
 pub fn channel_models_cache_path(id: &str) -> PathBuf {
-    get_config_home().join(format!("settings_{id}_models.json"))
+    get_claude_config_home_dir().join(format!("settings_{id}_models.json"))
 }
 
 /// Legacy fallback path to `~/.claude/setting_<id>_models.json`.
 fn legacy_channel_models_cache_path(id: &str) -> PathBuf {
-    get_config_home().join(format!("setting_{id}_models.json"))
+    get_claude_config_home_dir().join(format!("setting_{id}_models.json"))
 }
 
 /// Path to `~/.claude/settings_origin.json` (backup of user settings before proxy activation).
 pub fn origin_settings_path() -> PathBuf {
-    get_config_home().join("settings_origin.json")
+    get_claude_config_home_dir().join("settings_origin.json")
 }
 
 /// Path to active `~/.claude/settings.json`.
 pub fn user_settings_path() -> PathBuf {
-    get_config_home().join("settings.json")
+    get_claude_config_home_dir().join("settings.json")
 }
 
 /// Load the active proxy channel ID from `settings_proxy_active.json`.
@@ -61,7 +61,7 @@ pub fn get_active_channel_id() -> Option<String> {
 
 /// Set or clear the active proxy channel ID in `settings_proxy_active.json`.
 pub fn set_active_channel_id(id: Option<&str>) -> Result<()> {
-    let dir = get_config_home();
+    let dir = get_claude_config_home_dir();
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create config dir {}", dir.display()))?;
 
@@ -84,7 +84,7 @@ pub fn load_channel_config(id: &str) -> Option<ChannelConfigFile> {
 
 /// Save `settings_<id>.json`.
 pub fn save_channel_config(id: &str, config: &ChannelConfigFile) -> Result<()> {
-    let dir = get_config_home();
+    let dir = get_claude_config_home_dir();
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create config dir {}", dir.display()))?;
 
@@ -114,7 +114,7 @@ pub fn load_channel_models_cache(id: &str) -> Option<ChannelModelsCache> {
 
 /// Save `settings_<id>_models.json`.
 pub fn save_channel_models_cache(id: &str, cache: &ChannelModelsCache) -> Result<()> {
-    let dir = get_config_home();
+    let dir = get_claude_config_home_dir();
     fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create config dir {}", dir.display()))?;
 
@@ -126,6 +126,7 @@ pub fn save_channel_models_cache(id: &str, cache: &ChannelModelsCache) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     struct TestDir(std::path::PathBuf);
     impl TestDir {
@@ -146,9 +147,9 @@ mod tests {
 
     #[test]
     fn test_active_proxy_round_trip() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
-        let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
+        let _guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         assert_eq!(get_active_channel_id(), None);
 
@@ -161,9 +162,9 @@ mod tests {
 
     #[test]
     fn test_channel_config_and_env_update() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
-        let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
+        let _guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         assert!(load_channel_config("cpa").is_none());
 
@@ -192,9 +193,9 @@ mod tests {
 
     #[test]
     fn test_legacy_setting_fallback() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
-        let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
+        let _guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         // Write legacy files with singular 'setting_'
         let legacy_cpa = temp.path().join("setting_cpa.json");

@@ -315,6 +315,7 @@ fn format_command_result(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     struct TestDir(std::path::PathBuf);
     impl TestDir {
@@ -335,9 +336,9 @@ mod tests {
 
     #[test]
     fn test_handle_provider_off() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
-        let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
+        let _guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         let res = handle_provider_command("off");
         assert!(res.contains("deactivated") || res.contains("Reverted"));
@@ -346,9 +347,9 @@ mod tests {
 
     #[test]
     fn test_handle_provider_status() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
-        let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
+        let _guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         let res = handle_provider_command("");
         assert!(res.contains("Proxy Channel Status"));
@@ -357,9 +358,9 @@ mod tests {
 
     #[test]
     fn test_handle_provider_configure_and_activate() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
-        let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
+        let _guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         let res = handle_provider_command("cpa http://127.0.0.1:8317 your-token");
         assert!(res.contains("configured and activated"));

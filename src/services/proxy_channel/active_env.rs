@@ -30,7 +30,30 @@ pub const PROXY_MANAGED_ENV_KEYS: &[&str] = &[
     "ANTHROPIC_DEFAULT_OPUS_MODEL",
     "ANTHROPIC_DEFAULT_OPUS_1M_MODEL",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    "NO_PROXY",
+    "no_proxy",
 ];
+
+/// Merges `127.0.0.1` and `localhost` into an existing or new `NO_PROXY` string.
+fn ensure_local_no_proxy(current: Option<&str>) -> String {
+    match current {
+        Some(val) if !val.trim().is_empty() => {
+            let mut parts: Vec<&str> = val
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parts.iter().any(|&s| s == "127.0.0.1") {
+                parts.push("127.0.0.1");
+            }
+            if !parts.iter().any(|&s| s == "localhost") {
+                parts.push("localhost");
+            }
+            parts.join(",")
+        }
+        _ => "127.0.0.1,localhost".to_string(),
+    }
+}
 
 /// Activates a proxy channel by:
 /// 1. Backing up original `settings.json` to `settings_origin.json` (if not already present).
@@ -76,7 +99,24 @@ pub fn activate_channel(id: &str) -> Result<()> {
         base_val = serde_json::json!({});
     }
 
+    let origin_no_proxy = base_val
+        .get("env")
+        .and_then(|e| e.get("NO_PROXY").or_else(|| e.get("no_proxy")))
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
     // Step 4: Overlay channel environment variables onto base settings
+    let channel_no_proxy = channel_cfg
+        .env
+        .get("NO_PROXY")
+        .or_else(|| channel_cfg.env.get("no_proxy"))
+        .map(|s| s.as_str());
+
+    let effective_no_proxy = match channel_no_proxy {
+        Some(custom) => ensure_local_no_proxy(Some(custom)),
+        None => ensure_local_no_proxy(origin_no_proxy.as_deref()),
+    };
+
     let obj = base_val.as_object_mut().expect("object verified above");
     let env_val = obj.entry("env").or_insert_with(|| serde_json::json!({}));
 
@@ -93,6 +133,15 @@ pub fn activate_channel(id: &str) -> Result<()> {
         for (k, v) in &channel_cfg.env {
             env_map.insert(k.clone(), serde_json::Value::String(v.clone()));
         }
+        // Ensure loopback bypass is active for local proxy gateways
+        env_map.insert(
+            "NO_PROXY".to_string(),
+            serde_json::Value::String(effective_no_proxy.clone()),
+        );
+        env_map.insert(
+            "no_proxy".to_string(),
+            serde_json::Value::String(effective_no_proxy.clone()),
+        );
     }
 
     // Step 5: Write merged settings to settings.json
@@ -109,6 +158,12 @@ pub fn activate_channel(id: &str) -> Result<()> {
     }
     crate::utils::managed_env::apply_safe_config_environment_variables();
 
+    #[allow(clippy::disallowed_methods)]
+    unsafe {
+        std::env::set_var("NO_PROXY", &effective_no_proxy);
+        std::env::set_var("no_proxy", &effective_no_proxy);
+    }
+
     info!("Activated proxy channel '{id}' and updated settings.json");
     Ok(())
 }
@@ -120,6 +175,19 @@ pub fn activate_channel(id: &str) -> Result<()> {
 pub fn deactivate_channel() -> Result<()> {
     let origin_path = origin_settings_path();
     let settings_path = user_settings_path();
+
+    let origin_no_proxy = if origin_path.exists() {
+        fs::read_to_string(&origin_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("env")
+                    .and_then(|e| e.get("NO_PROXY").or_else(|| e.get("no_proxy")).cloned())
+            })
+            .and_then(|v| v.as_str().map(str::to_string))
+    } else {
+        None
+    };
 
     if origin_path.exists() {
         fs::copy(&origin_path, &settings_path).with_context(|| {
@@ -140,6 +208,17 @@ pub fn deactivate_channel() -> Result<()> {
         crate::utils::process_env::remove(key);
     }
     crate::utils::managed_env::apply_safe_config_environment_variables();
+
+    #[allow(clippy::disallowed_methods)]
+    unsafe {
+        if let Some(ref orig) = origin_no_proxy {
+            std::env::set_var("NO_PROXY", orig);
+            std::env::set_var("no_proxy", orig);
+        } else {
+            std::env::remove_var("NO_PROXY");
+            std::env::remove_var("no_proxy");
+        }
+    }
 
     info!("Deactivated proxy channels and restored original settings.json");
     Ok(())
@@ -185,6 +264,7 @@ pub fn update_active_settings_env(key_values: &[(&str, &str)]) -> Result<()> {
 mod tests {
     use super::*;
     use crate::services::proxy_channel::config::{load_channel_config, update_channel_env};
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     struct TestDir(std::path::PathBuf);
     impl TestDir {
@@ -206,9 +286,9 @@ mod tests {
 
     #[test]
     fn test_activate_and_deactivate_channel_lifecycle() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
-        let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
+        let _guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         // Setup an initial settings.json
         let initial_settings = serde_json::json!({
@@ -257,6 +337,14 @@ mod tests {
             current_json["env"]["ANTHROPIC_DEFAULT_SONNET_MODEL"],
             "gemini-2.5-pro"
         );
+        assert_eq!(
+            current_json["env"]["NO_PROXY"],
+            "127.0.0.1,localhost"
+        );
+        assert_eq!(
+            current_json["env"]["no_proxy"],
+            "127.0.0.1,localhost"
+        );
 
         // Verify process_env is updated
         assert_eq!(
@@ -266,6 +354,10 @@ mod tests {
         assert_eq!(
             crate::utils::process_env::var("ANTHROPIC_AUTH_TOKEN").as_deref(),
             Some("sk-cpa-token")
+        );
+        assert_eq!(
+            crate::utils::process_env::var("NO_PROXY").as_deref(),
+            Some("127.0.0.1,localhost")
         );
 
         // 2. Test tier remapping
@@ -295,19 +387,68 @@ mod tests {
         assert!(restored_json["env"]
             .get("ANTHROPIC_DEFAULT_SONNET_MODEL")
             .is_none());
+        assert!(restored_json["env"].get("NO_PROXY").is_none());
+        assert!(restored_json["env"].get("no_proxy").is_none());
 
         // Verify process_env cleared proxy keys
         assert_ne!(
             crate::utils::process_env::var("ANTHROPIC_BASE_URL").as_deref(),
             Some("http://127.0.0.1:8317")
         );
+        assert_ne!(
+            crate::utils::process_env::var("NO_PROXY").as_deref(),
+            Some("127.0.0.1,localhost")
+        );
+    }
+
+    #[test]
+    fn test_activate_preserves_existing_user_no_proxy() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let temp = TestDir::new();
+        let _guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
+
+        let initial_settings = serde_json::json!({
+            "env": {
+                "NO_PROXY": "custom-internal.domain"
+            }
+        });
+        std::fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_string_pretty(&initial_settings).unwrap(),
+        )
+        .unwrap();
+
+        update_channel_env(
+            "cpa",
+            &[("ANTHROPIC_BASE_URL", "http://127.0.0.1:8317")],
+        )
+        .unwrap();
+
+        // 1. Activate channel - should combine existing NO_PROXY with loopback
+        activate_channel("cpa").unwrap();
+        let content = std::fs::read_to_string(temp.path().join("settings.json")).unwrap();
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            json["env"]["NO_PROXY"],
+            "custom-internal.domain,127.0.0.1,localhost"
+        );
+        assert_eq!(
+            json["env"]["no_proxy"],
+            "custom-internal.domain,127.0.0.1,localhost"
+        );
+
+        // 2. Deactivate channel - should revert back to original custom-internal.domain exactly
+        deactivate_channel().unwrap();
+        let restored_content = std::fs::read_to_string(temp.path().join("settings.json")).unwrap();
+        let restored_json: serde_json::Value = serde_json::from_str(&restored_content).unwrap();
+        assert_eq!(restored_json["env"]["NO_PROXY"], "custom-internal.domain");
     }
 
     #[test]
     fn test_channel_switching_other_overrides_cpa() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let temp = TestDir::new();
-        let _guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
+        let _guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
 
         let initial_settings = serde_json::json!({
             "env": {
