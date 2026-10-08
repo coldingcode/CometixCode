@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use super::shell_provider::{BuiltExecCommand, ShellProvider, ShellType};
+use crate::utils::process_env::JsTruthy;
 
 pub struct BashShellProvider {
     shell_path: PathBuf,
@@ -35,7 +36,11 @@ impl std::fmt::Debug for BashShellProvider {
 }
 
 fn get_disable_extglob_command(shell_path: &str) -> Option<&'static str> {
-    if std::env::var_os("CLAUDE_CODE_SHELL_PREFIX").is_some_and(|value| !value.is_empty()) {
+    if crate::utils::process_env::var_os("CLAUDE_CODE_SHELL_PREFIX")
+        .as_deref()
+        .truthy()
+        .is_some()
+    {
         return Some("{ shopt -u extglob || setopt NO_EXTENDED_GLOB; } >/dev/null 2>&1 || true");
     }
     if shell_path.contains("bash") {
@@ -93,7 +98,8 @@ impl ShellProvider for BashShellProvider {
             *current = sandbox_tmp_dir.map(std::path::Path::to_path_buf);
         }
 
-        let native_tmp = std::env::temp_dir();
+        // CC `bashProvider.ts:108` `osTmpdir()`.
+        let native_tmp = crate::utils::node_os::tmpdir();
         let shell_tmp = if cfg!(windows) {
             PathBuf::from(crate::utils::windows_paths::windows_path_to_posix_path(
                 &native_tmp.display().to_string(),
@@ -156,13 +162,11 @@ impl ShellProvider for BashShellProvider {
             crate::utils::bash::shell_quote::quote(&[&shell_cwd])
         ));
         let mut command_string = parts.join(" && ");
-        if let Ok(prefix) = std::env::var("CLAUDE_CODE_SHELL_PREFIX") {
-            if !prefix.is_empty() {
-                command_string = crate::utils::bash::shell_prefix::format_shell_prefix_command(
-                    &prefix,
-                    &command_string,
-                );
-            }
+        if let Some(prefix) = crate::utils::process_env::var("CLAUDE_CODE_SHELL_PREFIX").truthy() {
+            command_string = crate::utils::bash::shell_prefix::format_shell_prefix_command(
+                &prefix,
+                &command_string,
+            );
         }
 
         Ok(BuiltExecCommand {
@@ -211,18 +215,7 @@ impl ShellProvider for BashShellProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-    }
+    use crate::utils::test_env::{EnvVarGuard, HOME_VAR, TEST_ENV_LOCK};
 
     #[test]
     fn provider_builds_official_eval_snapshot_and_cwd_trailer_shape() {
@@ -245,14 +238,14 @@ mod tests {
 
     #[test]
     fn successful_snapshot_is_removed_by_provider_cleanup() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-shell-snapshot-cleanup-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let _config = EnvGuard::set("CLAUDE_CONFIG_DIR", &root);
-        let _home = EnvGuard::set("HOME", &root);
-        let _writes = EnvGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root);
+        let _home = EnvVarGuard::set(HOME_VAR, &root);
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let provider = create_bash_shell_provider(PathBuf::from("/bin/bash"), false);
         let snapshot = provider
             .snapshot_file_path

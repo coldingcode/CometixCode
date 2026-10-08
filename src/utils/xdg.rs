@@ -13,12 +13,17 @@ pub struct XdgOptions {
     pub home: Option<String>,
 }
 
+/// Maps to CC `utils/xdg.ts#resolveOptions`:
+/// `options?.homedir ?? process.env.HOME ?? osHomedir()`.
 fn resolve_home(options: Option<&XdgOptions>) -> String {
     options
         .and_then(|options| options.home.clone())
-        .or_else(|| std::env::var("HOME").ok())
-        .or_else(|| std::env::var("USERPROFILE").ok())
-        .unwrap_or_else(|| ".".to_string())
+        .or_else(|| crate::utils::process_env::var("HOME"))
+        .unwrap_or_else(|| {
+            crate::utils::node_os::homedir()
+                .to_string_lossy()
+                .into_owned()
+        })
 }
 
 /// Maps to CC `utils/xdg.ts#getXDGStateHome`.
@@ -29,7 +34,7 @@ pub fn get_xdg_state_home() -> PathBuf {
 pub fn get_xdg_state_home_with_options(options: Option<&XdgOptions>) -> PathBuf {
     options
         .and_then(|options| options.xdg_state_home.clone())
-        .or_else(|| std::env::var("XDG_STATE_HOME").ok())
+        .or_else(|| crate::utils::process_env::var("XDG_STATE_HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(resolve_home(options))
@@ -46,7 +51,7 @@ pub fn get_xdg_cache_home() -> PathBuf {
 pub fn get_xdg_cache_home_with_options(options: Option<&XdgOptions>) -> PathBuf {
     options
         .and_then(|options| options.xdg_cache_home.clone())
-        .or_else(|| std::env::var("XDG_CACHE_HOME").ok())
+        .or_else(|| crate::utils::process_env::var("XDG_CACHE_HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(resolve_home(options)).join(".cache"))
 }
@@ -59,7 +64,7 @@ pub fn get_xdg_data_home() -> PathBuf {
 pub fn get_xdg_data_home_with_options(options: Option<&XdgOptions>) -> PathBuf {
     options
         .and_then(|options| options.xdg_data_home.clone())
-        .or_else(|| std::env::var("XDG_DATA_HOME").ok())
+        .or_else(|| crate::utils::process_env::var("XDG_DATA_HOME"))
         .map(PathBuf::from)
         .unwrap_or_else(|| {
             PathBuf::from(resolve_home(options))

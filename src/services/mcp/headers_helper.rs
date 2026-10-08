@@ -43,15 +43,20 @@ pub async fn get_mcp_headers_from_helper(
         command.args(["/C", helper]);
         command
     } else {
-        let mut command = Command::new("sh");
+        // CC execa `shell: true` (headersHelper.ts:62): `/bin/sh` off Windows.
+        let mut command = Command::new("/bin/sh");
         command.args(["-c", helper]);
         command
     };
-    command.envs(std::env::vars());
+    // CC headersHelper.ts:66-70: `{ ...process.env, CLAUDE_CODE_MCP_SERVER_NAME,
+    // CLAUDE_CODE_MCP_SERVER_URL: config.url }` — process.env, not
+    // subprocessEnv(); an undefined url drops the inherited key.
+    crate::utils::subprocess_env::apply_process_env(&mut command);
     command.env("CLAUDE_CODE_MCP_SERVER_NAME", server_name);
-    if let Some(url) = config.url.as_deref() {
-        command.env("CLAUDE_CODE_MCP_SERVER_URL", url);
-    }
+    match config.url.as_deref() {
+        Some(url) => command.env("CLAUDE_CODE_MCP_SERVER_URL", url),
+        None => command.env_remove("CLAUDE_CODE_MCP_SERVER_URL"),
+    };
 
     let output = match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
         Ok(Ok(output)) => output,
@@ -136,6 +141,7 @@ fn value_type_name(value: &Value) -> &'static str {
 mod tests {
     use super::*;
     use crate::services::mcp::types::{ConfigScope, Transport};
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     fn config(scope: ConfigScope, helper: Option<String>) -> ScopedMcpServerConfig {
         ScopedMcpServerConfig {
@@ -182,7 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn get_mcp_server_headers_merges_dynamic_over_static_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let helper = "printf '{\"X-Dynamic\":\"dynamic\",\"X-Override\":\"dynamic\"}'";
         let headers =
             get_mcp_server_headers("docs", &config(ConfigScope::User, Some(helper.to_string())))
@@ -200,17 +206,15 @@ mod tests {
 
     #[tokio::test]
     async fn get_mcp_headers_from_helper_blocks_untrusted_project_scope_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!(
             "cometix-mcp-headers-helper-{}",
             uuid::Uuid::new_v4()
         ));
         std::fs::create_dir_all(&temp_dir).unwrap();
-        let _config =
-            crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp_dir.join("config"));
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp_dir.join("config"));
         let previous_original_cwd = crate::bootstrap::state::get_original_cwd();
-        let _non_interactive =
-            crate::utils::env_utils::EnvVarGuard::unset("COMETIX_NON_INTERACTIVE_SESSION");
+        let _non_interactive = EnvVarGuard::unset("COMETIX_NON_INTERACTIVE_SESSION");
         crate::bootstrap::state::set_original_cwd(temp_dir.join("workspace"));
         crate::utils::config::reset_trust_dialog_accepted_cache_for_testing();
 

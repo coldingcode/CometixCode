@@ -13,6 +13,8 @@ use crate::services::compact::time_based_mc_config::{
 };
 use crate::tool::ToolUseContext;
 use crate::types::message::{AssistantContent, Message, UserContent};
+#[cfg(test)]
+use crate::utils::test_env::TestStateLock;
 use std::collections::HashSet;
 use std::sync::{LazyLock, Mutex};
 
@@ -99,8 +101,7 @@ static CACHED_MC_STATE: LazyLock<Mutex<CachedMicrocompactState>> =
     LazyLock::new(|| Mutex::new(CachedMicrocompactState::default()));
 
 #[cfg(test)]
-pub static TEST_CACHED_MC_LOCK: LazyLock<crate::utils::env_utils::TestStateLock> =
-    LazyLock::new(crate::utils::env_utils::TestStateLock::new);
+pub static TEST_CACHED_MC_LOCK: LazyLock<TestStateLock> = LazyLock::new(TestStateLock::new);
 
 #[derive(Debug, Clone, Default)]
 pub struct MicrocompactResult {
@@ -121,18 +122,17 @@ pub struct MicrocompactResult {
 pub fn cached_microcompact_config_from_env() -> CachedMicrocompactConfig {
     let mut config = CachedMicrocompactConfig::default();
     config.enabled = crate::utils::env_utils::is_env_truthy(
-        std::env::var("COMETIX_CACHED_MICROCOMPACT").ok().as_deref(),
+        crate::utils::process_env::var("COMETIX_CACHED_MICROCOMPACT").as_deref(),
     ) || crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_CACHED_MICROCOMPACT")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_CACHED_MICROCOMPACT")
             .as_deref(),
     );
-    if let Ok(value) = std::env::var("COMETIX_CACHED_MC_TRIGGER_THRESHOLD") {
+    if let Some(value) = crate::utils::process_env::var("COMETIX_CACHED_MC_TRIGGER_THRESHOLD") {
         if let Ok(parsed) = value.parse::<usize>() {
             config.trigger_threshold = parsed.max(1);
         }
     }
-    if let Ok(value) = std::env::var("COMETIX_CACHED_MC_KEEP_RECENT") {
+    if let Some(value) = crate::utils::process_env::var("COMETIX_CACHED_MC_KEEP_RECENT") {
         if let Ok(parsed) = value.parse::<usize>() {
             config.keep_recent = parsed.max(1);
         }

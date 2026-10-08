@@ -544,7 +544,7 @@ async fn create_post_compact_attachments(
 fn compact_hook_context(
     context: &crate::tool::ToolUseContext,
 ) -> crate::services::hooks::HookContext {
-    let project_dir = crate::bootstrap::state::get_original_cwd();
+    let original_cwd = crate::bootstrap::state::get_original_cwd();
     let permission_mode = context
         .get_app_state()
         .map(|state| state.tool_permission_context.mode)
@@ -559,10 +559,9 @@ fn compact_hook_context(
         cwd: context
             .cwd_override
             .clone()
-            .unwrap_or_else(|| project_dir.clone())
+            .unwrap_or(original_cwd)
             .display()
             .to_string(),
-        project_dir: project_dir.display().to_string(),
         permission_mode: Some(
             crate::utils::permissions::permission_mode::permission_mode_internal_name(
                 permission_mode,
@@ -1283,6 +1282,7 @@ fn finalize_compaction_result(
 mod tests {
     use super::*;
     use crate::types::message::{AssistantMessage, UserMessage};
+    use crate::utils::test_env::{EnvVarGuard, IsolatedProjectSettings, TEST_ENV_LOCK};
 
     #[test]
     fn strip_media_matches_official_meta_for_simple_and_raw_images() {
@@ -1954,9 +1954,8 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn partial_compact_matches_official_model_wire_and_preserved_history() {
         use crate::types::message::PartialCompactDirection;
-        use crate::utils::env_utils::{EnvVarGuard, IsolatedProjectSettings};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::tls_provider::install_crypto_provider();
         let _project = IsolatedProjectSettings::pin();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

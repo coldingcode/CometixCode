@@ -12,11 +12,12 @@ use crate::components::design_system::byline::Byline;
 use crate::components::design_system::keyboard_shortcut_hint::{
     KeyboardShortcutHint, KeyboardShortcutHintStyleContext,
 };
-use crate::components::spinner::SpinnerGlyph;
+use crate::components::spinner::Spinner;
 use crate::constants::figures;
 use crate::hooks::use_exit::use_exit_on_ctrl_cd_with_keybindings;
 use crate::services::mcp::types::{McpServerConnectionType, Transport};
 use crate::services::mcp::utils::describe_mcp_config_file_path;
+use crate::utils::process_env::JsTruthy;
 use iocraft::prelude::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -191,9 +192,8 @@ async fn handle_claude_ai_auth(
             .strip_prefix("mcprs")
             .map(|suffix| format!("mcpsrv{suffix}"))
             .unwrap_or_else(|| server_id.to_string());
-        let product_surface = std::env::var("CLAUDE_CODE_ENTRYPOINT")
-            .ok()
-            .filter(|value| !value.is_empty())
+        let product_surface = crate::utils::process_env::var("CLAUDE_CODE_ENTRYPOINT")
+            .truthy()
             .unwrap_or_else(|| "cli".to_string());
         let mut encoded_product_surface = String::new();
         for byte in product_surface.bytes() {
@@ -750,7 +750,7 @@ pub fn MCPRemoteServerMenu<'a>(
             View(flex_direction: FlexDirection::Column, padding: 1u32, row_gap: 1u32) {
                 Text(content: format!("Authenticating with {}…", server.name), color: theme.claude, wrap: TextWrap::NoWrap)
                 View(flex_direction: FlexDirection::Row) {
-                    SpinnerGlyph()
+                    Spinner
                     Text(content: auth_copy.to_string(), wrap: TextWrap::NoWrap)
                 }
                 #(authorization_url_value.map(|url| element! {
@@ -789,7 +789,7 @@ pub fn MCPRemoteServerMenu<'a>(
             View(flex_direction: FlexDirection::Column, padding: 1u32, row_gap: 1u32) {
                 Text(content: format!("Authenticating with {}…", server.name), color: theme.claude, wrap: TextWrap::NoWrap)
                 View(flex_direction: FlexDirection::Row) {
-                    SpinnerGlyph()
+                    Spinner
                     Text(content: " A browser window will open for authentication".to_string(), wrap: TextWrap::NoWrap)
                 }
                 #(claude_ai_auth_url_value.map(|url| element! {
@@ -859,7 +859,7 @@ pub fn MCPRemoteServerMenu<'a>(
                     Text(content: "…".to_string(), wrap: TextWrap::NoWrap)
                 }
                 View(flex_direction: FlexDirection::Row) {
-                    SpinnerGlyph()
+                    Spinner
                     Text(content: " Establishing connection to MCP server".to_string(), wrap: TextWrap::NoWrap)
                 }
                 Text(content: "This may take a few moments.".to_string(), dim: true, wrap: TextWrap::NoWrap)
@@ -986,27 +986,12 @@ mod tests {
     use crate::services::mcp::client::McpConnectionDiscovery;
     use crate::services::mcp::types::{ConfigScope, ScopedMcpServerConfig};
     use crate::state::app_state_store::McpState;
+    use crate::utils::test_env::{
+        CLIPBOARD_OFF_SYSTEM, EnvVarGuard, TEST_ENV_LOCK, in_child_process,
+    };
     use futures::StreamExt;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
-
-    struct EnvRestore {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::unset(key),
-            }
-        }
-    }
 
     struct GlobalConfigRestore(Option<crate::utils::config::GlobalConfig>);
 
@@ -1140,7 +1125,7 @@ mod tests {
 
     #[test]
     fn remote_menu_disable_dispatches_to_mcp_connection_service() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let temp_dir = std::env::temp_dir().join(format!(
             "cometix-remote-menu-toggle-{}",
             uuid::Uuid::new_v4()
@@ -1148,10 +1133,9 @@ mod tests {
         let project_dir = temp_dir.join("project");
         std::fs::create_dir_all(&project_dir).unwrap();
         let previous_cwd = std::env::current_dir().unwrap();
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &temp_dir);
-        let _session_write =
-            crate::utils::env_utils::EnvVarGuard::set("SESSION_WRITE_ENABLED", "1");
-        let _write = crate::utils::env_utils::EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &temp_dir);
+        let _session_write = EnvVarGuard::set("SESSION_WRITE_ENABLED", "1");
+        let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         std::env::set_current_dir(&project_dir).unwrap();
 
         let cancels = Arc::new(Mutex::new(0usize));
@@ -1247,18 +1231,18 @@ mod tests {
 
     #[test]
     fn handle_claude_ai_auth_matches_official_url_selection_and_closed_outlet() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _oauth_env = [
-            EnvRestore::unset("USE_LOCAL_OAUTH"),
-            EnvRestore::unset("USE_STAGING_OAUTH"),
-            EnvRestore::unset("CLAUDE_CODE_CUSTOM_OAUTH_URL"),
-            EnvRestore::unset("CLAUDE_CODE_SIMPLE"),
-            EnvRestore::set("ANTHROPIC_UNIX_SOCKET", "/tmp/cometix-test-auth.sock"),
-            EnvRestore::set("CLAUDE_CODE_OAUTH_TOKEN", "test-oauth-token"),
+            EnvVarGuard::unset("USE_LOCAL_OAUTH"),
+            EnvVarGuard::unset("USE_STAGING_OAUTH"),
+            EnvVarGuard::unset("CLAUDE_CODE_CUSTOM_OAUTH_URL"),
+            EnvVarGuard::unset("CLAUDE_CODE_SIMPLE"),
+            EnvVarGuard::set("ANTHROPIC_UNIX_SOCKET", "/tmp/cometix-test-auth.sock"),
+            EnvVarGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "test-oauth-token"),
         ];
-        let _entrypoint = EnvRestore::set("CLAUDE_CODE_ENTRYPOINT", "cli test");
+        let _entrypoint = EnvVarGuard::set("CLAUDE_CODE_ENTRYPOINT", "cli test");
         let mut account = crate::utils::config::AccountInfo::default();
         account.organization_uuid = Some("org_123".to_string());
         let _global_config = GlobalConfigRestore::install(crate::utils::config::GlobalConfig {
@@ -1383,10 +1367,16 @@ mod tests {
     /// canonical SSH OSC clipboard path runs, without native clipboard writes.
     #[tokio::test]
     async fn remote_clipboard_matches_official_feedback_and_copy_timeout() {
+        // iocraft reads the session's terminal from the OS environment.
+        if !in_child_process(
+            module_path!(),
+            "remote_clipboard_matches_official_feedback_and_copy_timeout",
+            CLIPBOARD_OFF_SYSTEM,
+        ) {
+            return;
+        }
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _ssh = EnvRestore::set("SSH_CONNECTION", "fixture");
-        let _tmux = EnvRestore::unset("TMUX");
-        let _oauth = EnvRestore::unset("CLAUDE_CODE_CUSTOM_OAUTH_URL");
+        let _oauth = EnvVarGuard::unset("CLAUDE_CODE_CUSTOM_OAUTH_URL");
         let (sender, receiver) = async_channel::unbounded();
         let mut app = element! {
             ContextProvider(value: Context::owned(crate::keybindings::keybinding_context::KeybindingRuntime::with_default_bindings())) {
@@ -1438,6 +1428,17 @@ mod tests {
     #[tokio::test]
     async fn remote_clipboard_matches_official_parent_unmount_guard() {
         use std::os::unix::fs::PermissionsExt;
+        // iocraft reads the session's terminal from the OS environment.
+        if !in_child_process(
+            module_path!(),
+            "remote_clipboard_matches_official_parent_unmount_guard",
+            &[
+                ("SSH_CONNECTION", Some("fixture")),
+                ("TMUX", Some("fixture")),
+            ],
+        ) {
+            return;
+        }
         crate::utils::process_runtime::initialize_test_process_runtime();
         let directory =
             std::env::temp_dir().join(format!("cometix-mcp-clipboard-{}", uuid::Uuid::new_v4()));
@@ -1445,12 +1446,9 @@ mod tests {
         let tool = directory.join("tmux");
         std::fs::write(&tool, "#!/bin/sh\n/bin/cat > \"$CLIPBOARD_FIXTURE_DIR/input\"\n/bin/sleep 0.25\n: > \"$CLIPBOARD_FIXTURE_DIR/finished\"\n").unwrap();
         std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let _path = crate::utils::env_utils::EnvVarGuard::set("PATH", &directory);
-        let _directory =
-            crate::utils::env_utils::EnvVarGuard::set("CLIPBOARD_FIXTURE_DIR", &directory);
-        let _ssh = EnvRestore::set("SSH_CONNECTION", "fixture");
-        let _tmux = EnvRestore::set("TMUX", "fixture");
-        let _oauth = EnvRestore::unset("CLAUDE_CODE_CUSTOM_OAUTH_URL");
+        let _path = EnvVarGuard::set("PATH", &directory);
+        let _directory = EnvVarGuard::set("CLIPBOARD_FIXTURE_DIR", &directory);
+        let _oauth = EnvVarGuard::unset("CLAUDE_CODE_CUSTOM_OAUTH_URL");
         let (sender, receiver) = async_channel::unbounded();
         let mut app = element! {
             ContextProvider(value: Context::owned(crate::keybindings::keybinding_context::KeybindingRuntime::with_default_bindings())) {

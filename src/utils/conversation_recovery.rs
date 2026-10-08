@@ -443,6 +443,7 @@ mod tests {
         CANCEL_MESSAGE, NO_RESPONSE_REQUESTED, PLAN_REJECTION_PREFIX, REJECT_MESSAGE,
         REJECT_MESSAGE_WITH_REASON_PREFIX,
     };
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use serde_json::json;
 
     /// A2.3 extractor: rows carry the real message; the old assertions on the
@@ -750,8 +751,8 @@ mod tests {
 
     #[test]
     fn load_conversation_for_resume_runs_only_session_start_resume_hooks() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _simple = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         let marker_path = std::env::temp_dir().join(format!(
             "cometix-startup-resume-hooks-{}",
             uuid::Uuid::new_v4()
@@ -3007,6 +3008,17 @@ mod tests {
 
     #[test]
     fn write_create_success_uses_created_summary() {
+        // CC FileWriteTool/UI.tsx:59 resolves the relative wire filePath using
+        // process cwd, then displays it relative to session cwd. Pin both for
+        // this fixture's intentionally bare filename expectation.
+        struct RestoreCwd(std::path::PathBuf);
+        impl Drop for RestoreCwd {
+            fn drop(&mut self) {
+                crate::bootstrap::state::set_original_cwd(self.0.clone());
+            }
+        }
+        let _cwd = RestoreCwd(crate::bootstrap::state::get_original_cwd());
+        crate::bootstrap::state::set_original_cwd(std::env::current_dir().unwrap());
         let entries = vec![
             json!({
                 "type": "assistant",

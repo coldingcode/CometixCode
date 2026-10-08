@@ -162,7 +162,7 @@ fn validate_write_input(input: &FileWriteInput, context: &ToolUseContext) -> Val
         return validation_error(error, 0);
     }
 
-    if crate::utils::permissions::filesystem::matching_rule_for_input_at_cwd(
+    if crate::utils::permissions::filesystem::matching_rule_for_input(
         &full_path.display().to_string(),
         &context.tool_permission_context,
         crate::utils::permissions::filesystem::FilePermissionType::Edit,
@@ -183,7 +183,9 @@ fn validate_write_input(input: &FileWriteInput, context: &ToolUseContext) -> Val
         return ValidationResult::Ok;
     }
 
-    let metadata = match std::fs::metadata(&full_path) {
+    let metadata = match futures::executor::block_on(
+        crate::utils::fs_operations::get_fs_implementation().stat(&full_path),
+    ) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return ValidationResult::Ok;
@@ -401,7 +403,7 @@ impl ToolCall for FileWriteTool {
                     .unwrap_or_default()
                     .to_string()
             });
-        crate::utils::permissions::filesystem::check_write_permission_for_tool_at_cwd(
+        crate::utils::permissions::filesystem::check_write_permission_for_tool(
             &path,
             args,
             &context.tool_permission_context,
@@ -511,11 +513,11 @@ impl ToolCall for FileWriteTool {
                     dynamic_skill_dirs,
                 );
             }
-            if let Err(error) = std::fs::create_dir_all(
+            if let Err(error) = crate::utils::fs_operations::get_fs_implementation().mkdir(
                 write_target
                     .parent()
-                    .unwrap_or_else(|| std::path::Path::new(".")),
-            ) {
+                    .unwrap_or_else(|| std::path::Path::new(".")), None,
+            ).await {
                 return make_error_after_discovery(error.to_string(), dynamic_skill_dirs);
             }
 
@@ -690,7 +692,7 @@ impl ToolCall for FileWriteTool {
             // CC: FileWriteTool.ts:339-342 `logEvent('tengu_write_claudemd',
             // {})` on `${sep}CLAUDE.md` paths — joins with analytics.
 
-            let git_diff = if crate::utils::env_utils::is_env_truthy(std::env::var("CLAUDE_CODE_REMOTE").ok().as_deref())
+            let git_diff = if crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_REMOTE").as_deref())
                 && remote_git_diff_enabled()
             {
                 // CC: logEvent('tengu_tool_use_diff_computed', {isWriteTool,
@@ -808,24 +810,7 @@ mod tests {
     use super::*;
     use crate::types::permissions::{PermissionMode, PermissionRequest, PermissionRuleValue};
     use crate::utils::query_helpers::{ReadFileStateEntry, ReadFileStateSource};
-
-    struct EnvRestore {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::unset(key),
-            }
-        }
-    }
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     struct TestGlobalConfigRestore;
 
@@ -934,8 +919,8 @@ mod tests {
 
     #[tokio::test]
     async fn creates_file_and_parent_directories_through_shared_writer() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-create-{}",
             uuid::Uuid::new_v4().simple()
@@ -969,8 +954,8 @@ mod tests {
     async fn write_call_preserves_dangling_direct_symlink_and_creates_its_target() {
         use std::os::unix::fs::symlink;
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-call-dangling-{}",
             uuid::Uuid::new_v4().simple()
@@ -1003,8 +988,8 @@ mod tests {
 
     #[tokio::test]
     async fn existing_file_requires_full_read_and_rejects_content_race() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-race-{}",
             uuid::Uuid::new_v4().simple()
@@ -1051,8 +1036,8 @@ mod tests {
 
     #[tokio::test]
     async fn post_validation_mtime_change_with_identical_content_uses_official_fallback() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-mtime-fallback-{}",
             uuid::Uuid::new_v4().simple()
@@ -1078,8 +1063,8 @@ mod tests {
 
     #[tokio::test]
     async fn preserves_utf16_encoding_but_honors_explicit_lf_content() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-encoding-{}",
             uuid::Uuid::new_v4().simple()
@@ -1113,9 +1098,9 @@ mod tests {
 
     #[tokio::test]
     async fn transcript_persistence_disable_does_not_disable_file_write() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _bootstrap = BootstrapRestore::capture();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         crate::bootstrap::state::set_session_persistence_disabled(true);
         let root = std::env::temp_dir().join(format!(
             "cometix-write-no-session-persistence-{}",
@@ -1140,8 +1125,8 @@ mod tests {
 
     #[tokio::test]
     async fn no_write_gate_fails_before_creating_parent_or_history() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "0");
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "0");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-disabled-{}",
             uuid::Uuid::new_v4().simple()
@@ -1177,15 +1162,15 @@ mod tests {
 
     #[tokio::test]
     async fn no_write_gate_leaves_existing_file_history_and_temp_state_untouched() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _bootstrap = BootstrapRestore::capture();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "0");
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "0");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-disabled-history-{}",
             uuid::Uuid::new_v4().simple()
         ));
         let config_dir = root.join("config");
-        let _config = EnvRestore::set("CLAUDE_CONFIG_DIR", &config_dir.display().to_string());
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_dir);
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("existing.txt");
         std::fs::write(&path, "old\n").unwrap();
@@ -1235,16 +1220,16 @@ mod tests {
 
     #[tokio::test]
     async fn existing_write_tracks_file_history_through_real_app_store() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _bootstrap = BootstrapRestore::capture();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _checkpointing = EnvRestore::unset("CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING");
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _checkpointing = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-history-{}",
             uuid::Uuid::new_v4().simple()
         ));
         let config_dir = root.join("config");
-        let _config = EnvRestore::set("CLAUDE_CONFIG_DIR", &config_dir.display().to_string());
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_dir);
         std::fs::create_dir_all(&root).unwrap();
         let path = root.join("existing.txt");
         std::fs::write(&path, "old history\n").unwrap();
@@ -1345,9 +1330,9 @@ mod tests {
 
     #[tokio::test]
     async fn remote_git_diff_gate_reads_switch_table_not_growthbook_cache() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _remote = EnvRestore::set("CLAUDE_CODE_REMOTE", "1");
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _remote = EnvVarGuard::set("CLAUDE_CODE_REMOTE", "1");
         let _config_restore = TestGlobalConfigRestore;
         let mut config = crate::utils::config::GlobalConfig::default();
         config.cached_growth_book_features = Some(std::collections::HashMap::from([(
@@ -1572,8 +1557,8 @@ mod tests {
 
     #[tokio::test]
     async fn empty_existing_file_returns_create_like_official_truthiness_branch() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _writes = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-empty-{}",
             uuid::Uuid::new_v4().simple()

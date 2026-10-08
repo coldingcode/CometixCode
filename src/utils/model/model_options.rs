@@ -21,6 +21,7 @@ use crate::utils::model::providers::{ApiProvider, get_api_provider};
 use crate::utils::model_cost::{
     COST_HAIKU_35, COST_HAIKU_45, COST_TIER_3_15, format_model_pricing,
 };
+use crate::utils::process_env::JsTruthy;
 
 // @[MODEL LAUNCH]: Update all the available and default model option strings below.
 
@@ -70,10 +71,6 @@ fn tier_3_15_suffix() -> String {
     } else {
         format!(" · {}", format_model_pricing(COST_TIER_3_15))
     }
-}
-
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
 /// Maps to: CC `utils/model/modelOptions.ts:45-74` `getDefaultOptionForUser`.
@@ -138,16 +135,17 @@ pub fn get_default_option_for_user_for_audience(
 
 /// Maps to: CC `utils/model/modelOptions.ts:76-92` `getCustomSonnetOption`.
 fn get_custom_sonnet_option() -> Option<ModelOption> {
-    let custom_sonnet_model = env("ANTHROPIC_DEFAULT_SONNET_MODEL")?;
+    let custom_sonnet_model =
+        crate::utils::process_env::var("ANTHROPIC_DEFAULT_SONNET_MODEL").truthy()?;
     if !is_3p() {
         return None;
     }
     let is_1m = crate::utils::context::has_1m_context(&custom_sonnet_model);
-    let description = env("ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION");
+    let description = crate::utils::process_env::var("ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION");
     Some(
         ModelOption::new(
             Some("sonnet"),
-            &env("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME")
+            &crate::utils::process_env::var("ANTHROPIC_DEFAULT_SONNET_MODEL_NAME")
                 .unwrap_or_else(|| custom_sonnet_model.clone()),
             description.clone().unwrap_or_else(|| {
                 format!(
@@ -187,16 +185,18 @@ fn get_sonnet_46_option() -> ModelOption {
 
 /// Maps to: CC `utils/model/modelOptions.ts:107-122` `getCustomOpusOption`.
 fn get_custom_opus_option() -> Option<ModelOption> {
-    let custom_opus_model = env("ANTHROPIC_DEFAULT_OPUS_MODEL")?;
+    let custom_opus_model =
+        crate::utils::process_env::var("ANTHROPIC_DEFAULT_OPUS_MODEL").truthy()?;
     if !is_3p() {
         return None;
     }
     let is_1m = crate::utils::context::has_1m_context(&custom_opus_model);
-    let description = env("ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION");
+    let description = crate::utils::process_env::var("ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION");
     Some(
         ModelOption::new(
             Some("opus"),
-            &env("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME").unwrap_or_else(|| custom_opus_model.clone()),
+            &crate::utils::process_env::var("ANTHROPIC_DEFAULT_OPUS_MODEL_NAME")
+                .unwrap_or_else(|| custom_opus_model.clone()),
             description.clone().unwrap_or_else(|| {
                 format!(
                     "Custom Opus model{}",
@@ -277,15 +277,16 @@ pub fn get_opus_46_1m_option(fast_mode: bool) -> ModelOption {
 
 /// Maps to: CC `utils/model/modelOptions.ts:165-179` `getCustomHaikuOption`.
 fn get_custom_haiku_option() -> Option<ModelOption> {
-    let custom_haiku_model = env("ANTHROPIC_DEFAULT_HAIKU_MODEL")?;
+    let custom_haiku_model =
+        crate::utils::process_env::var("ANTHROPIC_DEFAULT_HAIKU_MODEL").truthy()?;
     if !is_3p() {
         return None;
     }
-    let description = env("ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION");
+    let description = crate::utils::process_env::var("ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION");
     Some(
         ModelOption::new(
             Some("haiku"),
-            &env("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME")
+            &crate::utils::process_env::var("ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME")
                 .unwrap_or_else(|| custom_haiku_model.clone()),
             description
                 .clone()
@@ -638,16 +639,18 @@ pub fn get_model_options_for_audience(
     let mut options = get_model_options_base(audience, fast_mode);
 
     // The custom model from the ANTHROPIC_CUSTOM_MODEL_OPTION env var.
-    if let Some(env_custom_model) = env("ANTHROPIC_CUSTOM_MODEL_OPTION") {
+    if let Some(env_custom_model) =
+        crate::utils::process_env::var("ANTHROPIC_CUSTOM_MODEL_OPTION").truthy()
+    {
         if !options
             .iter()
             .any(|existing| existing.value.as_deref() == Some(env_custom_model.as_str()))
         {
             options.push(ModelOption::new(
                 Some(&env_custom_model),
-                &env("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME")
+                &crate::utils::process_env::var("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME")
                     .unwrap_or_else(|| env_custom_model.clone()),
-                env("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION")
+                crate::utils::process_env::var("ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION")
                     .unwrap_or_else(|| format!("Custom model ({env_custom_model})")),
             ));
         }
@@ -722,13 +725,14 @@ mod tests {
     use super::*;
     use crate::bootstrap::state::set_initial_main_loop_model;
     use crate::utils::build_profile::BuildAudience;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     /// Drives `getModelOptions()` from a clean, credential-free process state:
     /// no OAuth (so not a subscriber), first-party provider, no settings file.
     struct OptionsFixture {
         root: std::path::PathBuf,
-        config_dir: Option<crate::utils::env_utils::EnvVarGuard>,
-        cleared_env: Vec<crate::utils::env_utils::EnvVarGuard>,
+        config_dir: Option<EnvVarGuard>,
+        cleared_env: Vec<EnvVarGuard>,
     }
 
     const CLEARED_ENV: &[&str] = &[
@@ -760,14 +764,11 @@ mod tests {
             ));
             std::fs::create_dir_all(&root).unwrap();
             std::fs::write(root.join("settings.json"), settings.to_string()).unwrap();
-            let config_dir = Some(crate::utils::env_utils::EnvVarGuard::set(
-                "CLAUDE_CONFIG_DIR",
-                &root,
-            ));
+            let config_dir = Some(EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root));
 
             let cleared_env = CLEARED_ENV
                 .iter()
-                .map(|name| crate::utils::env_utils::EnvVarGuard::unset(*name))
+                .map(|name| EnvVarGuard::unset(*name))
                 .collect();
 
             crate::utils::settings::settings_cache::reset_settings_cache();
@@ -807,7 +808,7 @@ mod tests {
     /// `ANTHROPIC_API_KEY` user lands on.
     #[test]
     fn payg_first_party_list_matches_the_official_order_and_copy() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
 
         let options = get_model_options_for_audience(BuildAudience::External, false);
@@ -841,7 +842,7 @@ mod tests {
     /// Opus splits into the base option plus a separate 1M entry.
     #[test]
     fn disabling_1m_context_collapses_the_official_opus_merge_branch() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
         crate::utils::process_env::set("CLAUDE_CODE_DISABLE_1M_CONTEXT", "1");
 
@@ -859,7 +860,7 @@ mod tests {
     /// option values are provider-specific model IDs rather than aliases.
     #[test]
     fn third_party_list_uses_provider_model_ids_and_drops_first_party_pricing() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
         crate::utils::process_env::set("CLAUDE_CODE_USE_BEDROCK", "1");
 
@@ -894,7 +895,7 @@ mod tests {
     /// user with custom model strings sees those instead of the built-ins.
     #[test]
     fn third_party_custom_model_env_replaces_the_official_family_entries() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
         crate::utils::process_env::set("CLAUDE_CODE_USE_VERTEX", "1");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_SONNET_MODEL", "my-sonnet[1m]");
@@ -935,7 +936,7 @@ mod tests {
     /// is appended once, keyed by value.
     #[test]
     fn env_custom_model_option_is_appended_with_the_official_fallback_copy() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
         crate::utils::process_env::set("ANTHROPIC_CUSTOM_MODEL_OPTION", "internal-eval-1");
 
@@ -980,7 +981,7 @@ mod tests {
     /// options are appended, deduped by value.
     #[test]
     fn bootstrap_cached_options_are_appended_and_deduped_by_value() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
         crate::utils::config::set_test_global_config(Some(crate::utils::config::GlobalConfig {
             additional_model_options_cache: Some(vec![
@@ -1014,7 +1015,7 @@ mod tests {
     /// Anthropic IDs taking their own branches.
     #[test]
     fn pinned_models_take_the_official_append_branches() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
 
         crate::utils::process_env::set("ANTHROPIC_MODEL", "opusplan");
@@ -1057,7 +1058,7 @@ mod tests {
     /// the fallback source once the live setting is cleared.
     #[test]
     fn initial_main_loop_model_backs_the_pinned_model_lookup() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
 
         set_initial_main_loop_model(Some("claude-sonnet-4-5-20250929".to_string()));
@@ -1075,7 +1076,7 @@ mod tests {
     /// every entry except the default.
     #[test]
     fn allowlist_filters_options_but_always_keeps_the_default() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         {
             let _fixture = OptionsFixture::new(serde_json::json!({ "availableModels": ["haiku"] }));
             assert_eq!(
@@ -1114,7 +1115,7 @@ mod tests {
     /// `getClaudeAiUserDefaultModelDescription` or a suffix-free Sonnet ID.
     #[test]
     fn internal_build_list_matches_the_official_ant_order_minus_flag_models() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
 
         let options = get_model_options_for_audience(BuildAudience::AnthropicInternal, false);
@@ -1147,7 +1148,7 @@ mod tests {
     /// lightning bolt.
     #[test]
     fn fast_mode_applies_the_official_opus_pricing_suffix() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fixture = OptionsFixture::new(serde_json::json!({}));
         crate::utils::process_env::set("CLAUDE_CODE_DISABLE_1M_CONTEXT", "1");
 

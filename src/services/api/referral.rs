@@ -170,7 +170,7 @@ pub fn guest_passes_snapshot_from_readonly_config(
 ///
 /// It used to take a `get_env` the body never read: `is_claude_ai_subscriber`
 /// and `get_subscription_type` resolve from process state (ultimately
-/// `.credentials.json` under `get_config_home()`), exactly as at the source.
+/// `.credentials.json` under `get_claude_config_home_dir()`), exactly as at the source.
 /// The parameter made callers look like they could steer the result, which is
 /// how a test came to assert the no-subscription outcome while silently
 /// depending on whichever account the developer was logged into. Removed rather
@@ -209,6 +209,7 @@ fn formatted_minor_units(amount_minor_units: i64) -> String {
 mod tests {
     use super::*;
     use crate::utils::config::{AccountInfo, GlobalConfig};
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     fn config_with_cache(entry: serde_json::Value) -> GlobalConfig {
         GlobalConfig {
@@ -248,7 +249,7 @@ mod tests {
 
     #[test]
     fn cached_passes_eligibility_requires_official_precheck_and_reports_cache_state() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let config = config_with_cache(serde_json::json!({
             "eligible": true,
             "timestamp": 1_000,
@@ -258,7 +259,7 @@ mod tests {
 
         // Asserting the NO-subscription outcome means owning that premise: the
         // subscription lookup falls back to `.credentials.json` under
-        // `get_config_home()`, where the harness seeds a logged-in identity.
+        // `get_claude_config_home_dir()`, where the harness seeds a logged-in identity.
         // The sibling test below does the same thing in reverse (it writes a
         // max-subscriber file); this one needs the directory empty.
         let dir = std::env::temp_dir().join(format!(
@@ -266,7 +267,7 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
 
         let without_subscription = check_cached_passes_eligibility(&config, 2_000);
 
@@ -276,7 +277,7 @@ mod tests {
 
     #[test]
     fn cached_passes_eligibility_reads_fresh_max_subscriber_cache() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let config = config_with_cache(serde_json::json!({
             "eligible": true,
             "timestamp": 1_000,
@@ -304,7 +305,7 @@ mod tests {
         // the test was green purely because the harness seeds a max-subscriber
         // identity at the real config home — it would have passed with an empty
         // `dir` too, and failed the moment the harness stopped seeding.
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
 
         let eligibility = check_cached_passes_eligibility(&config, 2_000);
 

@@ -41,7 +41,10 @@ fn probe_tmux_control_mode_sync(get_env: &impl Fn(&str) -> Option<String>) -> bo
         return false;
     }
 
-    let Ok(output) = Command::new("tmux")
+    let mut command = Command::new("tmux");
+    // CC inherits process.env (spawnSync without env); the carrier is its counterpart.
+    crate::utils::subprocess_env::apply_process_env_std(&mut command);
+    let Ok(output) = command
         .args(["display-message", "-p", "#{client_control_mode}"])
         .output()
     else {
@@ -61,7 +64,7 @@ pub fn is_tmux_control_mode() -> bool {
     if let Some(value) = *cached {
         return value;
     }
-    let value = probe_tmux_control_mode_sync(&|key| std::env::var(key).ok());
+    let value = probe_tmux_control_mode_sync(&|key| crate::utils::process_env::var(key));
     *cached = Some(value);
     value
 }
@@ -92,7 +95,7 @@ pub fn is_fullscreen_env_enabled_for_audience(
 pub fn is_fullscreen_env_enabled() -> bool {
     let tmux_control_mode = is_tmux_control_mode();
     let enabled = is_fullscreen_env_enabled_for_audience(
-        &|key| std::env::var(key).ok(),
+        &|key| crate::utils::process_env::var(key),
         tmux_control_mode,
         crate::utils::build_profile::build_audience(),
     );
@@ -113,15 +116,14 @@ pub fn is_fullscreen_env_enabled() -> bool {
 /// Maps to: CC `utils/fullscreen.ts:137-149` `isMouseTrackingEnabled`.
 pub fn is_mouse_tracking_enabled() -> bool {
     !crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_MOUSE").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_DISABLE_MOUSE").as_deref(),
     )
 }
 
 /// Maps to: CC `utils/fullscreen.ts:151-160` `isMouseClicksDisabled`.
 pub fn is_mouse_clicks_disabled() -> bool {
     crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_MOUSE_CLICKS")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_DISABLE_MOUSE_CLICKS")
             .as_deref(),
     )
 }
@@ -144,7 +146,7 @@ pub fn reset_for_testing() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     struct InteractiveGuard(bool);
 
@@ -237,7 +239,7 @@ mod tests {
 
     #[test]
     fn canonical_fullscreen_gates_match_official_process_state() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _state = FullscreenStateGuard::reset();
         let _no_flicker = EnvVarGuard::unset("CLAUDE_CODE_NO_FLICKER");
         let _disable_mouse = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_MOUSE");

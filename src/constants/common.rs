@@ -2,12 +2,14 @@
 //!
 //! Maps to CC `constants/common.ts`.
 
+use crate::utils::process_env::JsTruthy;
+
 /// Maps to: CC `constants/common.ts` `getLocalISODate()`.
 pub fn get_local_iso_date() -> String {
-    if let Ok(override_date) = std::env::var("CLAUDE_CODE_OVERRIDE_DATE") {
-        if !override_date.is_empty() {
-            return override_date;
-        }
+    if let Some(override_date) =
+        crate::utils::process_env::var("CLAUDE_CODE_OVERRIDE_DATE").truthy()
+    {
+        return override_date;
     }
 
     chrono::Local::now().format("%Y-%m-%d").to_string()
@@ -18,7 +20,9 @@ pub fn get_local_iso_date() -> String {
 /// same `CLAUDE_CODE_OVERRIDE_DATE` override; an unparseable override falls
 /// back to now (CC would render "Invalid Date").
 pub fn get_local_month_year() -> String {
-    if let Ok(override_date) = std::env::var("CLAUDE_CODE_OVERRIDE_DATE") {
+    if let Some(override_date) =
+        crate::utils::process_env::var("CLAUDE_CODE_OVERRIDE_DATE").truthy()
+    {
         if let Ok(date) = chrono::NaiveDate::parse_from_str(&override_date, "%Y-%m-%d") {
             return date.format("%B %Y").to_string();
         }
@@ -36,10 +40,11 @@ pub fn get_session_start_date() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn get_local_iso_date_honors_official_override_env() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("CLAUDE_CODE_OVERRIDE_DATE", "2026-07-03");
         assert_eq!(get_local_iso_date(), "2026-07-03");
         crate::utils::process_env::remove("CLAUDE_CODE_OVERRIDE_DATE");

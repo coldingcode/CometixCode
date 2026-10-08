@@ -11,6 +11,7 @@
 //! "cannot validate", never as "safe", so a host without PowerShell installed
 //! degrades to prompting rather than auto-allowing.
 
+use crate::utils::process_env::JsTruthy;
 use serde::{Deserialize, Deserializer};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{LazyLock, Mutex};
@@ -218,9 +219,8 @@ const DEFAULT_PARSE_TIMEOUT_MS: u64 = 5_000;
 
 /// Maps to: CC `parser.ts:208-215#getParseTimeoutMs`.
 fn get_parse_timeout_ms() -> u64 {
-    std::env::var("CLAUDE_CODE_PWSH_PARSE_TIMEOUT_MS")
-        .ok()
-        .filter(|value| !value.is_empty())
+    crate::utils::process_env::var("CLAUDE_CODE_PWSH_PARSE_TIMEOUT_MS")
+        .truthy()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|parsed| *parsed > 0)
         .unwrap_or(DEFAULT_PARSE_TIMEOUT_MS)
@@ -1124,7 +1124,10 @@ fn spawn_pwsh(program: &str, args: &[&str], timeout: Duration) -> Result<SpawnOu
         captured
     }
 
-    let mut child = std::process::Command::new(program)
+    let mut command = std::process::Command::new(program);
+    // CC `parser.ts` execa(pwshPath, ...) inherits process.env; the carrier is its counterpart.
+    crate::utils::subprocess_env::apply_process_env_std(&mut command);
+    let mut child = command
         .args(args)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())

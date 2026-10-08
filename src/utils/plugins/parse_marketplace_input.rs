@@ -55,7 +55,7 @@ pub async fn parse_marketplace_input(input: &str) -> Option<Value> {
         || windows
     {
         let raw = if let Some(rest) = trimmed.strip_prefix('~') {
-            format!("{}{rest}", std::env::var("HOME").unwrap_or_default())
+            format!("{}{rest}", crate::utils::node_os::homedir().display())
         } else {
             trimmed.to_owned()
         };
@@ -77,7 +77,10 @@ pub async fn parse_marketplace_input(input: &str) -> Option<Value> {
             }
         }
         let display = path.to_string_lossy().into_owned();
-        let metadata = match tokio::fs::metadata(&path).await {
+        let metadata = match crate::utils::fs_operations::get_fs_implementation()
+            .stat(&path)
+            .await
+        {
             Ok(m) => m,
             Err(e) => {
                 let message = if e.kind() == std::io::ErrorKind::NotFound {

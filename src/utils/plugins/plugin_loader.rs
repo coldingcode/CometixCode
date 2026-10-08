@@ -792,7 +792,7 @@ fn resolve_git_subdir_url(url: &str) -> anyhow::Result<String> {
     {
         Ok(
             if crate::utils::env_utils::is_env_truthy(
-                std::env::var("CLAUDE_CODE_REMOTE").ok().as_deref(),
+                crate::utils::process_env::var("CLAUDE_CODE_REMOTE").as_deref(),
             ) {
                 format!("https://github.com/{url}.git")
             } else {
@@ -1720,8 +1720,7 @@ pub fn load_all_plugins_cache_only()
 {
     use futures::FutureExt;
     let promise = if crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_SYNC_PLUGIN_INSTALL")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_SYNC_PLUGIN_INSTALL")
             .as_deref(),
     ) {
         return futures::future::Either::Left(load_all_plugins());
@@ -2162,11 +2161,11 @@ mod tests {
     use super::super::load_plugin_agents::load_plugin_agents_from_plugins;
     use super::*;
     use crate::types::plugin::PluginComponent;
-    use crate::utils::env_utils::{EnvVarGuard, TEST_ENV_LOCK};
     use crate::utils::plugins::schemas::PluginManifest;
     use crate::utils::settings::{
         constants::SettingSource, settings_cache, validation::SettingsWithErrors,
     };
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::fs;
     fn temp_dir(label: &str) -> PathBuf {
         let root =

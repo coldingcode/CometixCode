@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::types::permissions::PermissionMode;
+use crate::utils::process_env::JsTruthy;
 use crate::utils::swarm::backends::teammate_mode_snapshot::get_teammate_mode_from_snapshot;
 use crate::utils::swarm::constants::TEAMMATE_COMMAND_ENV_VAR;
 
@@ -56,7 +57,7 @@ pub fn get_teammate_command_from_parts(
     teammate_command_env: Option<&str>,
     current_executable: impl Into<PathBuf>,
 ) -> String {
-    if let Some(command) = teammate_command_env.filter(|value| !value.is_empty()) {
+    if let Some(command) = teammate_command_env.truthy() {
         return command.to_string();
     }
     current_executable.into().display().to_string()
@@ -66,7 +67,7 @@ pub fn get_teammate_command_from_parts(
 pub fn get_teammate_command() -> String {
     let executable = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("cometix"));
     get_teammate_command_from_parts(
-        std::env::var(TEAMMATE_COMMAND_ENV_VAR).ok().as_deref(),
+        crate::utils::process_env::var(TEAMMATE_COMMAND_ENV_VAR).as_deref(),
         executable,
     )
 }
@@ -174,9 +175,13 @@ pub fn build_inherited_env_vars_from_map(env: &BTreeMap<String, String>) -> Stri
     env_vars.join(" ")
 }
 
-/// Maps to: CC `buildInheritedEnvVars()`.
+/// Maps to: CC `buildInheritedEnvVars()`, which reads `process.env` — here the
+/// environment carrier, so settings-applied variables reach the teammate.
 pub fn build_inherited_env_vars() -> String {
-    let env = std::env::vars().collect::<BTreeMap<_, _>>();
+    let env = crate::utils::process_env::snapshot()
+        .iter()
+        .filter_map(|(key, value)| Some((key.to_str()?.to_string(), value.to_str()?.to_string())))
+        .collect::<BTreeMap<_, _>>();
     build_inherited_env_vars_from_map(&env)
 }
 

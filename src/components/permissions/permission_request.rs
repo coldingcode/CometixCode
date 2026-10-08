@@ -10,9 +10,7 @@ use super::enter_plan_mode_permission_request::{
 use super::exit_plan_mode_permission_request::{
     ExitPlanModePermissionRequest, exit_plan_mode_selection_to_prompt_response,
 };
-use super::fallback_permission_request::{
-    FallbackPermissionRequest, fallback_permission_option_to_prompt_choice,
-};
+use super::fallback_permission_request::FallbackPermissionRequest;
 use super::file_edit_permission_request::FileEditPermissionRequest;
 use super::file_write_permission_request::FileWritePermissionRequest;
 use super::filesystem_permission_request::FilesystemPermissionRequest;
@@ -76,8 +74,9 @@ pub struct PermissionRequestProps {
     /// Maps to: CC `toolUseContext.messages` consumed by permission explainer.
     pub messages: Arc<Vec<Message>>,
     /// Maps to CC `PermissionRequestProps.onReject` reaching
-    /// `toolUseConfirm.onReject()` — the `app:interrupt` (Ctrl-C) keybinding at
-    /// `PermissionRequest.tsx:206-214`. CC's Esc leg reaches the same row method
+    /// `toolUseConfirm.onReject()` — the `app:interrupt` keybinding at
+    /// `PermissionRequest.tsx:206-214` (CC's Ctrl-C; Cometix binds Ctrl-C to
+    /// `app:exit`, so here it is a key a user binds to it). CC's Esc leg reaches the same row method
     /// through `PermissionPrompt.tsx:219-231` → `FallbackPermissionRequest.tsx:108-121`;
     /// in this port Esc is a `Deny` on
     /// [`on_select_response`](PermissionRequestProps::on_select_response)
@@ -118,7 +117,10 @@ fn tool_permission_context_for_request(
 }
 
 #[component]
-pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement<'static>> {
+pub fn PermissionRequest(
+    props: &PermissionRequestProps,
+    mut hooks: Hooks,
+) -> impl Into<AnyElement<'static>> {
     // Maps to: CC `isPermissionExplainerEnabled()` (permissionExplainer.ts:139-141),
     // a config-only gate CC reads leaf-local in `usePermissionExplainerUI`
     // (PermissionExplanation.tsx:101). Re-derived from the live global config on
@@ -180,6 +182,27 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
     let on_cancel = Handler::<()>::from(move |_: ()| {
         (props_on_cancel)(cancel_tool_use_id.clone());
     });
+    // CC :206-214: app:interrupt (CC's Ctrl+C; not Cometix's, which binds
+    // Ctrl+C to app:exit) rejects whichever dialog shows. It runs after the
+    // dialog's own listeners, as a parent's do; the REPL's cancel handler
+    // leaves it the key while the dialog's list registers an overlay.
+    let runtime = hooks
+        .try_use_context::<crate::keybindings::keybinding_context::KeybindingRuntime>()
+        .map(|runtime| runtime.clone());
+    crate::keybindings::use_keybinding::use_keybinding(
+        &mut hooks,
+        runtime,
+        "app:interrupt",
+        crate::keybindings::types::ContextName::Confirmation,
+        || true,
+        {
+            let on_cancel = on_cancel.clone();
+            move || {
+                on_cancel(());
+                true
+            }
+        },
+    );
 
     if request.tool_name.eq_ignore_ascii_case("bash") {
         let on_select = props.on_select.clone();
@@ -292,9 +315,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
                         ),
                     );
                 },
-                on_cancel: move |_| {
-                    (on_cancel)(());
-                },
             )
         }
         .into_any();
@@ -302,7 +322,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
     if request.tool_name.eq_ignore_ascii_case("powershell") {
         let on_select = props.on_select.clone();
         let on_select_response = on_select_response.clone();
-        let on_cancel = on_cancel.clone();
         let suggestions = request
             .rule
             .rule_content
@@ -361,9 +380,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
                         ),
                     );
                 },
-                on_cancel: move |_| {
-                    (on_cancel)(());
-                },
             )
         }
         .into_any();
@@ -371,7 +387,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
     if request.tool_name == "AskUserQuestion" {
         let on_select = props.on_select.clone();
         let on_select_response = on_select_response.clone();
-        let on_cancel = on_cancel.clone();
 
         return element! {
             AskUserQuestionPermissionRequest(
@@ -380,9 +395,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
                 on_select: move |response| {
                     emit_prompt_response(&on_select, &on_select_response, response);
                 },
-                on_cancel: move |_| {
-                    (on_cancel)(());
-                },
             )
         }
         .into_any();
@@ -390,7 +402,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
     if request.tool_name.eq_ignore_ascii_case("webfetch") {
         let on_select = props.on_select.clone();
         let on_select_response = on_select_response.clone();
-        let on_cancel = on_cancel.clone();
 
         let response_request = request.clone();
 
@@ -408,9 +419,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
                         web_fetch_permission_option_to_prompt_response(value, &response_request),
                     );
                 },
-                on_cancel: move |_| {
-                    (on_cancel)(());
-                },
             )
         }
         .into_any();
@@ -418,7 +426,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
     if request.tool_name == "EnterPlanMode" {
         let on_select = props.on_select.clone();
         let on_select_response = on_select_response.clone();
-        let on_cancel = on_cancel.clone();
 
         return element! {
             EnterPlanModePermissionRequest(
@@ -427,9 +434,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
                 on_select: move |value| {
                     emit_prompt_choice(&on_select, &on_select_response, enter_plan_mode_permission_option_to_prompt_choice(value));
                 },
-                on_cancel: move |_| {
-                    (on_cancel)(());
-                },
             )
         }
         .into_any();
@@ -437,7 +441,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
     if request.tool_name == "ExitPlanMode" {
         let on_select = props.on_select.clone();
         let on_select_response = on_select_response.clone();
-        let on_cancel = on_cancel.clone();
 
         return element! {
             ExitPlanModePermissionRequest(
@@ -450,9 +453,6 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
                         &on_select_response,
                         exit_plan_mode_selection_to_prompt_response(selection),
                     );
-                },
-                on_cancel: move |_| {
-                    (on_cancel)(());
                 },
             )
         }
@@ -548,19 +548,14 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
     if request.tool_name == "Skill" {
         let on_select = props.on_select.clone();
         let on_select_response = on_select_response.clone();
-        let on_cancel = on_cancel.clone();
 
         return element! {
             SkillPermissionRequest(
                 request: Some(request),
                 worker_badge: props.worker_badge.clone(),
-                show_always_allow_options: true,
-                on_select: move |response| {
+                on_select: Handler::from(move |response| {
                     emit_prompt_response(&on_select, &on_select_response, response);
-                },
-                on_cancel: move |_| {
-                    (on_cancel)(());
-                },
+                }),
             )
         }
         .into_any();
@@ -571,14 +566,10 @@ pub fn PermissionRequest(props: &PermissionRequestProps) -> impl Into<AnyElement
     element! {
         FallbackPermissionRequest(
             request: Some(request),
-            show_always_allow_options: true,
             worker_badge: props.worker_badge.clone(),
-            on_select: move |value| {
-                emit_prompt_choice(&on_select, &on_select_response, fallback_permission_option_to_prompt_choice(value));
-            },
-            on_cancel: move |_| {
-                (on_cancel)(());
-            },
+            on_select: Handler::from(move |response| {
+                emit_prompt_response(&on_select, &on_select_response, response);
+            }),
         )
     }
     .into_any()
@@ -591,6 +582,7 @@ mod tests {
     use crate::components::prompt_input::PromptInput;
     use crate::types::message::{RenderableMessage, RenderableMessageKind, ToolUseStatus};
     use crate::types::permissions::{PermissionMode, PermissionRuleValue};
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use crate::utils::theme;
     use futures::StreamExt;
     use std::sync::Mutex;
@@ -887,11 +879,43 @@ mod tests {
 
     /// Drive a dialog element with `events` until it settles, so the answer
     /// callbacks have fired.
-    async fn drive_dialog(mut app: AnyElement<'static>, events: Vec<TerminalEvent>) {
-        // `ignore_ctrl_c`: the interrupt keybinding is a dialog answer here
-        // (CC `PermissionRequest.tsx:206-214`), so the harness must not take
-        // iocraft's default "Ctrl-C ends the render loop" before the component
-        // has re-rendered and delivered it.
+    async fn drive_dialog(app: AnyElement<'static>, events: Vec<TerminalEvent>) {
+        drive_dialog_with(
+            app,
+            events,
+            crate::keybindings::keybinding_context::KeybindingRuntime::with_default_bindings(),
+        )
+        .await;
+    }
+
+    /// The default bindings plus F6 for `app:interrupt`: Cometix binds Ctrl+C
+    /// to `app:exit`, so the dispatcher's interrupt is reached through a key a
+    /// user binds to it.
+    fn runtime_with_interrupt_key() -> crate::keybindings::keybinding_context::KeybindingRuntime {
+        let mut bindings = crate::keybindings::default_bindings::default_bindings();
+        bindings.push(crate::keybindings::types::ParsedBinding {
+            chord: crate::keybindings::parser::parse_chord("f6"),
+            action: Some("app:interrupt".to_string()),
+            context: crate::keybindings::types::ContextName::Global,
+        });
+        crate::keybindings::keybinding_context::KeybindingRuntime::new(bindings)
+    }
+
+    async fn drive_dialog_with(
+        app: AnyElement<'static>,
+        events: Vec<TerminalEvent>,
+        runtime: crate::keybindings::keybinding_context::KeybindingRuntime,
+    ) {
+        // The dialogs answer through keybindings (their Select's, and the
+        // dispatcher's app:interrupt), so they run under a runtime.
+        let mut app = element! {
+            ContextProvider(value: Context::owned(runtime)) {
+                #(vec![app])
+            }
+        }
+        .into_any();
+        // `ignore_ctrl_c`, as production does (CC `exitOnCtrlC: false`): a
+        // Ctrl+C no dialog takes must leave the loop running, not end it.
         let mut render_loop = Box::pin(
             app.mock_terminal_render_loop(
                 MockTerminalConfig::with_events(futures::stream::iter(events))
@@ -950,10 +974,11 @@ mod tests {
     }
 
     /// Maps to: CC `PermissionRequest.tsx:206-214` — the `app:interrupt`
-    /// (Ctrl-C) keybinding rejects through `toolUseConfirm.onReject()`, i.e. the
+    /// keybinding rejects through `toolUseConfirm.onReject()`, i.e. the
     /// rendered row's own callback. The cancel leg needs the same address as the
-    /// allow leg, or a Ctrl-C that arrives after its row was withdrawn drops the
-    /// successor instead.
+    /// allow leg, or an interrupt that arrives after its row was withdrawn drops
+    /// the successor instead. (Cometix binds Ctrl+C to `app:exit`; F6 stands in
+    /// for a key a user binds to `app:interrupt`.)
     ///
     /// OLD SHAPE: `on_cancel` was `Handler<()>` and carried nothing, so
     /// `screens/repl.rs#on_permission_cancel` denied `queue[0]`.
@@ -961,7 +986,7 @@ mod tests {
     async fn a_dialog_cancel_names_the_row_the_dialog_rendered() {
         let cancelled = Arc::new(Mutex::new(Vec::<String>::new()));
         let recorder = cancelled.clone();
-        drive_dialog(
+        drive_dialog_with(
             element! {
                 ContextProvider(value: Context::owned(*theme::current())) {
                     PermissionRequest(
@@ -971,11 +996,103 @@ mod tests {
                 }
             }
             .into_any(),
-            vec![modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL)],
+            vec![key(KeyCode::F(6))],
+            runtime_with_interrupt_key(),
         )
         .await;
 
         assert_eq!(cancelled.lock().unwrap().as_slice(), &["toolu".to_string()]);
+    }
+
+    fn skill_request() -> PermissionRequestData {
+        PermissionRequestData {
+            tool_name: "Skill".to_string(),
+            input: serde_json::json!({ "skill": "deploy" }),
+            rule: PermissionRuleValue::new("Skill", Some("deploy".to_string())),
+            ..custom_tool_request()
+        }
+    }
+
+    /// Maps to: CC `PermissionRequest.tsx:206-214` over
+    /// `PermissionPrompt.tsx:219-231`: `app:interrupt` is the dispatcher's
+    /// (the row's `onReject`), Esc the prompt's own cancel (a rejection
+    /// answer); the prompt keeps no interrupt of its own, so each key reaches
+    /// exactly one of them. Ctrl+C reaches neither: Cometix binds it to
+    /// `app:exit` (2.0.x semantics), which this dialog does not take.
+    #[tokio::test]
+    async fn a_prompt_dialog_leaves_the_interrupt_to_the_dispatcher_and_answers_esc() {
+        for (event, cancels, answers) in [
+            (key(KeyCode::F(6)), vec!["toolu".to_string()], vec![]),
+            (key(KeyCode::Esc), vec![], vec![PermissionPromptChoice::Deny]),
+            (modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL), vec![], vec![]),
+        ] {
+            let cancelled = Arc::new(Mutex::new(Vec::<String>::new()));
+            let answered = Arc::new(Mutex::new(Vec::<PermissionPromptChoice>::new()));
+            let (cancel_recorder, answer_recorder) = (cancelled.clone(), answered.clone());
+            drive_dialog_with(
+                element! {
+                    ContextProvider(value: Context::owned(*theme::current())) {
+                        PermissionRequest(
+                            request: Some(skill_request()),
+                            on_select_response: move |response: PermissionPromptResponse| {
+                                answer_recorder.lock().unwrap().push(response.choice)
+                            },
+                            on_cancel: move |tool_use_id| cancel_recorder.lock().unwrap().push(tool_use_id),
+                        )
+                    }
+                }
+                .into_any(),
+                vec![event.clone()],
+                runtime_with_interrupt_key(),
+            )
+            .await;
+            assert_eq!(*cancelled.lock().unwrap(), cancels, "{event:?}");
+            assert_eq!(*answered.lock().unwrap(), answers, "{event:?}");
+        }
+    }
+
+    /// The dialogs that kept a Ctrl+C reject of their own, which CC's never
+    /// had: under Cometix's binding (Ctrl+C → `app:exit`, which no permission
+    /// dialog takes) Ctrl+C now answers nothing in them, while a key bound to
+    /// `app:interrupt` still reaches the dispatcher (CC :206-214).
+    #[tokio::test]
+    async fn ctrl_c_answers_nothing_in_the_tool_dialogs() {
+        for request in [
+            bash_request(),
+            powershell_request(),
+            web_fetch_request(),
+            enter_plan_request(),
+            exit_plan_request(),
+        ] {
+            let tool = request.tool_name.clone();
+            for (event, cancels) in [
+                (modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL), 0),
+                (key(KeyCode::F(6)), 1),
+            ] {
+                let cancelled = Arc::new(Mutex::new(0usize));
+                let answered = Arc::new(Mutex::new(Vec::<PermissionPromptChoice>::new()));
+                let (cancel_recorder, answer_recorder) = (cancelled.clone(), answered.clone());
+                drive_dialog_with(
+                    element! {
+                        ContextProvider(value: Context::owned(*theme::current())) {
+                            PermissionRequest(
+                                request: Some(request.clone()),
+                                on_select_response: move |response: PermissionPromptResponse| {
+                                    answer_recorder.lock().unwrap().push(response.choice)
+                                },
+                                on_cancel: move |_| *cancel_recorder.lock().unwrap() += 1,
+                            )
+                        }
+                    }
+                    .into_any(),
+                    vec![event.clone()],
+                    runtime_with_interrupt_key(),
+                )
+                .await;
+                assert_eq!(*cancelled.lock().unwrap(), cancels, "{tool} {event:?}");
+                assert!(answered.lock().unwrap().is_empty(), "{tool} {event:?}");
+            }
+        }
     }
 
     fn transcript_fixture_messages(count: usize) -> Vec<RenderableMessage> {
@@ -1283,7 +1400,7 @@ mod tests {
     #[test]
     fn permission_request_projects_explicit_unsandboxed_bash_metadata() {
         struct ConfigGuard {
-            config_dir: Option<crate::utils::env_utils::EnvVarGuard>,
+            config_dir: Option<EnvVarGuard>,
             previous_original_cwd: std::path::PathBuf,
             root: std::path::PathBuf,
         }
@@ -1296,7 +1413,7 @@ mod tests {
             }
         }
 
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-bash-permission-sandbox-{}",
             uuid::Uuid::new_v4().simple()
@@ -1308,10 +1425,7 @@ mod tests {
         )
         .unwrap();
         let _config = ConfigGuard {
-            config_dir: Some(crate::utils::env_utils::EnvVarGuard::set(
-                "CLAUDE_CONFIG_DIR",
-                &root,
-            )),
+            config_dir: Some(EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root)),
             previous_original_cwd: crate::bootstrap::state::get_original_cwd(),
             root: root.clone(),
         };
@@ -1340,8 +1454,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn permission_request_delegates_bash_sed_to_official_sed_edit_dialog() {
+    #[tokio::test]
+    async fn permission_request_delegates_bash_sed_to_official_sed_edit_dialog() {
         let path = std::env::temp_dir().join(format!(
             "cometix-permission-sed-{}.txt",
             uuid::Uuid::new_v4().simple()
@@ -1368,7 +1482,7 @@ mod tests {
             mode: PermissionMode::Default,
         };
         let current_theme = *theme::current();
-        let text = element! {
+        let mut app = element! {
             ContextProvider(value: Context::owned(current_theme)) {
                 PermissionRequest(
                     request: Some(request),
@@ -1376,9 +1490,24 @@ mod tests {
                     on_cancel: move |_| {},
                 )
             }
-        }
-        .render(Some(140))
-        .to_string();
+        };
+        // The Sed child matches CC Suspense: its initial frame is empty while
+        // readFile is pending. Mount and await the actual completed preview.
+        use futures::StreamExt;
+        let mut frames = Box::pin(app.mock_terminal_render_loop(
+            MockTerminalConfig::with_events(futures::stream::pending()).with_size(140, 40),
+        ));
+        let text = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(frame) = frames.next().await {
+                let text = frame.to_string();
+                if text.contains("hello new") {
+                    return text;
+                }
+            }
+            panic!("Sed permission delegation ended before the async preview completed");
+        })
+        .await
+        .expect("delegated Sed preview must complete");
         let _ = std::fs::remove_file(&path);
 
         assert!(text.contains("Edit file"), "canvas=\n{text}");
@@ -1490,7 +1619,9 @@ mod tests {
 
         assert!(text.contains("Proceed?"), "canvas=\n{text}");
         assert!(text.contains("Yes"), "canvas=\n{text}");
-        assert!(text.contains("Other"), "canvas=\n{text}");
+        // CC select-input-option.tsx:341-345: the unfocused Other shows its
+        // placeholder.
+        assert!(text.contains("Type something."), "canvas=\n{text}");
         assert!(text.contains("Chat about this"), "canvas=\n{text}");
         assert!(
             !text.contains("Tool use"),

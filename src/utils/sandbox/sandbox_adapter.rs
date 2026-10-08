@@ -12,6 +12,7 @@ use crate::tools::web_fetch_tool::prompt::WEB_FETCH_TOOL_NAME;
 use crate::types::permissions::PermissionUpdate;
 use crate::utils::permissions::filesystem::get_claude_temp_dir;
 use crate::utils::permissions::permission_rule_parser::permission_rule_value_from_string;
+use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::constants::SettingSource;
 use crate::utils::settings::managed_path::get_managed_settings_drop_in_dir;
 use crate::utils::settings::types::SettingsJson;
@@ -294,9 +295,12 @@ pub fn check_dependencies_readonly() -> SandboxDependencyCheck {
     }
 }
 
+/// sandbox-runtime's `whichSync` (`utils/which.js`) is Bun.which, which reads
+/// the startup PATH, as `utils/which.rs` does.
 fn command_exists(command: &str) -> bool {
-    std::env::var_os("PATH")
-        .is_some_and(|path| std::env::split_paths(&path).any(|dir| dir.join(command).is_file()))
+    crate::utils::process_env::startup_snapshot()
+        .var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(path).any(|dir| dir.join(command).is_file()))
 }
 
 /// Maps to: CC `utils/sandbox/sandbox-adapter.ts:491-493` `isSupportedPlatform`.
@@ -322,17 +326,7 @@ pub fn is_platform_in_enabled_list() -> bool {
         return false;
     }
 
-    let current_platform = if crate::utils::env::is_wsl() {
-        "wsl"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else if cfg!(target_os = "linux") {
-        "linux"
-    } else if cfg!(target_os = "windows") {
-        "windows"
-    } else {
-        std::env::consts::OS
-    };
+    let current_platform = crate::utils::platform::get_platform().as_str();
     enabled_platforms
         .iter()
         .any(|platform| platform.as_str() == Some(current_platform))
@@ -873,11 +867,13 @@ fn wrap_shell_command_macos(
 }
 
 fn proxy_environment(http_port: u16, socks_port: u16) -> Vec<String> {
-    let tmpdir = std::env::var("CLAUDE_TMPDIR").unwrap_or_else(|_| {
-        crate::utils::permissions::filesystem::get_claude_temp_dir()
-            .display()
-            .to_string()
-    });
+    let tmpdir = crate::utils::process_env::var("CLAUDE_TMPDIR")
+        .truthy()
+        .unwrap_or_else(|| {
+            crate::utils::permissions::filesystem::get_claude_temp_dir()
+                .display()
+                .to_string()
+        });
     let no_proxy = "localhost,127.0.0.1,::1,*.local,.local,169.254.0.0/16,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16";
     vec![
         "SANDBOX_RUNTIME=1".to_string(),
@@ -1481,8 +1477,18 @@ fn write_local_settings_value(value: &serde_json::Value) -> anyhow::Result<()> {
     result
 }
 
-/// Maps to: CC `setSandboxSettings(...)`.
-pub fn set_sandbox_settings(options: SandboxSettingsUpdate) -> anyhow::Result<()> {
+/// Maps to: CC `sandbox-adapter.ts:669-691#setSandboxSettings`. Its promise
+/// never rejects: it calls `updateSettingsForSource('localSettings', …)` and
+/// drops the `{ error }` that function returns after logging it
+/// (settings.ts:515-520). A failed write is logged here the same way and
+/// the caller carries on.
+pub fn set_sandbox_settings(options: SandboxSettingsUpdate) {
+    if let Err(error) = write_sandbox_settings_update(options) {
+        crate::utils::log::log_error(crate::utils::log::LogError::new(error.to_string()));
+    }
+}
+
+fn write_sandbox_settings_update(options: SandboxSettingsUpdate) -> anyhow::Result<()> {
     let mut value = read_local_settings_value()?;
     if !value.is_object() {
         value = serde_json::json!({});
@@ -1881,14 +1887,12 @@ fn parse_sandbox_violation_lines(stderr: &str) -> Vec<String> {
 fn expand_path(pattern: &str, root: &Path) -> String {
     let trimmed = pattern.trim();
     if trimmed == "~" {
-        if let Some(home) = home_dir() {
-            return home;
-        }
+        return crate::utils::node_os::homedir()
+            .to_string_lossy()
+            .into_owned();
     }
     if let Some(rest) = trimmed.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return normalize_path_string(PathBuf::from(home).join(rest));
-        }
+        return normalize_path_string(crate::utils::node_os::homedir().join(rest));
     }
 
     let path = Path::new(trimmed);
@@ -1903,29 +1907,11 @@ fn normalize_path_string(path: PathBuf) -> String {
     path.components().collect::<PathBuf>().display().to_string()
 }
 
-fn home_dir() -> Option<String> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::TEST_ENV_LOCK;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::path::Path;
-
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set_path(key: &'static str, path: &Path) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, path),
-            }
-        }
-    }
 
     struct CwdGuard {
         old: PathBuf,
@@ -2185,7 +2171,7 @@ mod tests {
             r#"{"sandbox":{"network":{"allowManagedDomainsOnly":true}}}"#,
         )
         .unwrap();
-        let _managed_guard = EnvGuard::set_path("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &root);
+        let _managed_guard = EnvVarGuard::set("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &root);
 
         assert!(should_allow_managed_sandbox_domains_only());
         let _ = std::fs::remove_dir_all(&root);
@@ -2199,7 +2185,7 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();
-        let _managed_guard = EnvGuard::set_path("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &root);
+        let _managed_guard = EnvVarGuard::set("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &root);
 
         assert!(!should_allow_managed_sandbox_domains_only());
         let _ = std::fs::remove_dir_all(&root);
@@ -2286,8 +2272,8 @@ mod tests {
         )
         .unwrap();
         let _cwd_guard = CwdGuard::set(&root);
-        let _managed_guard = EnvGuard::set_path("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &managed);
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &config_home);
+        let _managed_guard = EnvVarGuard::set("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &managed);
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
 
         let settings = get_initial_settings();
         let config = convert_to_sandbox_runtime_config(&settings);
@@ -2406,8 +2392,8 @@ mod tests {
         )
         .unwrap();
         let _cwd_guard = CwdGuard::set(&root);
-        let _managed_guard = EnvGuard::set_path("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &managed);
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &config_home);
+        let _managed_guard = EnvVarGuard::set("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &managed);
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
 
         let settings = get_initial_settings();
         let config = convert_to_sandbox_runtime_config(&settings);
@@ -2455,17 +2441,7 @@ mod tests {
         let workspace = root.join("workspace");
         std::fs::create_dir_all(&config_home).unwrap();
         std::fs::create_dir_all(&workspace).unwrap();
-        let current_platform = if crate::utils::env::is_wsl() {
-            "wsl"
-        } else if cfg!(target_os = "macos") {
-            "macos"
-        } else if cfg!(target_os = "linux") {
-            "linux"
-        } else if cfg!(target_os = "windows") {
-            "windows"
-        } else {
-            std::env::consts::OS
-        };
+        let current_platform = crate::utils::platform::get_platform().as_str();
         std::fs::write(
             config_home.join("settings.json"),
             serde_json::to_vec(&serde_json::json!({
@@ -2480,8 +2456,8 @@ mod tests {
 
         {
             let _cwd_guard = CwdGuard::set(&workspace);
-            let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &config_home);
-            let _managed_guard = EnvGuard::set_path(
+            let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
+            let _managed_guard = EnvVarGuard::set(
                 "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
                 &root.join("missing-managed-settings.json"),
             );
@@ -2622,7 +2598,7 @@ mod tests {
             }
         }
 
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _reset = ResetStore;
         let store = get_sandbox_violation_store();
         store.reset_for_test();
@@ -2676,7 +2652,7 @@ mod tests {
     /// its process-wide mutex would cascade into unrelated tests.
     #[test]
     fn violation_listener_reenters_app_store_turn_on_same_thread() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let store = get_sandbox_violation_store();

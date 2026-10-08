@@ -79,7 +79,7 @@ pub fn on_change_app_state(new: &AppState, old: &AppState) {
         // Settings persistence respects COMETIX_WRITE_ENABLED like
         // save_global_config.
         if crate::utils::env_utils::is_env_truthy(
-            std::env::var("COMETIX_WRITE_ENABLED").ok().as_deref(),
+            crate::utils::process_env::var("COMETIX_WRITE_ENABLED").as_deref(),
         ) {
             let mut updates = serde_json::Map::new();
             match &new.main_loop_model {
@@ -148,14 +148,20 @@ pub fn on_change_app_state(new: &AppState, old: &AppState) {
         // CC also clears AWS/GCP credential caches; those helpers are not
         // ported yet — attach here when auth.ts parity lands.
         //
-        // CC :164 gates on `newState.settings.env !== oldState.settings.env`
-        // — REFERENCE inequality. Every settings reload re-parses, so the env
-        // references differ whenever either side carries an env object; the
-        // gate only short-circuits when both are undefined. Value equality
-        // here would under-fire: a reload with identical env values must
-        // still re-apply (and re-run the source effects inside
-        // applyConfigEnvironmentVariables when those owners land).
-        if new.settings.env.is_some() || old.settings.env.is_some() {
+        // CC :164 gates on `newState.settings.env !== oldState.settings.env`,
+        // a REFERENCE inequality, which `Arc::ptr_eq` is.
+        // - A reload re-parses, so its env is a new `Arc` and re-applies even
+        //   with identical values. Value equality would under-fire.
+        // - An update that keeps the env `Arc` does not re-apply, e.g. a
+        //   spread-style `Arc::make_mut` (ThemePicker Ctrl+T) or `/config`
+        //   Esc writing its snapshot back. CC's spread keeps the reference
+        //   too.
+        let env_changed = match (&new.settings.env, &old.settings.env) {
+            (None, None) => false,
+            (Some(new_env), Some(old_env)) => !Arc::ptr_eq(new_env, old_env),
+            _ => true,
+        };
+        if env_changed {
             crate::utils::managed_env::apply_config_environment_variables();
         }
     }
@@ -174,6 +180,7 @@ mod tests {
     use crate::tool::ToolPermissionContext;
     use crate::types::permissions::PermissionMode;
     use crate::utils::session_state::SessionExternalMetadata;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     fn apply(metadata: &SessionExternalMetadata) -> AppState {
         let mut state = AppState::default();
@@ -278,8 +285,8 @@ mod tests {
 
     #[test]
     fn model_changes_update_runtime_override_matches_official_even_when_writes_are_disabled() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write = crate::utils::env_utils::EnvVarGuard::unset("COMETIX_WRITE_ENABLED");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _write = EnvVarGuard::unset("COMETIX_WRITE_ENABLED");
         let previous_override = crate::bootstrap::state::get_main_loop_model_override();
 
         let store = AppStore::new(AppState::default(), Some(default_on_change()));
@@ -312,5 +319,61 @@ mod tests {
             store.get().settings.model.as_deref(),
             Some("claude-sonnet-4-6")
         );
+    }
+
+    /// CC `:164`: `newState.settings.env !== oldState.settings.env`. A settings
+    /// update that keeps the env reference (a spread, like ThemePicker's
+    /// Ctrl+T) does not re-apply; a reload, whose env is a new reference, does.
+    #[test]
+    fn settings_env_reapplies_only_for_a_new_env_reference() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "cometix-env-reference-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"env":{"COMETIX_ENV_REFERENCE_PROBE":"applied"}}"#,
+        )
+        .unwrap();
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root);
+        let _probe = EnvVarGuard::unset("COMETIX_ENV_REFERENCE_PROBE");
+        crate::utils::settings::settings_cache::reset_settings_cache();
+
+        let mut old = AppState::default();
+        let mut settings = (*old.settings).clone();
+        settings.env = Some(Arc::new(indexmap::IndexMap::from([(
+            "COMETIX_ENV_REFERENCE_PROBE".to_string(),
+            "applied".to_string(),
+        )])));
+        old.settings = Arc::new(settings);
+
+        let mut spread = old.clone();
+        let mut settings = (*spread.settings).clone();
+        settings.model = Some("claude-sonnet-4-6".to_string());
+        spread.settings = Arc::new(settings);
+        on_change_app_state(&spread, &old);
+        assert_eq!(
+            crate::utils::process_env::var("COMETIX_ENV_REFERENCE_PROBE"),
+            None,
+            "a spread keeps the env reference and must not re-apply"
+        );
+
+        let mut reloaded = spread.clone();
+        let mut settings = (*reloaded.settings).clone();
+        settings.env = Some(Arc::new((**spread.settings.env.as_ref().unwrap()).clone()));
+        reloaded.settings = Arc::new(settings);
+        on_change_app_state(&reloaded, &spread);
+        assert_eq!(
+            crate::utils::process_env::var("COMETIX_ENV_REFERENCE_PROBE").as_deref(),
+            Some("applied"),
+            "a reload's new env reference re-applies, even with equal values"
+        );
+
+        crate::utils::settings::settings_cache::reset_settings_cache();
+        let _ = std::fs::remove_dir_all(root);
     }
 }

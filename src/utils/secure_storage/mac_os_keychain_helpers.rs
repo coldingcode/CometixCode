@@ -1,5 +1,6 @@
 //! Maps to: CC `utils/secureStorage/macOsKeychainHelpers.ts`.
 
+use crate::utils::process_env::JsTruthy;
 use sha2::{Digest, Sha256};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -13,8 +14,12 @@ pub(crate) const CREDENTIALS_SERVICE_SUFFIX: &str = "-credentials";
 pub(crate) fn get_mac_os_keychain_storage_service_name(
     service_suffix: &str,
 ) -> anyhow::Result<String> {
-    let config_dir = crate::utils::config::get_config_home();
-    let dir_hash = if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+    let config_dir = crate::utils::env_utils::get_claude_config_home_dir();
+    let dir_hash = if crate::utils::process_env::var_os("CLAUDE_CONFIG_DIR")
+        .as_deref()
+        .truthy()
+        .is_none()
+    {
         String::new()
     } else {
         let digest = Sha256::digest(config_dir.to_string_lossy().as_bytes());
@@ -34,7 +39,7 @@ pub(crate) fn get_mac_os_keychain_storage_service_name(
 /// Maps to: CC `utils/secureStorage/macOsKeychainHelpers.ts:43-49`
 /// `getUsername`.
 pub(crate) fn get_username() -> String {
-    if let Some(username) = std::env::var("USER").ok().filter(|value| !value.is_empty()) {
+    if let Some(username) = crate::utils::process_env::var("USER").truthy() {
         return username;
     }
 
@@ -67,10 +72,7 @@ pub(crate) fn get_username() -> String {
     }
 
     #[cfg(windows)]
-    if let Some(username) = std::env::var("USERNAME")
-        .ok()
-        .filter(|value| !value.is_empty())
-    {
+    if let Some(username) = crate::utils::process_env::var("USERNAME").truthy() {
         return username;
     }
 
@@ -133,43 +135,29 @@ pub(crate) fn prime_keychain_cache_from_prefetch(stdout: Option<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: Option<&std::ffi::OsStr>) -> Self {
-            Self {
-                _env: match value {
-                    Some(value) => crate::utils::env_utils::EnvVarGuard::set(key, value),
-                    None => crate::utils::env_utils::EnvVarGuard::unset(key),
-                },
-            }
-        }
-    }
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[cfg(target_os = "macos")]
     #[test]
     fn username_falls_back_to_os_account_not_logname() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _user = EnvGuard::set("USER", None);
-        let _logname = EnvGuard::set("LOGNAME", Some(std::ffi::OsStr::new("wrong-logname")));
+        let _user = EnvVarGuard::unset("USER");
+        let _logname = EnvVarGuard::set("LOGNAME", "wrong-logname");
         assert_ne!(get_username(), "wrong-logname");
         assert_ne!(get_username(), "claude-code-user");
     }
 
     #[test]
     fn service_name_and_username_match_official_default_and_custom_dir_shapes() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _config = EnvGuard::set("CLAUDE_CONFIG_DIR", None);
-        let _custom_oauth = EnvGuard::set("CLAUDE_CODE_CUSTOM_OAUTH_URL", None);
-        let _local = EnvGuard::set("USE_LOCAL_OAUTH", None);
-        let _staging = EnvGuard::set("USE_STAGING_OAUTH", None);
+        let _config = EnvVarGuard::unset("CLAUDE_CONFIG_DIR");
+        let _custom_oauth = EnvVarGuard::unset("CLAUDE_CODE_CUSTOM_OAUTH_URL");
+        let _local = EnvVarGuard::unset("USE_LOCAL_OAUTH");
+        let _staging = EnvVarGuard::unset("USE_STAGING_OAUTH");
         assert_eq!(
             get_mac_os_keychain_storage_service_name("").unwrap(),
             "Claude Code"
@@ -180,13 +168,13 @@ mod tests {
         );
         drop(_config);
         let custom_dir = std::path::Path::new("/tmp/cometix-claude-config");
-        let _config = EnvGuard::set("CLAUDE_CONFIG_DIR", Some(custom_dir.as_os_str()));
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", custom_dir);
         assert_eq!(
             get_mac_os_keychain_storage_service_name(CREDENTIALS_SERVICE_SUFFIX).unwrap(),
             "Claude Code-credentials-4f825471"
         );
 
-        let _user = EnvGuard::set("USER", Some(std::ffi::OsStr::new("alice")));
+        let _user = EnvVarGuard::set("USER", "alice");
         assert_eq!(get_username(), "alice");
     }
 }

@@ -15,6 +15,8 @@
 //! this file consumes are inlined below with their own source attribution
 //! rather than reaching across an unported boundary.
 
+use crate::utils::process_env::JsTruthy;
+
 /// Maps to: CC `tools/BriefTool/upload.ts:32` — matches the private_api backend
 /// limit.
 const MAX_UPLOAD_BYTES: u64 = 30 * 1024 * 1024;
@@ -66,9 +68,7 @@ fn get_bridge_token_override() -> Option<String> {
     ) {
         return None;
     }
-    std::env::var("CLAUDE_BRIDGE_OAUTH_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
+    crate::utils::process_env::var("CLAUDE_BRIDGE_OAUTH_TOKEN").truthy()
 }
 
 /// Maps to: CC `bridge/bridgeConfig.ts:27-32` `getBridgeBaseUrlOverride`.
@@ -78,9 +78,7 @@ fn get_bridge_base_url_override() -> Option<String> {
     ) {
         return None;
     }
-    std::env::var("CLAUDE_BRIDGE_BASE_URL")
-        .ok()
-        .filter(|base_url| !base_url.is_empty())
+    crate::utils::process_env::var("CLAUDE_BRIDGE_BASE_URL").truthy()
 }
 
 /// Maps to: CC `bridge/bridgeConfig.ts:38-40` `getBridgeAccessToken`. `None`
@@ -104,10 +102,8 @@ fn get_bridge_base_url() -> Option<String> {
     if let Some(override_url) = get_bridge_base_url_override() {
         return Some(override_url);
     }
-    if let Ok(base_url) = std::env::var("ANTHROPIC_BASE_URL") {
-        if !base_url.is_empty() {
-            return Some(base_url);
-        }
+    if let Some(base_url) = crate::utils::process_env::var("ANTHROPIC_BASE_URL") {
+        return Some(base_url);
     }
     crate::constants::oauth::get_oauth_config()
         .ok()
@@ -243,13 +239,13 @@ pub(crate) async fn upload_brief_attachment(
     let boundary = format!("----FormBoundary{}", uuid::Uuid::new_v4());
     let body = build_multipart_body(&boundary, &filename, mime_type, &content);
 
-    // Rust-only transport initialization: the binary installs this at startup,
-    // while library/test callers can enter this boundary directly.
-    crate::utils::tls_provider::install_crypto_provider();
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(UPLOAD_TIMEOUT_MS))
-        .build()
-    {
+    // CC posts through the global axios instance (`configureGlobalAgents`);
+    // `create_axios_instance` resolves the same proxy, NO_PROXY, mTLS and CA.
+    let client = match crate::utils::proxy::create_axios_instance().and_then(|builder| {
+        Ok(builder
+            .timeout(std::time::Duration::from_millis(UPLOAD_TIMEOUT_MS))
+            .build()?)
+    }) {
         Ok(client) => client,
         Err(error) => {
             debug(&format!("upload threw for {full_path}: {error}"));

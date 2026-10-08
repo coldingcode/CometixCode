@@ -128,7 +128,7 @@ pub(crate) fn exec_file_no_throw_with_cwd(
             stdin: ExecFileStdin::Inherit,
             ..Default::default()
         },
-        None,
+        &crate::utils::process_env::snapshot(),
     ) {
         Ok(process) => process.finish(preserve_output_on_error),
         Err(_) => ExecFileOutput::failed(),
@@ -238,7 +238,7 @@ pub(crate) fn exec_file_no_throw_with_cwd_options(
     let inherited_env = crate::utils::process_env::snapshot();
     let started = match resolve_error {
         Some(error) => Err(error),
-        None => StartedProcess::spawn_options(program, args, &options, Some(&inherited_env)),
+        None => StartedProcess::spawn_options(program, args, &options, &inherited_env),
     };
     let spawn_error = started.as_ref().err().map(|error| {
         let mut output = ExecFileOutput::failed();
@@ -328,7 +328,7 @@ impl StartedProcess {
         program: &str,
         args: &[&str],
         options: &ExecFileWithCwdOptions<'_>,
-        inherited_env: Option<&crate::utils::process_env::EnvSnapshot>,
+        inherited_env: &crate::utils::process_env::EnvSnapshot,
     ) -> std::io::Result<Self> {
         let mut command = Command::new(program);
         command
@@ -352,11 +352,7 @@ impl StartedProcess {
         // CC passes env to Execa with extendEnv's true default. Snapshot the
         // established runtime process.env carrier before spawn, then overlay
         // own properties (including explicit undefined removals).
-        // Old synchronous consumers still inherit the OS environment. Their
-        // migration to the process.env carrier is not part of this adapter.
-        if let Some(inherited_env) = inherited_env {
-            command.env_clear().envs(inherited_env.iter());
-        }
+        command.env_clear().envs(inherited_env.iter());
         for (key, value) in options.env {
             match value {
                 Some(value) => {
@@ -685,6 +681,7 @@ fn captured_output(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK, in_child_process};
 
     fn workdir() -> std::path::PathBuf {
         let path =
@@ -697,18 +694,27 @@ mod tests {
     /// executor, inherits cwd, and returns DCS only after load-buffer succeeds.
     #[test]
     fn clipboard_backend_matches_official_eager_tmux_and_failure_fallback() {
-        use crate::utils::env_utils::EnvVarGuard;
         use std::os::unix::fs::PermissionsExt;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        // iocraft's clipboard reads the session's terminal from the OS environment.
+        let terminal = [
+            ("SSH_CONNECTION", Some("fixture")),
+            ("TMUX", Some("fixture")),
+            ("LC_TERMINAL", Some("iTerm2")),
+        ];
+        if !in_child_process(
+            module_path!(),
+            "clipboard_backend_matches_official_eager_tmux_and_failure_fallback",
+            &terminal,
+        ) {
+            return;
+        }
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let dir = workdir();
         let executable = dir.join("tmux");
         std::fs::write(&executable, "#!/bin/sh\n/bin/cat > \"$CLIP_EXEC_FIXTURE/input\"\nprintf '%s\\n' \"$@\" > \"$CLIP_EXEC_FIXTURE/args\"\n/bin/pwd > \"$CLIP_EXEC_FIXTURE/cwd\"\n[ -f \"$CLIP_EXEC_FIXTURE/success\" ]\n").unwrap();
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
         let _path = EnvVarGuard::set("PATH", &dir);
         let _fixture = EnvVarGuard::set("CLIP_EXEC_FIXTURE", &dir);
-        let _ssh = EnvVarGuard::set("SSH_CONNECTION", "fixture");
-        let _tmux = EnvVarGuard::set("TMUX", "fixture");
-        let _iterm = EnvVarGuard::set("LC_TERMINAL", "iTerm2");
         let clipboard = iocraft::Clipboard::new(std::sync::Arc::new(ExecFileClipboardBackend));
         let future = clipboard.set_clipboard("中文\n🌈");
         let deadline = Instant::now() + Duration::from_secs(4);
@@ -997,8 +1003,7 @@ mod tests {
     /// overrides and undefined removal, with final env captured before await.
     #[test]
     fn options_matches_official_env_inheritance_override_deletion_and_cwd() {
-        use crate::utils::env_utils::EnvVarGuard;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _inherit = EnvVarGuard::set("EXEC_PARITY_INHERIT", "inherited");
         let _override = EnvVarGuard::set("EXEC_PARITY_OVERRIDE", "parent");
         let _remove = EnvVarGuard::set("EXEC_PARITY_REMOVE", "delete-me");

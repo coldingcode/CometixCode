@@ -84,6 +84,18 @@ pub struct SettingsProps<'a> {
     pub session_name: Option<String>,
 }
 
+/// Native placement carrier for CC `Settings.tsx:62`
+/// `useExitOnCtrlCDWithKeybindings()`, like `PermissionRuleListCancelBinding`.
+/// Ink keeps listener registration order, so the pane's hook, mounted before
+/// any submenu, takes Ctrl+C/Ctrl+D ahead of what a submenu mounts later — a
+/// ThemePicker's no-op exit hook, a LanguagePicker's TextInput. iocraft polls
+/// descendants first; a zero-size first child of the pane restores that order.
+#[component]
+fn SettingsExitBinding(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let _ = crate::hooks::use_exit::use_exit_on_ctrl_cd_with_keybindings(&mut hooks, true);
+    element! { View(width: 0u32, height: 0u32) }
+}
+
 /// Maps to: CC components/Settings/Settings.tsx
 #[component]
 pub fn Settings<'a>(
@@ -109,6 +121,9 @@ pub fn Settings<'a>(
     // Settings closes the local command UI.
     let mut config_owns_esc = hooks.use_state(|| false);
     let mut pending_config_result = hooks.use_state(|| None::<String>);
+
+    // CC `Settings.tsx:62` `useExitOnCtrlCDWithKeybindings()` lives in
+    // `SettingsExitBinding`, the pane's first child: see there.
 
     let keybinding_runtime = hooks
         .try_use_context::<crate::keybindings::keybinding_context::KeybindingRuntime>()
@@ -196,6 +211,7 @@ pub fn Settings<'a>(
 
     element! {
         Pane(color: theme.permission) {
+            SettingsExitBinding
             #(if !are_tabs_hidden {
                 Some(element! {
                     View(margin_bottom: 1u32) {
@@ -425,6 +441,193 @@ mod tests {
     }
 
     #[test]
+    fn settings_config_search_box_spans_the_pane() {
+        // CC Config.tsx:1789-1791 roots Config at `width="100%"`, which in
+        // CC's Tab resolves to the pane's content width; the search box, a
+        // direct child of the gap column (:2118-2123), stretches across it.
+        // The permission tabs, with no percentage, follow their content
+        // instead. (Here the tab container is a column, so this catches a
+        // wrapper that stops the stretch; the root's width is checked under
+        // a row parent in config.rs.)
+        // The 110-column pane's content box, inside Pane's `paddingX={2}`
+        // (Pane.tsx:52), is 106 columns from column 2.
+        let text = render_settings_text(Vec::new());
+        let top = text
+            .lines()
+            .find(|line| line.contains('╭'))
+            .unwrap_or_else(|| panic!("no search box; canvas=\n{text}"));
+        let border = top.trim();
+        assert!(top.starts_with("  ╭"), "{top:?}\ncanvas=\n{text}");
+        assert!(border.ends_with('╮'), "{top:?}");
+        assert_eq!(border.chars().count(), 106, "{top:?}\ncanvas=\n{text}");
+    }
+
+    #[test]
+    fn settings_exit_hook_takes_ctrl_c_ahead_of_the_language_input() {
+        // CC `Settings.tsx:62` registers the exit hook (app:interrupt and
+        // app:exit, Ctrl+C's action here) with the pane, before
+        // LanguagePicker's TextInput mounts, so Ctrl+C arms the exit double
+        // press and never clears the typed language. Frame-driven: each step
+        // waits for the frame the previous one produced; the trailing `z`
+        // guarantees a frame either way.
+        crate::utils::process_runtime::initialize_test_process_runtime();
+        let last = futures::executor::block_on(async {
+            let (keys, events) = async_channel::unbounded();
+            let mut app = element!(SettingsHarness);
+            let mut frames = Box::pin(app.mock_terminal_render_loop(
+                MockTerminalConfig::with_events(events).with_size(110, 30),
+            ));
+            let mut stage = 0;
+            let mut last = String::new();
+            while let Some(canvas) = frames.next().await {
+                last = canvas_lines(&canvas).join("\n");
+                match stage {
+                    0 => {
+                        let mut open = text_events("language");
+                        open.push(press(KeyCode::Enter));
+                        open.push(press(KeyCode::Char(' ')));
+                        for event in open {
+                            keys.send(event).await.unwrap();
+                        }
+                        stage = 1;
+                    }
+                    1 if last.contains("Enter your preferred response and voice language:") => {
+                        let mut ctrl_c = KeyEvent::new(KeyEventKind::Press, KeyCode::Char('c'));
+                        ctrl_c.modifiers = KeyModifiers::CONTROL;
+                        let mut typed = text_events("Korean");
+                        typed.push(TerminalEvent::Key(ctrl_c));
+                        typed.push(press(KeyCode::Char('z')));
+                        for event in typed {
+                            keys.send(event).await.unwrap();
+                        }
+                        stage = 2;
+                    }
+                    2 if last.contains('z') => break,
+                    _ => {}
+                }
+            }
+            last
+        });
+        assert!(last.contains("Koreanz"), "canvas=\n{last}");
+    }
+
+    #[test]
+    fn settings_exit_hook_exits_on_double_ctrl_d_with_an_empty_language_input() {
+        // CC: `app:exit` belongs to Settings' useExitOnCtrlCDWithKeybindings
+        // (Settings.tsx:62), registered before LanguagePicker's TextInput,
+        // whose useTextInput registers no keybinding. So a double Ctrl+D in
+        // the empty field exits. Frame-driven and hang-free: the render loop
+        // ends on exit (the `z` sent in the same batch may still paint first);
+        // if it does not, the typed `z` then `q` produce frames and the test
+        // fails on "zq".
+        crate::utils::process_runtime::initialize_test_process_runtime();
+        let (exited, last) = futures::executor::block_on(async {
+            let (keys, events) = async_channel::unbounded();
+            let mut app = element!(SettingsHarness);
+            let mut frames = Box::pin(app.mock_terminal_render_loop(
+                MockTerminalConfig::with_events(events).with_size(110, 30),
+            ));
+            let mut stage = 0;
+            let mut last = String::new();
+            while let Some(canvas) = frames.next().await {
+                last = canvas_lines(&canvas).join("\n");
+                match stage {
+                    0 => {
+                        let mut open = text_events("language");
+                        open.push(press(KeyCode::Enter));
+                        open.push(press(KeyCode::Char(' ')));
+                        for event in open {
+                            keys.send(event).await.unwrap();
+                        }
+                        stage = 1;
+                    }
+                    1 if last.contains("Enter your preferred response and voice language:") => {
+                        let mut ctrl_d = KeyEvent::new(KeyEventKind::Press, KeyCode::Char('d'));
+                        ctrl_d.modifiers = KeyModifiers::CONTROL;
+                        for event in [
+                            TerminalEvent::Key(ctrl_d.clone()),
+                            TerminalEvent::Key(ctrl_d),
+                            press(KeyCode::Char('z')),
+                        ] {
+                            keys.send(event).await.unwrap();
+                        }
+                        stage = 2;
+                    }
+                    2 if last.contains("❯ z") => {
+                        if keys.send(press(KeyCode::Char('q'))).await.is_err() {
+                            return (true, last);
+                        }
+                        stage = 3;
+                    }
+                    3 if last.contains("❯ zq") => return (false, last),
+                    _ => {}
+                }
+            }
+            (true, last)
+        });
+        assert!(
+            exited,
+            "a double Ctrl+D in the empty language field must exit; canvas=\n{last}"
+        );
+    }
+
+    #[test]
+    fn settings_exit_hook_exits_on_double_ctrl_c_inside_the_theme_submenu() {
+        // CC: Settings' exit hook (Settings.tsx:62) registered before the
+        // ThemePicker mounts, so its listener takes Ctrl+C ahead of the
+        // picker's no-op exit (ThemePicker.tsx:85-88) and a double press
+        // exits. `SettingsExitBinding` keeps that order. Frame-driven: the
+        // loop ends on exit; otherwise `z` and `q` produce frames.
+        crate::utils::process_runtime::initialize_test_process_runtime();
+        let (exited, last) = futures::executor::block_on(async {
+            let (keys, events) = async_channel::unbounded();
+            let mut app = element!(SettingsHarness);
+            let mut frames = Box::pin(app.mock_terminal_render_loop(
+                MockTerminalConfig::with_events(events).with_size(110, 30),
+            ));
+            let mut stage = 0;
+            let mut last = String::new();
+            while let Some(canvas) = frames.next().await {
+                last = canvas_lines(&canvas).join("\n");
+                match stage {
+                    0 => {
+                        let mut open = text_events("theme");
+                        open.push(press(KeyCode::Enter));
+                        open.push(press(KeyCode::Char(' ')));
+                        for event in open {
+                            keys.send(event).await.unwrap();
+                        }
+                        stage = 1;
+                    }
+                    1 if last.contains("Choose the text style") => {
+                        let mut ctrl_c = KeyEvent::new(KeyEventKind::Press, KeyCode::Char('c'));
+                        ctrl_c.modifiers = KeyModifiers::CONTROL;
+                        for event in [TerminalEvent::Key(ctrl_c.clone()), TerminalEvent::Key(ctrl_c)] {
+                            keys.send(event).await.unwrap();
+                        }
+                        stage = 2;
+                    }
+                    // The picker's own count of presses shows in its footer
+                    // only if it, not Settings, took the keys.
+                    2 => {
+                        if keys.send(press(KeyCode::Down)).await.is_err() {
+                            return (true, last);
+                        }
+                        stage = 3;
+                    }
+                    3 => return (false, last),
+                    _ => {}
+                }
+            }
+            (true, last)
+        });
+        assert!(
+            exited,
+            "a double Ctrl+C in the Theme submenu must exit through Settings; canvas=\n{last}"
+        );
+    }
+
+    #[test]
     fn settings_default_status_tab_starts_with_header_focused_like_official() {
         let text = render_settings_status_text(Vec::new());
 
@@ -485,11 +688,39 @@ mod tests {
 
     #[test]
     fn settings_restores_tab_header_after_submenu_escape() {
-        let mut events = text_events("theme");
-        events.push(press(KeyCode::Enter));
-        events.push(press(KeyCode::Char(' ')));
-        events.push(press(KeyCode::Esc));
-        let text = render_settings_text(events);
+        // Frame-driven: Esc goes out once the ThemePicker, which owns the
+        // submenu's keys, is on screen; the frame its close produces is read.
+        crate::utils::process_runtime::initialize_test_process_runtime();
+        let text = futures::executor::block_on(async {
+            let (keys, events) = async_channel::unbounded();
+            let mut app = element!(SettingsHarness);
+            let mut frames = Box::pin(app.mock_terminal_render_loop(
+                MockTerminalConfig::with_events(events).with_size(110, 30),
+            ));
+            let mut stage = 0;
+            let mut last = String::new();
+            while let Some(canvas) = frames.next().await {
+                last = canvas_lines(&canvas).join("\n");
+                match stage {
+                    0 => {
+                        let mut open = text_events("theme");
+                        open.push(press(KeyCode::Enter));
+                        open.push(press(KeyCode::Char(' ')));
+                        for event in open {
+                            keys.send(event).await.unwrap();
+                        }
+                        stage = 1;
+                    }
+                    1 if last.contains("Choose the text style") => {
+                        keys.send(press(KeyCode::Esc)).await.unwrap();
+                        stage = 2;
+                    }
+                    2 if !last.contains("Choose the text style") => break,
+                    _ => {}
+                }
+            }
+            last
+        });
 
         assert!(
             text.contains("Settings"),
@@ -500,8 +731,8 @@ mod tests {
             "Config tab label should return after submenu Esc; canvas=\n{text}"
         );
         assert!(
-            !text.contains("Enter select · Esc cancel"),
-            "submenu footer should disappear after submenu Esc; canvas=\n{text}"
+            !text.contains("Enter to select · Esc to cancel"),
+            "the Theme submenu footer should disappear after its Esc; canvas=\n{text}"
         );
     }
 }

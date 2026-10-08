@@ -19,7 +19,7 @@ use crate::components::trust_dialog::{
 };
 use crate::services::mcp::config::get_mcp_configs_by_scope_readonly;
 use crate::services::mcp::types::ConfigScope;
-use crate::tools::agent_tool::load_agents_dir::get_agent_definitions_with_overrides_from_env;
+use crate::tools::agent_tool::load_agents_dir::get_agent_definitions_with_overrides;
 use crate::utils::auth::{
     GetAnthropicApiKeyOptions, get_anthropic_api_key_with_source,
     get_api_key_from_config_or_macos_keychain, get_auth_token_source, is_anthropic_auth_enabled,
@@ -43,10 +43,10 @@ use crate::utils::env as runtime_env;
 use crate::utils::env_utils::is_running_on_homespace;
 use crate::utils::ide::IDEExtensionInstallationStatus;
 use crate::utils::ide::{is_jetbrains_ide, to_ide_display_name};
+use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::SettingSource;
 use crate::utils::settings::get_settings_for_source;
 use crate::utils::status_notice_definitions::{MemoryFileInfo, StatusNoticeContext};
-use crate::utils::theme::ThemeName;
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -70,7 +70,6 @@ pub struct SetupScreensSnapshot {
     pub oauth_enabled: bool,
     pub api_key_needing_approval: Option<String>,
     pub offer_terminal_setup: bool,
-    pub theme_name: Option<ThemeName>,
     pub terminal_name: Option<String>,
     pub show_claude_in_chrome_onboarding: bool,
     pub claude_in_chrome_extension_installed: bool,
@@ -92,12 +91,11 @@ fn api_key_needing_onboarding_approval(
     if is_running_on_homespace() {
         return None;
     }
-    let api_key = get_env("ANTHROPIC_API_KEY")?;
-    let trimmed = api_key.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let truncated = normalize_api_key_for_config(trimmed);
+    // CC Onboarding.tsx:132-138: only an empty value is absent, and the
+    // suffix is taken from the value as set; auth matches the same
+    // untrimmed bytes, so a trimmed suffix would never be found approved.
+    let api_key = get_env("ANTHROPIC_API_KEY").truthy()?;
+    let truncated = normalize_api_key_for_config(&api_key);
     (get_custom_api_key_status(global_config, &truncated) == CustomApiKeyStatus::New)
         .then_some(truncated)
 }
@@ -109,7 +107,9 @@ pub fn setup_screens_snapshot_from_readonly_runtime(
     terminal_name: Option<String>,
     platform: runtime_env::Platform,
 ) -> SetupScreensSnapshot {
-    if crate::utils::env_utils::is_env_truthy(get_env("IS_DEMO").as_deref()) {
+    // CC `:157` tests `process.env.IS_DEMO` for plain truthiness: any
+    // non-empty value, `0` included.
+    if get_env("IS_DEMO").truthy().is_some() {
         return SetupScreensSnapshot::default();
     }
 
@@ -128,7 +128,6 @@ pub fn setup_screens_snapshot_from_readonly_runtime(
         oauth_enabled: is_anthropic_auth_enabled(),
         api_key_needing_approval: api_key_needing_onboarding_approval(global_config, get_env),
         offer_terminal_setup: should_offer_terminal_setup_for(terminal_name.as_deref(), platform),
-        theme_name: configured_theme.and_then(ThemeName::from_config_or_display),
         terminal_name,
         show_claude_in_chrome_onboarding: enable_claude_in_chrome
             && global_config.has_completed_claude_in_chrome_onboarding != Some(true),
@@ -148,7 +147,6 @@ fn status_notice_memory_files(files: Vec<ClaudeMdFile>) -> Vec<MemoryFileInfo> {
 
 pub fn status_notice_context_from_readonly_runtime(
     global_config: &GlobalConfig,
-    get_env: &impl Fn(&str) -> Option<String>,
     cwd: &Path,
     memory_files: Vec<ClaudeMdFile>,
     ide_installation_status: Option<&IDEExtensionInstallationStatus>,
@@ -170,7 +168,7 @@ pub fn status_notice_context_from_readonly_runtime(
     StatusNoticeContext {
         cwd: cwd.to_string_lossy().to_string(),
         memory_files: status_notice_memory_files(memory_files),
-        agent_definitions: Some(get_agent_definitions_with_overrides_from_env(cwd, get_env).into()),
+        agent_definitions: Some(get_agent_definitions_with_overrides(cwd).into()),
         auth_token_source,
         api_key_source,
         has_console_api_key: get_api_key_from_config_or_macos_keychain().is_some(),
@@ -208,7 +206,7 @@ pub fn default_setup_screens_snapshot() -> SetupScreensSnapshot {
     let detected = runtime_env::get();
     setup_screens_snapshot_from_readonly_runtime(
         &load_global_config(),
-        &|key| std::env::var(key).ok(),
+        &|key| crate::utils::process_env::var(key),
         std::env::args(),
         detected.terminal.clone(),
         detected.platform,
@@ -221,7 +219,6 @@ pub fn default_status_notice_context(
     let cwd = std::env::current_dir().unwrap_or_default();
     status_notice_context_from_readonly_runtime(
         &load_global_config(),
-        &|key| std::env::var(key).ok(),
         &cwd,
         discover_claude_md_files(),
         ide_installation_status,
@@ -265,14 +262,29 @@ pub fn exit_with_error(
     system_context: &mut SystemContext,
     exit_code: &AtomicI32,
     message: impl Into<String>,
-    color: Color,
 ) -> AnyElement<'static> {
     exit_code.store(1, Ordering::SeqCst);
     system_context.exit();
     element! {
-        Text(content: message.into(), color: color)
+        ExitMessage(message: message.into())
     }
     .into_any()
+}
+
+#[derive(Default, Props)]
+struct ExitMessageProps {
+    message: String,
+}
+
+/// Maps to: CC `interactiveHelpers.tsx:108-110` `exitWithMessage`'s
+/// `<Text color={color}>`, with `exitWithError`'s `color: 'error'`. The
+/// colour is a theme key, resolved under the root's ThemeProvider.
+#[component]
+fn ExitMessage(props: &ExitMessageProps, hooks: Hooks) -> impl Into<AnyElement<'static>> {
+    let theme = hooks.use_context::<crate::utils::theme::Theme>();
+    element! {
+        Text(content: props.message.clone(), color: theme.error)
+    }
 }
 
 pub fn show_setup_screens(
@@ -318,6 +330,12 @@ fn SetupScreensHost<'a>(
     let mut claude_md_dismissed = hooks.use_state(|| false);
     let trust_risk_snapshot = hooks.use_const(build_trust_dialog_risk_snapshot);
     let claude_md_external_includes = hooks.use_const(load_claude_md_external_includes_for_setup);
+    // The Onboarding store's settings seed, built once (see the Onboarding
+    // arm below).
+    let onboarding_settings_seed = hooks.use_const({
+        let startup_settings = startup_settings.clone();
+        move || Arc::new(startup_settings.settings.clone())
+    });
 
     // Maps to: CC `interactiveHelpers.tsx:218` + `mcpServerApproval.tsx:16-19`
     // — both derive the pending list from the settings snapshot read off disk.
@@ -329,6 +347,7 @@ fn SetupScreensHost<'a>(
     // Maps to: CC main.tsx `[STARTUP] Running showSetupScreens()...` once per mount.
     let mut setup_screens_started = hooks.use_state(|| false);
     let mut setup_screens_completed_logged = hooks.use_state(|| false);
+    let mut config_env_applied = hooks.use_state(|| false);
     if !setup_screens_started.get() {
         setup_screens_started.set(true);
         crate::utils::debug::log_for_debugging("[STARTUP] Running showSetupScreens()...");
@@ -342,27 +361,81 @@ fn SetupScreensHost<'a>(
         should_show_claude_md_external_includes_gate() && !claude_md_dismissed.get();
 
     let pending_mcpjson_servers = { pending_mcpjson_servers_state.read().clone() };
-    let setup_gate = resolve_setup_screen_gate(
-        show_onboarding,
-        show_trust_dialog,
-        !pending_mcpjson_servers.is_empty(),
-        show_claude_md_external_includes,
-        show_claude_in_chrome_onboarding,
-    );
+    // CC `:154-161`: demo mode returns before every step, the env application
+    // at :252 included.
+    let setup_gate = if is_demo_mode() {
+        SetupScreenGate::Ready
+    } else {
+        resolve_setup_screen_gate(
+            show_onboarding,
+            show_trust_dialog,
+            !pending_mcpjson_servers.is_empty(),
+            show_claude_md_external_includes,
+            show_claude_in_chrome_onboarding,
+        )
+    };
 
-    match setup_gate {
+    // Maps to: CC `interactiveHelpers.tsx:248-252`. The full settings env,
+    // potentially dangerous variables included, applies once trust is settled.
+    // That is after the trust dialog, the `.mcp.json` approvals and the
+    // CLAUDE.md external-includes warning, and before the dialogs that follow,
+    // among them Claude in Chrome (:390-400). It applies whether or not the
+    // trust dialog showed, as CC's call does, but not in demo mode, which
+    // returns first.
+    if matches!(
+        setup_gate,
+        SetupScreenGate::ClaudeInChrome | SetupScreenGate::Ready
+    ) && !config_env_applied.get()
+        && !is_demo_mode()
+    {
+        config_env_applied.set(true);
+        // Settings may have changed on disk during the dialogs. `Main`'s
+        // completion re-reads them right after this, so reset the cache
+        // first. The env applied here and AppState.settings then come from
+        // the same read, as in CC, where both read one cache.
+        crate::utils::settings::settings_cache::reset_settings_cache();
+        crate::utils::managed_env::apply_config_environment_variables();
+    }
+
+    let gate_element = match setup_gate {
         SetupScreenGate::Onboarding => {
+            // Maps to: CC `interactiveHelpers.tsx:171-182` — onboarding is a
+            // `showSetupDialog(…, { onChangeAppState })`, i.e. its own
+            // `<AppStateProvider><KeybindingSetup>` (:127-128), which the theme
+            // step's ThemePicker reads. The other setup dialogs read no
+            // AppState yet and keep only the KeybindingSetup below (seam).
             let snapshot = setup_screens_snapshot.clone();
+            let keybinding_key = format!("{setup_gate:?}");
+            // CC's `getDefaultAppState()` seeds `settings: getInitialSettings()`
+            // (AppStateStore.ts:469), which the picker's syntax toggle reads.
+            // `startup_settings` is that disk read. It is safe before trust:
+            // the toggle is a spread that keeps the env reference, so
+            // onChangeAppState does not re-apply it (env redesign F2). The
+            // settings watcher only starts after setup (F3).
+            let mut seed = crate::state::app_state_store::AppState::default();
+            seed.settings = onboarding_settings_seed.clone();
             element! {
-                Onboarding(
-                    on_done: move |_| {
-                        onboarding_dismissed.set(true);
-                    },
-                    oauth_enabled: snapshot.oauth_enabled,
-                    api_key_needing_approval: snapshot.api_key_needing_approval.clone(),
-                    offer_terminal_setup: snapshot.offer_terminal_setup,
-                    theme_name: snapshot.theme_name,
-                    terminal_name: snapshot.terminal_name.clone(),
+                crate::state::app_state::AppStateProvider(
+                    initial_state: Some(seed),
+                    on_change_app_state: Some(crate::state::on_change_app_state::default_on_change()),
+                    children: crate::state::app_state::ProviderChildren::new(move || {
+                        let snapshot = snapshot.clone();
+                        let mut dismissed = onboarding_dismissed;
+                        element! {
+                            crate::keybindings::keybinding_provider_setup::KeybindingSetup(key: keybinding_key.clone()) {
+                                Onboarding(
+                                    on_done: move |_| {
+                                        dismissed.set(true);
+                                    },
+                                    oauth_enabled: snapshot.oauth_enabled,
+                                    api_key_needing_approval: snapshot.api_key_needing_approval.clone(),
+                                    offer_terminal_setup: snapshot.offer_terminal_setup,
+                                    terminal_name: snapshot.terminal_name.clone(),
+                                )
+                            }
+                        }
+                        .into_any()
+                    }),
                 )
             }
             .into_any()
@@ -485,16 +558,48 @@ fn SetupScreensHost<'a>(
             }
             element! { Fragment }.into_any()
         }
+    };
+    // Onboarding already carries its showSetupDialog wrappers.
+    if matches!(setup_gate, SetupScreenGate::Ready | SetupScreenGate::Onboarding) {
+        return gate_element;
     }
+    // Maps to: CC `interactiveHelpers.tsx:121-131` `showSetupDialog` — every
+    // setup dialog renders inside its own `<KeybindingSetup>`. Keyed by gate,
+    // so each dialog gets a fresh one, as each CC `showDialog` render does.
+    element! {
+        crate::keybindings::keybinding_provider_setup::KeybindingSetup(key: format!("{setup_gate:?}")) {
+            #(Some(gate_element))
+        }
+    }
+    .into_any()
 }
 
 #[cfg(test)]
 mod setup_screens_snapshot_tests {
     use super::*;
     use crate::utils::config::CustomApiKeyResponses;
-    use crate::utils::theme::ThemeName;
+    use crate::utils::test_env::{EnvVarGuard, HOME_VAR, TEST_ENV_LOCK};
     use std::fs;
     use std::path::Path;
+
+    #[test]
+    fn api_key_needing_approval_keeps_the_key_as_set() {
+        // CC Onboarding.tsx:132-138: `normalizeApiKeyForConfig` of the raw
+        // value, as auth later matches it; only an empty value is absent.
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _homespace = EnvVarGuard::unset("COO_RUNNING_ON_HOMESPACE");
+        let config = GlobalConfig::default();
+        let with_key = |value: &'static str| {
+            move |key: &str| (key == "ANTHROPIC_API_KEY").then(|| value.to_string())
+        };
+        assert_eq!(
+            api_key_needing_onboarding_approval(&config, &with_key("sk-ant-test-key\r")),
+            Some(normalize_api_key_for_config("sk-ant-test-key\r"))
+        );
+        assert_eq!(api_key_needing_onboarding_approval(&config, &with_key("")), None);
+    }
 
     #[test]
     fn setup_screens_snapshot_matches_official_onboarding_gate_and_api_key_step() {
@@ -520,7 +625,6 @@ mod setup_screens_snapshot_tests {
             runtime_env::Platform::MacOS,
         );
         assert!(!completed.show_onboarding);
-        assert_eq!(completed.theme_name, Some(ThemeName::Dark));
         assert!(!completed.offer_terminal_setup);
 
         let with_new_key = setup_screens_snapshot_from_readonly_runtime(
@@ -632,13 +736,12 @@ mod setup_screens_snapshot_tests {
         // `auth_token_source` and `api_key_source` come from
         // `get_auth_token_source()` / `get_anthropic_api_key_with_source()`,
         // which read the process environment directly — CC does the same
-        // (`utils/auth.ts:125` reads `process.env.ANTHROPIC_AUTH_TOKEN`). The
-        // `get_env` parameter below only feeds the agent-definition overrides,
-        // so these two assertions need the real variable set.
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        // (`utils/auth.ts:125` reads `process.env.ANTHROPIC_AUTH_TOKEN`), so
+        // these two assertions need the variable set in the carrier.
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _token = crate::utils::env_utils::EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", "token");
+        let _token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", "token");
 
         let mut global_config = GlobalConfig::default();
         global_config.primary_api_key = Some("sk-console".to_string());
@@ -666,7 +769,6 @@ mod setup_screens_snapshot_tests {
 
         let context = status_notice_context_from_readonly_runtime(
             &global_config,
-            &|key| (key == "ANTHROPIC_AUTH_TOKEN").then(|| "token".to_string()),
             Path::new("/repo"),
             vec![memory_file],
             Some(&ide_status),
@@ -684,23 +786,17 @@ mod setup_screens_snapshot_tests {
 
     #[test]
     fn auth_token_and_api_key_guards_restore_distinct_sentinels() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _restore_token = crate::utils::env_utils::EnvVarGuard::preserve("ANTHROPIC_AUTH_TOKEN");
-        let _restore_api_key = crate::utils::env_utils::EnvVarGuard::preserve("ANTHROPIC_API_KEY");
+        let _restore_token = EnvVarGuard::preserve("ANTHROPIC_AUTH_TOKEN");
+        let _restore_api_key = EnvVarGuard::preserve("ANTHROPIC_API_KEY");
         crate::utils::process_env::set("ANTHROPIC_AUTH_TOKEN", "token-sentinel");
         crate::utils::process_env::set("ANTHROPIC_API_KEY", "api-key-sentinel");
 
         {
-            let _token = crate::utils::env_utils::EnvVarGuard::set(
-                "ANTHROPIC_AUTH_TOKEN",
-                "token-under-test",
-            );
-            let _api_key = crate::utils::env_utils::EnvVarGuard::set(
-                "ANTHROPIC_API_KEY",
-                "api-key-under-test",
-            );
+            let _token = EnvVarGuard::set("ANTHROPIC_AUTH_TOKEN", "token-under-test");
+            let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", "api-key-under-test");
         }
 
         assert_eq!(
@@ -735,29 +831,25 @@ mod setup_screens_snapshot_tests {
     #[test]
     fn status_notice_context_uses_official_api_key_approval_for_conflict_source() {
         // Same two fixtures the sibling test above documents and this one was
-        // missing. `api_key_source` does not read the `global_config` argument
-        // or the `get_env` closure — it goes through
+        // missing. `api_key_source` does not read the `global_config`
+        // argument — it goes through
         // `get_anthropic_api_key_with_source()`, which reads the process
         // environment and `load_global_config()` (auth.rs:534), exactly as CC
         // reads `process.env` in `utils/auth.ts`. Without both, the lookup saw
         // the scratch home's empty config and no ANTHROPIC_API_KEY, so the
         // source was "none" and this looked like an approval-logic bug.
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _api_key =
-            crate::utils::env_utils::EnvVarGuard::set("ANTHROPIC_API_KEY", "sk-ant-test");
+        let _api_key = EnvVarGuard::set("ANTHROPIC_API_KEY", "sk-ant-test");
 
         let mut global_config = GlobalConfig {
             primary_api_key: Some("sk-console".to_string()),
             ..Default::default()
         };
-        let env_key = |key: &str| (key == "ANTHROPIC_API_KEY").then(|| "sk-ant-test".to_string());
-
         crate::utils::config::set_test_global_config(Some(global_config.clone()));
         let unapproved = status_notice_context_from_readonly_runtime(
             &global_config,
-            &env_key,
             Path::new("/repo"),
             Vec::new(),
             None,
@@ -773,7 +865,6 @@ mod setup_screens_snapshot_tests {
         crate::utils::config::set_test_global_config(Some(global_config.clone()));
         let approved = status_notice_context_from_readonly_runtime(
             &global_config,
-            &env_key,
             Path::new("/repo"),
             Vec::new(),
             None,
@@ -809,13 +900,19 @@ mod setup_screens_snapshot_tests {
         )
         .expect("write agent definition");
 
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
+        let _home = EnvVarGuard::set(HOME_VAR, &root);
+        // A host's `CLAUDE_CODE_SIMPLE` (CC `--bare`) would skip custom agents;
+        // unsetting the managed override would read the machine's real managed
+        // root, so point it at a directory that does not exist.
+        let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
+        let _managed = EnvVarGuard::set(
+            "CLAUDE_CODE_MANAGED_SETTINGS_PATH",
+            root.join("missing-managed-root"),
+        );
         let context = status_notice_context_from_readonly_runtime(
             &GlobalConfig::default(),
-            &|key| match key {
-                "CLAUDE_CONFIG_DIR" => Some(config_home.display().to_string()),
-                "HOME" => Some(root.display().to_string()),
-                _ => None,
-            },
             &cwd,
             Vec::new(),
             None,
@@ -852,10 +949,18 @@ pub enum SetupScreenGate {
     Ready,
 }
 
-/// Maps to: CC `interactiveHelpers.tsx` CLAUBBIT / demo skip of trust.
+/// Maps to: CC `interactiveHelpers.tsx:154-161`, the demo-mode return of
+/// `showSetupScreens`. `process.env.IS_DEMO` is tested for plain
+/// truthiness, not `isEnvTruthy`: any non-empty value counts.
+pub fn is_demo_mode() -> bool {
+    crate::utils::process_env::var("IS_DEMO").truthy().is_some()
+}
+
+/// Maps to: CC `interactiveHelpers.tsx:191` `if (!isEnvTruthy(process.env.CLAUBBIT))`.
+/// Demo mode returned earlier (`:155-160`, [`is_demo_mode`]), so it is not
+/// tested here.
 pub fn should_skip_trust_dialog_for_env() -> bool {
-    crate::utils::env_utils::is_env_truthy(std::env::var("CLAUBBIT").ok().as_deref())
-        || crate::utils::env_utils::is_env_truthy(std::env::var("IS_DEMO").ok().as_deref())
+    crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUBBIT").as_deref())
 }
 
 /// Whether TrustDialog must still be shown (CC fast-path when already accepted).
@@ -867,7 +972,7 @@ pub fn should_show_trust_dialog() -> bool {
 }
 
 /// Maps to: CC showSetupScreens ClaudeMdExternalIncludes gate predicate.
-/// Skipped under CLAUBBIT/IS_DEMO with the same trust-block as official.
+/// Skipped under CLAUBBIT, inside the same trust block as official.
 pub fn should_show_claude_md_external_includes_gate() -> bool {
     if should_skip_trust_dialog_for_env() {
         return false;
@@ -879,7 +984,7 @@ pub fn should_show_claude_md_external_includes_gate() -> bool {
 pub fn load_claude_md_external_includes_for_setup() -> Vec<ExternalClaudeMdInclude> {
     let additional_dirs = crate::bootstrap::state::get_additional_directories_for_claude_md();
     let include_default_discovery = !crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_SIMPLE").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_SIMPLE").as_deref(),
     );
     let files = discover_claude_md_files_with_external_policy(
         include_default_discovery,
@@ -887,12 +992,6 @@ pub fn load_claude_md_external_includes_for_setup() -> Vec<ExternalClaudeMdInclu
         true,
     );
     get_external_claude_md_includes(&files)
-}
-
-fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(std::path::PathBuf::from)
 }
 
 fn paths_equal(a: &Path, b: &Path) -> bool {
@@ -905,7 +1004,7 @@ fn paths_equal(a: &Path, b: &Path) -> bool {
 pub fn build_trust_dialog_risk_snapshot() -> TrustDialogRiskSnapshot {
     let cwd = std::env::current_dir().unwrap_or_else(|_| Path::new(".").to_path_buf());
     let cwd_display = cwd.display().to_string();
-    let is_home_dir = home_dir().is_some_and(|home| paths_equal(&home, &cwd));
+    let is_home_dir = paths_equal(&crate::utils::node_os::homedir(), &cwd);
 
     let project_settings = get_settings_for_source(SettingSource::Project);
     let local_settings = get_settings_for_source(SettingSource::Local);
@@ -1012,6 +1111,7 @@ pub fn resolve_setup_screen_gate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn setup_screen_gate_order_matches_official_show_setup_screens() {
@@ -1055,5 +1155,94 @@ mod tests {
         assert!(check_has_trust_dialog_accepted());
         crate::bootstrap::state::set_session_trust_accepted(false);
         reset_trust_dialog_accepted_cache_for_testing();
+    }
+
+    struct CwdGuard {
+        old: std::path::PathBuf,
+    }
+
+    impl CwdGuard {
+        fn set(path: &Path) -> Self {
+            let old = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { old }
+        }
+    }
+
+    impl Drop for CwdGuard {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.old);
+        }
+    }
+
+    /// Renders the setup phase with no step to show. Returns whether `on_done`
+    /// fired and what a non-safe settings env variable held afterwards.
+    fn render_setup_with_settings_env(demo: bool) -> (bool, Option<String>) {
+        use futures::StreamExt as _;
+        use std::sync::atomic::AtomicBool;
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let root = std::env::temp_dir().join(format!(
+            "cometix-setup-env-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("settings.json"),
+            r#"{"env":{"COMETIX_SETUP_ENV_PROBE":"applied"}}"#,
+        )
+        .unwrap();
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root);
+        let _probe = EnvVarGuard::unset("COMETIX_SETUP_ENV_PROBE");
+        // `.mcp.json` approvals walk up from the cwd; keep a host's out.
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let _cwd = CwdGuard::set(&project);
+        // CLAUBBIT skips the trust dialog and the CLAUDE.md warning.
+        let _claubbit = EnvVarGuard::set("CLAUBBIT", "1");
+        let _demo = if demo {
+            EnvVarGuard::set("IS_DEMO", "1")
+        } else {
+            EnvVarGuard::unset("IS_DEMO")
+        };
+        crate::utils::settings::settings_cache::reset_settings_cache();
+
+        let done = Arc::new(AtomicBool::new(false));
+        let done_in_callback = Arc::clone(&done);
+        futures::executor::block_on(async move {
+            show_setup_screens(
+                SetupScreensSnapshot::default(),
+                crate::main::McpStartupConfig::default(),
+                Arc::new(SettingsWithErrors::default()),
+                None,
+                move |_| done_in_callback.store(true, Ordering::SeqCst),
+            )
+            .mock_terminal_render_loop(MockTerminalConfig::default())
+            .next()
+            .await;
+        });
+        let applied = crate::utils::process_env::var("COMETIX_SETUP_ENV_PROBE");
+        crate::utils::settings::settings_cache::reset_settings_cache();
+        let _ = std::fs::remove_dir_all(root);
+        (done.load(Ordering::SeqCst), applied)
+    }
+
+    /// CC `interactiveHelpers.tsx:252`: the full settings env, not just the
+    /// safe allowlist, is applied by the time setup completes.
+    #[test]
+    fn setup_applies_the_full_settings_env_before_completing() {
+        let (done, applied) = render_setup_with_settings_env(false);
+        assert!(done, "setup with no step to show completes on the first frame");
+        assert_eq!(applied.as_deref(), Some("applied"));
+    }
+
+    /// CC `:154-161`: demo mode returns before every step, so the full env is
+    /// never applied.
+    #[test]
+    fn demo_mode_completes_setup_without_applying_the_settings_env() {
+        let (done, applied) = render_setup_with_settings_env(true);
+        assert!(done);
+        assert_eq!(applied, None);
     }
 }

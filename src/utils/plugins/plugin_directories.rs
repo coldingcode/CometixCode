@@ -7,6 +7,8 @@
 
 use std::path::PathBuf;
 
+use crate::utils::process_env::JsTruthy;
+
 const PLUGINS_DIR: &str = "plugins";
 const COWORK_PLUGINS_DIR: &str = "cowork_plugins";
 
@@ -25,17 +27,15 @@ fn get_plugins_directory_name() -> &'static str {
 
 /// Maps to CC `pluginDirectories.ts#getPluginsDirectory`.
 pub fn get_plugins_directory() -> PathBuf {
-    if let Some(path) = crate::utils::process_env::var("CLAUDE_CODE_PLUGIN_CACHE_DIR") {
-        if !path.is_empty() {
-            return expand_tilde_path(&path);
-        }
+    if let Some(path) = crate::utils::process_env::var("CLAUDE_CODE_PLUGIN_CACHE_DIR").truthy() {
+        return expand_tilde_path(&path);
     }
-    crate::utils::config::get_config_home().join(get_plugins_directory_name())
+    crate::utils::env_utils::get_claude_config_home_dir().join(get_plugins_directory_name())
 }
 
 /// Maps to CC `pluginDirectories.ts#getPluginSeedDirs`.
 pub fn get_plugin_seed_dirs() -> Vec<PathBuf> {
-    let Some(raw) = crate::utils::process_env::var("CLAUDE_CODE_PLUGIN_SEED_DIR") else {
+    let Some(raw) = crate::utils::process_env::var("CLAUDE_CODE_PLUGIN_SEED_DIR").truthy() else {
         return Vec::new();
     };
     let delimiter = if cfg!(windows) { ';' } else { ':' };
@@ -71,17 +71,9 @@ pub fn plugin_data_dir_path(plugin_id: &str) -> PathBuf {
 /// Maps to CC `permissions/pathValidation.ts#expandTilde` usage in
 /// `pluginDirectories.ts#getPluginsDirectory` and `getPluginSeedDirs`.
 pub fn expand_tilde_path(path: &str) -> PathBuf {
-    if path == "~" {
-        return std::env::var("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(path));
-    }
-    if let Some(rest) = path.strip_prefix("~/") {
-        if let Ok(home) = std::env::var("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
-    }
-    PathBuf::from(path)
+    PathBuf::from(crate::utils::permissions::path_validation::expand_tilde(
+        path,
+    ))
 }
 
 /// Maps to: CC pluginDirectories.ts#getPluginDataDir.
@@ -135,7 +127,15 @@ pub async fn get_plugin_data_dir_size(
 /// Maps to: CC pluginDirectories.ts#deletePluginDataDir.
 pub async fn delete_plugin_data_dir(plugin_id: &str) {
     let dir = plugin_data_dir_path(plugin_id);
-    if let Err(error) = crate::utils::fs_operations::rm(&dir, true, true).await {
+    if let Err(error) = crate::utils::fs_operations::native::rm(
+        &dir,
+        crate::utils::fs_operations::RmOptions {
+            recursive: true,
+            force: true,
+        },
+    )
+    .await
+    {
         crate::utils::debug::log_for_debugging(&format!(
             "Failed to delete plugin data dir {}: {error}",
             dir.display()
@@ -146,16 +146,19 @@ pub async fn delete_plugin_data_dir(plugin_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, HOME_VAR, TEST_ENV_LOCK};
 
     #[test]
     fn plugin_directories_respect_cache_override_cowork_and_seed_precedence() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _restore = [
-            crate::utils::env_utils::EnvVarGuard::preserve("CLAUDE_CODE_PLUGIN_CACHE_DIR"),
-            crate::utils::env_utils::EnvVarGuard::preserve("CLAUDE_CODE_USE_COWORK_PLUGINS"),
-            crate::utils::env_utils::EnvVarGuard::preserve("CLAUDE_CODE_PLUGIN_SEED_DIR"),
+            EnvVarGuard::preserve("CLAUDE_CODE_PLUGIN_CACHE_DIR"),
+            EnvVarGuard::preserve("CLAUDE_CODE_USE_COWORK_PLUGINS"),
+            EnvVarGuard::preserve("CLAUDE_CODE_PLUGIN_SEED_DIR"),
         ];
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+        // `expandTilde` takes `homedir()`: pin it to a literal.
+        let home = "/home/someone";
+        let _home = EnvVarGuard::set(HOME_VAR, home);
         crate::utils::process_env::remove("CLAUDE_CODE_USE_COWORK_PLUGINS");
         crate::utils::process_env::remove("CLAUDE_CODE_PLUGIN_SEED_DIR");
         crate::utils::process_env::set("CLAUDE_CODE_PLUGIN_CACHE_DIR", "~/custom-plugins");
@@ -167,7 +170,7 @@ mod tests {
         crate::utils::process_env::set("CLAUDE_CODE_PLUGIN_CACHE_DIR", "");
         assert_eq!(
             get_plugins_directory(),
-            crate::utils::config::get_config_home().join(PLUGINS_DIR)
+            crate::utils::env_utils::get_claude_config_home_dir().join(PLUGINS_DIR)
         );
 
         crate::utils::process_env::remove("CLAUDE_CODE_PLUGIN_CACHE_DIR");
@@ -189,9 +192,8 @@ mod tests {
 
     #[test]
     fn plugin_data_dir_path_sanitizes_plugin_id_without_creating_directory() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _restore =
-            crate::utils::env_utils::EnvVarGuard::preserve("CLAUDE_CODE_PLUGIN_CACHE_DIR");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _restore = EnvVarGuard::preserve("CLAUDE_CODE_PLUGIN_CACHE_DIR");
         let root = std::env::temp_dir().join(format!(
             "cometix-plugin-data-{}",
             uuid::Uuid::new_v4().simple()

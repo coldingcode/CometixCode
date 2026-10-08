@@ -66,7 +66,7 @@ pub struct OidcMetadata {
 
 /// Maps to: CC `services/mcp/xaaIdpLogin.ts#isXaaEnabled`.
 pub fn is_xaa_enabled() -> bool {
-    crate::utils::env_utils::is_env_truthy(std::env::var(CLAUDE_CODE_ENABLE_XAA).ok().as_deref())
+    crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var(CLAUDE_CODE_ENABLE_XAA).as_deref())
 }
 
 /// Maps to: CC `services/mcp/xaaIdpLogin.ts#getXaaIdpSettings`.
@@ -247,8 +247,10 @@ mod runtime {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener as TokioTcpListener;
 
+    /// CC's IdP requests (`xaaIdpLogin.ts:208-211,453-465`) use the global
+    /// `fetch`, whose dispatcher carries the proxy and TLS options.
     fn http_client() -> anyhow::Result<reqwest::Client> {
-        Ok(reqwest::Client::builder()
+        Ok(crate::utils::proxy::get_proxy_fetch_options(false)?
             .timeout(std::time::Duration::from_secs(IDP_REQUEST_TIMEOUT_SECS))
             .build()?)
     }
@@ -895,21 +897,10 @@ pub async fn acquire_idp_id_token(_opts: IdpLoginOptions) -> anyhow::Result<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-    }
 
     fn with_temp_config_home(test: impl FnOnce(&std::path::Path)) {
         let dir = std::env::temp_dir().join(format!(
@@ -919,10 +910,10 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _config_home = EnvGuard::set("CLAUDE_CONFIG_DIR", dir.as_os_str());
+        let _config_home = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
         test(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -999,13 +990,13 @@ mod tests {
 
     #[test]
     fn xaa_gate_uses_official_env_truthy_value_semantics() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _enabled = EnvGuard::set(CLAUDE_CODE_ENABLE_XAA, std::ffi::OsStr::new("yes"));
+        let _enabled = EnvVarGuard::set(CLAUDE_CODE_ENABLE_XAA, "yes");
         assert!(is_xaa_enabled());
         drop(_enabled);
-        let _disabled = EnvGuard::set(CLAUDE_CODE_ENABLE_XAA, std::ffi::OsStr::new("0"));
+        let _disabled = EnvVarGuard::set(CLAUDE_CODE_ENABLE_XAA, "0");
         assert!(!is_xaa_enabled());
     }
 }

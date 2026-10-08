@@ -132,44 +132,8 @@ pub fn is_project_config_key(key: &str) -> bool {
 // ════════════════════════════════════════════════════════════
 // ════════════════════════════════════════════════════════════
 
-pub fn get_config_home() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        PathBuf::from(dir)
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".claude")
-    } else if let Ok(home) = std::env::var("USERPROFILE") {
-        PathBuf::from(home).join(".claude")
-    } else {
-        PathBuf::from(".claude")
-    }
-}
-
-fn get_global_config_file_home() -> PathBuf {
-    if let Ok(dir) = std::env::var("CLAUDE_CONFIG_DIR") {
-        PathBuf::from(dir)
-    } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-    } else if let Ok(home) = std::env::var("USERPROFILE") {
-        PathBuf::from(home)
-    } else {
-        PathBuf::from(".")
-    }
-}
-
-fn global_config_path_from_dirs(config_home: PathBuf, global_file_home: PathBuf) -> PathBuf {
-    let legacy = config_home.join(".config.json");
-    if legacy.exists() {
-        return legacy;
-    }
-    global_file_home.join(".claude.json")
-}
-
-pub fn get_global_config_path() -> PathBuf {
-    global_config_path_from_dirs(get_config_home(), get_global_config_file_home())
-}
-
 pub fn get_config_backup_dir() -> PathBuf {
-    get_config_home().join("backups")
+    crate::utils::env_utils::get_claude_config_home_dir().join("backups")
 }
 
 pub fn normalize_project_path(path: &str) -> String {
@@ -186,14 +150,12 @@ fn get_project_path_for_config() -> PathBuf {
 /// Maps to CC `utils/config.ts#getMemoryPath`.
 pub fn get_memory_path(memory_type: &str) -> PathBuf {
     match memory_type {
-        "User" | "user" => get_config_home().join("CLAUDE.md"),
+        "User" | "user" => crate::utils::env_utils::get_claude_config_home_dir().join("CLAUDE.md"),
         "Local" | "local" => crate::bootstrap::state::get_original_cwd().join("CLAUDE.local.md"),
         "Managed" | "managed" => {
             crate::utils::settings::managed_path::get_managed_file_path().join("CLAUDE.md")
         }
-        "AutoMem" | "autoMem" | "automem" => {
-            crate::memdir::paths::get_auto_mem_entrypoint_from_trusted_sources()
-        }
+        "AutoMem" | "autoMem" | "automem" => crate::memdir::paths::get_auto_mem_entrypoint(),
         "Project" | "project" => crate::bootstrap::state::get_original_cwd().join("CLAUDE.md"),
         // `TeamMem` only joins `MemoryType` under CC's `feature('TEAMMEM')`
         // (`utils/memory/types.ts:9`); the provider itself is unconditional.
@@ -211,7 +173,7 @@ pub fn get_managed_claude_rules_dir() -> PathBuf {
 }
 
 pub fn get_user_claude_rules_dir() -> PathBuf {
-    get_config_home().join("rules")
+    crate::utils::env_utils::get_claude_config_home_dir().join("rules")
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1353,7 +1315,11 @@ fn start_global_config_freshness_watcher() {
         return;
     }
 
-    let path = get_global_config_path();
+    let path = crate::utils::env::get_global_claude_file();
+    // The launchers' first config load starts this thread before
+    // `process_env::publish_startup_environment` writes the real environment,
+    // so it must never reach libc's getenv (no `node_os::homedir`, local time
+    // or DNS here).
     let _ = thread::Builder::new()
         .name("cometix-global-config-freshness".to_string())
         .spawn(move || {
@@ -1595,7 +1561,7 @@ pub fn load_global_config() -> GlobalConfig {
             return config;
         }
     }
-    let path = get_global_config_path();
+    let path = crate::utils::env::get_global_claude_file();
 
     // Claude Code keeps the normal read path as a pure memory hit after the
     // startup load. A background freshness watcher refreshes external writes.
@@ -1635,7 +1601,7 @@ pub fn load_global_config() -> GlobalConfig {
 }
 
 pub fn enable_configs() -> anyhow::Result<()> {
-    let path = get_global_config_path();
+    let path = crate::utils::env::get_global_claude_file();
     if path.exists() {
         let config = read_global_config_value(&path).and_then(load_global_config_from_value)?;
         write_through_global_config_cache(&path, config);
@@ -1665,7 +1631,7 @@ pub fn save_global_config(updater: impl FnOnce(&mut GlobalConfig)) -> anyhow::Re
         return Ok(());
     }
 
-    let path = get_global_config_path();
+    let path = crate::utils::env::get_global_claude_file();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -1775,7 +1741,7 @@ fn pin_created_user_id(user_id: &str) {
         return;
     }
     config.user_id = Some(user_id.to_string());
-    write_through_global_config_cache(&get_global_config_path(), config);
+    write_through_global_config_cache(&crate::utils::env::get_global_claude_file(), config);
 }
 
 pub fn record_first_start_time() {
@@ -1792,7 +1758,7 @@ pub fn record_first_start_time() {
 }
 
 pub fn is_config_write_enabled() -> bool {
-    crate::utils::env_utils::is_env_truthy(std::env::var("COMETIX_WRITE_ENABLED").ok().as_deref())
+    crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("COMETIX_WRITE_ENABLED").as_deref())
 }
 
 fn is_write_enabled() -> bool {
@@ -1805,7 +1771,7 @@ fn is_write_enabled() -> bool {
 
 pub fn should_skip_plugin_autoupdate() -> bool {
     if crate::utils::env_utils::is_env_truthy(
-        std::env::var("FORCE_AUTOUPDATE_PLUGINS").ok().as_deref(),
+        crate::utils::process_env::var("FORCE_AUTOUPDATE_PLUGINS").as_deref(),
     ) {
         return false;
     }
@@ -1813,10 +1779,9 @@ pub fn should_skip_plugin_autoupdate() -> bool {
 }
 
 pub fn get_auto_updater_disabled_reason() -> Option<&'static str> {
-    if crate::utils::env_utils::is_env_truthy(std::env::var("DISABLE_AUTOUPDATER").ok().as_deref())
+    if crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("DISABLE_AUTOUPDATER").as_deref())
         || crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_DISABLE_AUTOUPDATER")
-                .ok()
+            crate::utils::process_env::var("CLAUDE_CODE_DISABLE_AUTOUPDATER")
                 .as_deref(),
         )
     {
@@ -1825,8 +1790,7 @@ pub fn get_auto_updater_disabled_reason() -> Option<&'static str> {
 
     if cfg!(debug_assertions)
         && !crate::utils::env_utils::is_env_truthy(
-            std::env::var("ENABLE_AUTOUPDATER_IN_DEVELOPMENT")
-                .ok()
+            crate::utils::process_env::var("ENABLE_AUTOUPDATER_IN_DEVELOPMENT")
                 .as_deref(),
         )
     {
@@ -1869,7 +1833,7 @@ pub fn get_remote_control_at_startup() -> bool {
 
 pub fn find_most_recent_backup() -> Option<PathBuf> {
     let backup_dir = get_config_backup_dir();
-    let global_config_file_name = get_global_config_path()
+    let global_config_file_name = crate::utils::env::get_global_claude_file()
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or(".claude.json")
@@ -1943,6 +1907,7 @@ pub fn check_has_trust_dialog_accepted() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::fs;
 
     fn unique_temp_dir(name: &str) -> PathBuf {
@@ -1956,35 +1921,6 @@ mod tests {
             crate::memdir::team_mem_paths::get_team_mem_entrypoint()
         );
         assert_ne!(get_memory_path("TeamMem"), get_memory_path("Project"));
-    }
-
-    #[test]
-    fn global_config_path_matches_official_home_file_location_without_legacy_file() {
-        let home = PathBuf::from("/tmp/cometix-home");
-        let config_home = home.join(".claude");
-
-        assert_eq!(
-            global_config_path_from_dirs(config_home, home.clone()),
-            home.join(".claude.json")
-        );
-    }
-
-    #[test]
-    fn global_config_path_keeps_official_legacy_config_home_fallback() {
-        let root = unique_temp_dir("legacy-global-path");
-        let config_home = root.join(".claude");
-        let global_home = root.join("home");
-        fs::create_dir_all(&config_home).expect("create config home");
-        fs::create_dir_all(&global_home).expect("create global home");
-        let legacy = config_home.join(".config.json");
-        fs::write(&legacy, "{}").expect("write legacy config");
-
-        assert_eq!(
-            global_config_path_from_dirs(config_home, global_home),
-            legacy
-        );
-
-        let _ = fs::remove_dir_all(root);
     }
 
     /// CC `utils/managedEnv.ts#applyConfigEnvironmentVariables` feeds
@@ -2283,7 +2219,6 @@ mod tests {
 
     #[test]
     fn get_or_create_user_id_is_stable_across_calls_without_a_preseeded_id() {
-        use crate::utils::env_utils::{EnvVarGuard, TEST_ENV_LOCK};
         let _env = TEST_ENV_LOCK.lock().unwrap();
         let previous = replace_test_global_config(Some(GlobalConfig::default()));
         let first = get_or_create_user_id();
@@ -2299,7 +2234,6 @@ mod tests {
 
     #[test]
     fn get_or_create_user_id_persists_user_id_to_global_config_like_official() {
-        use crate::utils::env_utils::{EnvVarGuard, TEST_ENV_LOCK};
         let _env = TEST_ENV_LOCK.lock().unwrap();
         let root = unique_temp_dir("user-id-persist");
         fs::create_dir_all(&root).unwrap();
@@ -2333,7 +2267,6 @@ mod tests {
     fn mcp_raw_snapshot_survives_disk_cache_save_and_live_replacement() {
         use crate::services::mcp::config::get_mcp_configs_by_scope_readonly;
         use crate::services::mcp::types::ConfigScope;
-        use crate::utils::env_utils::{EnvVarGuard, TEST_ENV_LOCK};
         let _env = TEST_ENV_LOCK.lock().unwrap();
         let root = unique_temp_dir("mcp-raw-snapshot");
         fs::create_dir_all(&root).unwrap();
@@ -2345,7 +2278,7 @@ mod tests {
             "bad":{"type":"http","url":"u","oauth":null},
             "nullArgs":{"command":"g","args":null,"env":null,"type":null}
         });
-        let file = get_global_config_path();
+        let file = crate::utils::env::get_global_claude_file();
         let project_key = normalize_project_path(&get_project_path_for_config().to_string_lossy());
         let initial = serde_json::json!({"mcpServers":raw,"projects":{project_key.clone():{"mcpServers":raw}}});
         fs::write(&file, initial.to_string()).unwrap();

@@ -1,15 +1,16 @@
 //! Maps to: CC `hooks/useCancelRequest.ts` — the CancelRequestHandler.
 //!
 //! CC renders a null component that registers `chat:cancel` (Escape) and
-//! `app:interrupt` (Ctrl+C) keybinding handlers with independent isActive
-//! gates. Cometix keeps the same current action names and expresses the owner
-//! as a hook mounted from Repl; the event arrives via
-//! `use_propagated_terminal_events`.
+//! `app:interrupt` (CC's Ctrl+C) keybinding handlers with independent isActive
+//! gates. Cometix keeps the same action names; `CancelRequestHandler` below is
+//! that component, which REPL mounts ahead of PromptInput as CC does
+//! (REPL.tsx:5891, :6133).
 //!
-//! Event-order note: Ink delivers events parents-first, so CC's handler wins
-//! Escape while a task runs. iocraft bubbles children-first; the input layer
-//! cooperates via `UseTextInputOptions::cancel_passthrough` (set while
-//! loading), which leaves Escape unconsumed for this handler.
+//! Event-order note: Ink hands a key to listeners in registration order, and
+//! this handler registered before PromptInput's TextInput, so it wins Escape
+//! while a task runs. iocraft polls earlier siblings first, which puts this
+//! component ahead of PromptInput the same way; the input layer's
+//! `UseTextInputOptions::cancel_passthrough` also leaves Escape unconsumed.
 //!
 //! Coverage vs CC (useCancelRequest.ts):
 //! - Priority 1 (:97-103): active task → clear permission queue + on_cancel ✓
@@ -20,8 +21,10 @@
 //!   overlay gate reads `context::overlay_context::is_overlay_active` ✓; the
 //!   special-mode-empty-input and teammate-view exclusions join when those
 //!   states are lifted out of PromptInput/swarm.
-//! - Active-task Ctrl+C resolves `app:interrupt`; idle PromptInput still owns
-//!   its text-level double-press exit because this hook's active gate is false.
+//! - `app:interrupt` is CC's Ctrl+C. Cometix binds Ctrl+C to `app:exit`
+//!   (2.0.x semantics, `default_bindings.rs`), so the interrupt leg answers
+//!   only a key a user binds to it; Ctrl+C stays PromptInput's text-level
+//!   clear and double-press exit, running turn or not.
 
 use iocraft::prelude::*;
 use std::sync::{Arc, Mutex};
@@ -206,4 +209,39 @@ pub fn use_cancel_request<CanCancel, OnCancel>(
             true
         },
     );
+}
+
+/// The `CancelRequestHandler` props (`useCancelRequest.ts:40-57`) this REPL
+/// supplies. CC's `abortSignal` becomes `can_cancel_running_task`; the
+/// screen / local-command-UI facts arrive folded into `is_context_blocked`.
+#[derive(Default, Props)]
+pub struct CancelRequestHandlerProps {
+    pub can_cancel_running_task: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    pub on_cancel: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub is_context_blocked: bool,
+}
+
+/// Maps to: CC `useCancelRequest.ts:63-276` `CancelRequestHandler`, the
+/// null-rendering component REPL mounts inside `KeybindingSetup`.
+#[component]
+pub fn CancelRequestHandler(
+    props: &CancelRequestHandlerProps,
+    mut hooks: Hooks,
+) -> impl Into<AnyElement<'static>> {
+    let app_store = crate::state::app_state::use_set_app_state(&mut hooks);
+    let can_cancel = props
+        .can_cancel_running_task
+        .clone()
+        .expect("CancelRequestHandler can_cancel_running_task");
+    let on_cancel = props.on_cancel.clone().expect("CancelRequestHandler on_cancel");
+    use_cancel_request(
+        &mut hooks,
+        UseCancelRequestOptions {
+            app_store,
+            can_cancel_running_task: move || can_cancel(),
+            on_cancel: move || on_cancel(),
+            is_context_blocked: props.is_context_blocked,
+        },
+    );
+    element!(View(width: 0u32, height: 0u32))
 }

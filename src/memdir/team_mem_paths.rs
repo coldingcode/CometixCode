@@ -85,17 +85,12 @@ fn sanitize_path_key(key: &str) -> Result<&str, PathTraversalError> {
     Ok(key)
 }
 
-fn merged_settings() -> crate::utils::settings::types::SettingsJson {
-    crate::utils::settings::get_initial_settings()
-}
-
 /// Maps to CC `isTeamMemoryEnabled()`.
 ///
 /// Cometix resolves the `tengu_herring_clock` cohort from the source-controlled
 /// switch table instead of GrowthBook.
 pub fn is_team_memory_enabled() -> bool {
-    let settings = merged_settings();
-    if !crate::memdir::paths::is_auto_memory_enabled(&settings) {
+    if !crate::memdir::paths::is_auto_memory_enabled() {
         return false;
     }
     crate::utils::feature_flags::feature_enabled(
@@ -105,7 +100,7 @@ pub fn is_team_memory_enabled() -> bool {
 
 /// Maps to CC `getTeamMemPath()`.
 pub fn get_team_mem_path() -> PathBuf {
-    let path = crate::memdir::paths::get_auto_mem_path_from_trusted_sources().join("team");
+    let path = crate::memdir::paths::get_auto_mem_path().join("team");
     PathBuf::from(path.to_string_lossy().nfc().collect::<String>())
 }
 
@@ -292,27 +287,16 @@ pub fn is_team_mem_file(file_path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &Path) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-    }
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn team_memory_prefix_requires_a_path_component_boundary_and_uses_override() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-team-mem-path-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let _override = EnvGuard::set("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", &root);
+        let _override = EnvVarGuard::set("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", &root);
         let team = get_team_mem_path();
         assert_eq!(team, root.join("team"));
         assert!(is_team_mem_path(&team.join("MEMORY.md")));
@@ -322,12 +306,12 @@ mod tests {
 
     #[tokio::test]
     async fn team_memory_key_rejects_encoded_unicode_and_lexical_traversal() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-team-mem-key-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let _override = EnvGuard::set("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", &root);
+        let _override = EnvVarGuard::set("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", &root);
         for key in ["%2e%2e%2fsecret", "．．／secret", "..\\secret", "/secret"] {
             assert!(
                 validate_team_mem_key(key).await.is_err(),
@@ -345,7 +329,7 @@ mod tests {
     #[tokio::test]
     async fn team_memory_write_validation_rejects_symlink_escapes_and_dangling_links() {
         use std::os::unix::fs::symlink;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-team-mem-symlink-{}",
             uuid::Uuid::new_v4().simple()
@@ -354,7 +338,7 @@ mod tests {
             "cometix-team-mem-outside-{}",
             uuid::Uuid::new_v4().simple()
         ));
-        let _override = EnvGuard::set("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", &root);
+        let _override = EnvVarGuard::set("CLAUDE_COWORK_MEMORY_PATH_OVERRIDE", &root);
         std::fs::create_dir_all(root.join("team")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         symlink(&outside, root.join("team/escape")).unwrap();

@@ -50,9 +50,7 @@ pub fn get_terminal_plist_path() -> PathBuf {
     if tests::is_active() {
         return PathBuf::from("/oracle/Library/Preferences/com.apple.Terminal.plist");
     }
-    std::env::home_dir()
-        .unwrap_or_default()
-        .join("Library/Preferences/com.apple.Terminal.plist")
+    crate::utils::node_os::homedir().join("Library/Preferences/com.apple.Terminal.plist")
 }
 
 /// Maps to: CC `utils/appleTerminalBackup.ts#backupTerminalPreferences:37-71`.
@@ -179,6 +177,7 @@ async fn stat(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use serde_json::{Value, json};
     use std::cell::RefCell;
     use std::collections::VecDeque;
@@ -276,7 +275,6 @@ mod tests {
 
     #[test]
     fn apple_terminal_backup_markers_match_official_persisted_config() {
-        use crate::utils::env_utils::{EnvVarGuard, TEST_ENV_LOCK};
         let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-terminal-backup-{}", uuid::Uuid::new_v4()));
@@ -290,7 +288,7 @@ mod tests {
         );
         mark_terminal_setup_complete().unwrap();
         let config: Value = serde_json::from_slice(
-            &std::fs::read(super::super::config::get_global_config_path()).unwrap(),
+            &std::fs::read(crate::utils::env::get_global_claude_file()).unwrap(),
         )
         .unwrap();
         // CC utils/appleTerminalBackup.ts:7-20 clears only the progress flag;

@@ -66,7 +66,7 @@ use crate::components::tasks::task_status_utils::TaskStatus;
 use crate::components::teams::teams_dialog::{
     TeammateStatusData, TeamsDialog, TeamsDialogAction, TeamsDialogData,
 };
-use crate::components::thinking_toggle::{ThinkingToggle, thinking_toggle_requires_confirmation};
+use crate::components::thinking_toggle::ThinkingToggle;
 use crate::components::vim_text_input::{VimMode, VimTextInput};
 use crate::context::notifications::use_notifications;
 use crate::hooks::notifs::external_editor_hint::{
@@ -533,11 +533,13 @@ pub struct PromptInputProps<'a> {
     /// Initial controlled value seam. REPL owns the durable prompt snapshot so
     /// local-command unmount/remount cycles preserve unsent text.
     pub initial_input: Option<String>,
-    /// Maps to: CC `PromptInputProps.onInputChange`.
-    pub on_input_change: HandlerMut<'a, String>,
+    /// Maps to: CC `PromptInputProps.onInputChange`. A shared `Handler` (not
+    /// `HandlerMut`) so the text input's change event can call it directly,
+    /// the way CC's `onChange` calls `onInputChange`.
+    pub on_input_change: Handler<String>,
     /// Retained equivalent of REPL's controlled input/mode/paste/cursor state.
     /// Echoes edits with the same revision; only owner-initiated updates advance it.
-    pub on_input_state_change: HandlerMut<'a, PromptInputTextUpdate>,
+    pub on_input_state_change: Handler<PromptInputTextUpdate>,
     /// Projects CC `useIsModalOverlayActive()` to the REPL-level dynamic
     /// command-keybinding owner.
     pub on_modal_overlay_change: HandlerMut<'a, bool>,
@@ -568,6 +570,46 @@ pub struct PromptInputProps<'a> {
     /// Shift+Tab intent callback. REPL owns the actual permission-mode cycle
     /// via `utils::permissions::get_next_permission_mode`.
     pub on_permission_mode_cycle: HandlerMut<'a, ()>,
+    /// Maps to: CC `PromptInputProps.hasSuppressedDialogs` (PromptInput.tsx:301):
+    /// permission prompts are queued but held back while the user types
+    /// (REPL.tsx:2768-2775), so the prompt says it is waiting for them.
+    pub has_suppressed_dialogs: bool,
+}
+
+/// Maps to: CC PromptInput.tsx:1148-1160 `onChange` — cancel pending prompt
+/// suggestion / speculation work and reset autocomplete for the new text.
+/// Called from the text input's change event for typed edits, and from the
+/// render-body `prev_input` diff for programmatic ones.
+fn on_input_text_changed(
+    app_store: Option<&crate::state::store::AppStore>,
+    text: &str,
+    mut prev_input: iocraft::hooks::State<String>,
+    mut typeahead_selection_reset: iocraft::hooks::Ref<bool>,
+    mut autocomplete_dismissed_input: iocraft::hooks::State<Option<String>>,
+    mut help_open: iocraft::hooks::State<bool>,
+) {
+    crate::services::prompt_suggestion::prompt_suggestion::abort_prompt_suggestion();
+    if let Some(active) = app_store.and_then(|store| {
+        let state = store.get();
+        match &state.speculation {
+            crate::state::app_state_store::SpeculationState::Active(active) => {
+                Some(active.clone())
+            }
+            crate::state::app_state_store::SpeculationState::Idle => None,
+        }
+    }) {
+        active.abort_controller.abort();
+        let context = active.cache_safe_params.tool_use_context.clone();
+        tokio::spawn(async move {
+            crate::services::prompt_suggestion::speculation::abort_speculation(&context).await;
+        });
+    }
+    prev_input.set(text.to_string());
+    typeahead_selection_reset.set(true);
+    autocomplete_dismissed_input.set(None);
+    if help_open.get() {
+        help_open.set(false);
+    }
 }
 
 #[component]
@@ -626,10 +668,6 @@ pub fn PromptInput<'a>(
     let initial_model = initial_app_state
         .as_ref()
         .and_then(|state| state.main_loop_model.clone());
-    let initial_thinking = initial_app_state
-        .as_ref()
-        .and_then(|state| state.thinking_enabled)
-        .unwrap_or(true);
     let fast_mode_on = initial_app_state
         .as_ref()
         .is_some_and(|state| state.fast_mode);
@@ -687,14 +725,15 @@ pub fn PromptInput<'a>(
             last_insert_revision.set(Some(update.revision));
         }
     }
-    let mut undo_stack = hooks.use_state(Vec::<PromptEditSnapshot>::new);
-    let mut last_edit_snapshot = hooks.use_state(move || initial_edit_snapshot);
+    // Refs, not state: the undo buffer is never rendered, and it is recorded
+    // by diffing snapshots during render — a `State` write there is a
+    // render-phase update that costs the frame a second update pass.
+    let mut undo_stack = hooks.use_ref(Vec::<PromptEditSnapshot>::new);
+    let mut last_edit_snapshot = hooks.use_ref(move || initial_edit_snapshot);
     let mut stashed_prompt = hooks.use_state(|| Option::<PromptStash>::None);
     let mut show_model_picker = hooks.use_state(|| false);
     let mut show_fast_mode_picker = hooks.use_state(|| false);
     let mut show_thinking_toggle = hooks.use_state(|| false);
-    let mut thinking_toggle_focus = hooks.use_state(|| usize::from(!initial_thinking));
-    let mut thinking_confirmation = hooks.use_state(|| Option::<bool>::None);
     let mut is_external_editor_active = hooks.use_state(|| false);
     let mut editor_result = hooks.use_state(|| Option::<EditorResult>::None);
     let mut clipboard_image_result =
@@ -1185,12 +1224,20 @@ pub fn PromptInput<'a>(
             true
         },
     );
+    // Maps to: CC `PromptInput.tsx:2226-2238`. The picker owns ctrl+r only
+    // under the HISTORY_PICKER build feature; without it the binding is
+    // inactive and useHistorySearch's inline search takes the key.
+    // (`prompt_actions_active` stands in for CC's `!isModalOverlayActive`,
+    // a known seam.)
+    let history_picker = crate::utils::feature_flags::feature_enabled(
+        crate::utils::feature_flags::FeatureFlag::HistoryPicker,
+    );
     use_keybinding(
         &mut hooks,
         keybinding_runtime.clone(),
         "history:search",
         ContextName::Global,
-        move || prompt_actions_active,
+        move || history_picker && prompt_actions_active,
         move || {
             show_history_picker.set(true);
             help_open.set(false);
@@ -1238,6 +1285,12 @@ pub fn PromptInput<'a>(
             });
         }
     }
+    // Maps to: CC PromptInput.tsx:678-682. No footer item here for
+    // `tmuxSelected` (ant-only) or `bagelSelected` (`bagelFooterVisible` is
+    // hardcoded false, :432-434).
+    let tasks_selected = footer_item_selected == Some(FooterItem::Tasks);
+    let teams_selected = footer_item_selected == Some(FooterItem::Teams);
+    let bridge_selected = footer_item_selected == Some(FooterItem::Bridge);
     let select_footer_item = {
         let store = app_store.clone();
         move |item: Option<FooterItem>| {
@@ -1440,7 +1493,6 @@ pub fn PromptInput<'a>(
             show_thinking_toggle.set(!show_thinking_toggle.get());
             show_model_picker.set(false);
             show_fast_mode_picker.set(false);
-            thinking_confirmation.set(None);
             help_open.set(false);
             true
         },
@@ -1584,6 +1636,7 @@ pub fn PromptInput<'a>(
         && autocomplete_dismissed_input.read().as_deref() != Some(input.read().as_str());
     let typeahead_count = typeahead.suggestions.len() as i32;
     let mut typeahead_selected = typeahead.selected;
+    let typeahead_selection_reset = typeahead.selection_reset;
     let typeahead_suggestions = Arc::clone(&typeahead.suggestions);
     let typeahead_kind = typeahead.kind;
     let typeahead_file_token = typeahead.file_token.clone();
@@ -1595,29 +1648,22 @@ pub fn PromptInput<'a>(
 
     // Reset autocomplete selection when the actual input text changes. This is
     // the `onChange → selectedSuggestion=0` behavior from CC PromptInput.
+    //
+    // Typed changes already ran this in the text input's change event (the
+    // `on_change` handler below, CC's `onChange`), so on a typing frame
+    // `prev_input == input` and nothing here writes. This render-body diff
+    // is the fallback for the programmatic edits (undo, stash, suggestion
+    // accept, controlled updates, …) that set `input` without going through
+    // the text input.
     if prev_input.read().as_str() != input.read().as_str() {
-        crate::services::prompt_suggestion::prompt_suggestion::abort_prompt_suggestion();
-        if let Some(active) = app_store.as_ref().and_then(|store| {
-            let state = store.get();
-            match &state.speculation {
-                crate::state::app_state_store::SpeculationState::Active(active) => {
-                    Some(active.clone())
-                }
-                crate::state::app_state_store::SpeculationState::Idle => None,
-            }
-        }) {
-            active.abort_controller.abort();
-            let context = active.cache_safe_params.tool_use_context.clone();
-            tokio::spawn(async move {
-                crate::services::prompt_suggestion::speculation::abort_speculation(&context).await;
-            });
-        }
-        prev_input.set(input.to_string());
-        typeahead_selected.set(0);
-        autocomplete_dismissed_input.set(None);
-        if help_open.get() {
-            help_open.set(false);
-        }
+        on_input_text_changed(
+            app_store.as_ref(),
+            &input.read(),
+            prev_input,
+            typeahead_selection_reset,
+            autocomplete_dismissed_input,
+            help_open,
+        );
     }
 
     // `useTypeahead` is the sole suggestion-state owner. Reuse its memoized
@@ -2001,80 +2047,6 @@ pub fn PromptInput<'a>(
     });
 
     let (columns, terminal_rows) = hooks.use_terminal_size();
-    let app_store_for_picker = app_store.clone();
-    let mut notifications_for_picker = notifications.clone();
-    let has_assistant_messages = props.has_assistant_messages;
-    hooks.use_propagated_terminal_events(move |event| {
-        let TerminalEvent::Key(KeyEvent {
-            code,
-            kind,
-            modifiers,
-            ..
-        }) = event.event()
-        else {
-            return;
-        };
-        if *kind == KeyEventKind::Release {
-            return;
-        }
-
-        if show_model_picker.get() {
-            return;
-        }
-
-        if show_thinking_toggle.get() {
-            let selected = thinking_toggle_focus.get() == 0;
-            let current = app_store_for_picker
-                .as_ref()
-                .and_then(|store| store.get().thinking_enabled)
-                .unwrap_or(true);
-            match code {
-                KeyCode::Esc => {
-                    if thinking_confirmation.read().is_some() {
-                        thinking_confirmation.set(None);
-                    } else {
-                        show_thinking_toggle.set(false);
-                    }
-                }
-                KeyCode::Up | KeyCode::Down => {
-                    if thinking_confirmation.read().is_none() {
-                        thinking_toggle_focus
-                            .set(1usize.saturating_sub(thinking_toggle_focus.get().min(1)));
-                    }
-                }
-                KeyCode::Enter if modifiers.is_empty() => {
-                    if thinking_confirmation.read().is_none()
-                        && thinking_toggle_requires_confirmation(
-                            current,
-                            selected,
-                            has_assistant_messages,
-                        )
-                    {
-                        thinking_confirmation.set(Some(selected));
-                    } else {
-                        let value = thinking_confirmation.read().unwrap_or(selected);
-                        if let Some(store) = app_store_for_picker.as_ref() {
-                            store.replace_with(|state| state.thinking_enabled = Some(value));
-                        }
-                        {
-                            let context = &mut notifications_for_picker;
-                            context.add_notification(
-                                crate::context::notifications::Notification::text(
-                                    "thinking-toggled-hotkey",
-                                    format!("Thinking {}", if value { "on" } else { "off" }),
-                                    crate::context::notifications::NotificationPriority::Immediate,
-                                ),
-                            );
-                        }
-                        thinking_confirmation.set(None);
-                        show_thinking_toggle.set(false);
-                    }
-                }
-                _ => return,
-            }
-            event.stop_propagation();
-        }
-    });
     let text_input_columns = prompt_text_input_columns(columns);
     // Official main-screen/native-scrollback PromptInput does not cap the
     // input viewport. The 50% bottom-slot cap is fullscreen-only upstream.
@@ -2124,7 +2096,40 @@ pub fn PromptInput<'a>(
     let mut text_input = use_text_input(
         &mut hooks,
         UseTextInputOptions {
-            on_change: Handler::default(),
+            // Maps to: CC PromptInput.tsx:1148-1160 `onChange` — the work that
+            // follows a keystroke, plus `trackAndSetInput → onInputChange`
+            // (:382-388), runs in the input event. Doing it here instead of by
+            // diffing during render is what keeps a typing frame to one
+            // update pass: every `State` written during render forces the
+            // settle pass to re-run the update (and this component is most
+            // of it). The render-body emission near the end stays as the
+            // fallback for programmatic edits; the parent ignores repeats.
+            on_change: Handler::from({
+                let app_store = app_store.clone();
+                let on_input_change = props.on_input_change.clone();
+                let on_input_state_change = props.on_input_state_change.clone();
+                move |text: String| {
+                    if prev_input.read().as_str() == text.as_str() {
+                        return;
+                    }
+                    on_input_text_changed(
+                        app_store.as_ref(),
+                        &text,
+                        prev_input,
+                        typeahead_selection_reset,
+                        autocomplete_dismissed_input,
+                        help_open,
+                    );
+                    on_input_change(text.clone());
+                    on_input_state_change(PromptInputTextUpdate {
+                        revision: last_controlled_revision.get().unwrap_or_default(),
+                        text,
+                        mode: Some(input_mode.get()),
+                        pasted_contents: Some(pasted_contents.read().clone()),
+                        cursor_offset: Some(cursor_offset.get()),
+                    });
+                }
+            }),
             on_clear_input: Handler::default(),
             on_history_reset: Handler::from({
                 let arrow_history = arrow_history.clone();
@@ -2135,6 +2140,7 @@ pub fn PromptInput<'a>(
             }),
             escape_event_passthrough: false,
             select_navigation_passthrough: false,
+            preceding_keybinding_contexts: Vec::new(),
             value: input,
             cursor_offset,
             inline_ghost_text: typeahead_inline_ghost_text.clone(),
@@ -2146,8 +2152,9 @@ pub fn PromptInput<'a>(
             disable_escape_double_press: has_suggestions,
             // While a query is running, Escape belongs to the Repl-level
             // chat:cancel handler (CC CancelRequestHandler isActive gate);
-            // the input yields Escape. Ctrl+C stays with double-press exit
-            // (default Global binding app:exit — old semantics).
+            // the input yields Escape. Ctrl+C stays with the input's clear and
+            // double-press exit even then: Cometix binds it to app:exit, 2.0.x
+            // semantics (default_bindings.rs).
             cancel_passthrough: props.is_loading,
         },
     );
@@ -2458,7 +2465,7 @@ pub fn PromptInput<'a>(
         cursor_offset: Some(cursor_offset.get()),
     });
 
-    if text_input.exit.should_exit() {
+    if text_input.exit.take_should_exit() {
         (props.on_exit)(());
     }
 
@@ -2803,20 +2810,48 @@ pub fn PromptInput<'a>(
         .into_any();
     }
 
+    // CC :2740-2758, returned in place of the input (:2856-2858). The toggle
+    // owns its keys; this only handles the result.
     if show_thinking_toggle.get() {
         let current = app_store
             .as_ref()
             .and_then(|store| store.get().thinking_enabled)
             .unwrap_or(true);
+        let select_store = app_store.clone();
+        let mut select_notifications = notifications.clone();
         return element! {
             View(flex_direction: FlexDirection::Column, margin_top: 1u32) {
                 ThinkingToggle(
                     current_value: current,
-                    focused_index: thinking_toggle_focus.get(),
-                    confirmation_pending: *thinking_confirmation.read(),
                     is_mid_conversation: props.has_assistant_messages,
-                    exit_pending: false,
-                    exit_key_name: None,
+                    // CC :2713-2733 `handleThinkingSelect`.
+                    on_select: move |enabled: bool| {
+                        if let Some(store) = select_store.as_ref() {
+                            store.replace_with(|state| state.thinking_enabled = Some(enabled));
+                        }
+                        show_thinking_toggle.set(false);
+                        crate::services::analytics::log_event(
+                            "tengu_thinking_toggled_hotkey",
+                            serde_json::json!({ "enabled": enabled }),
+                        );
+                        // `<Text color={enabled ? 'suggestion' : undefined}
+                        // dimColor={!enabled}>`: no colour renders inactive.
+                        let notification = crate::context::notifications::Notification::text(
+                            "thinking-toggled-hotkey",
+                            format!("Thinking {}", if enabled { "on" } else { "off" }),
+                            crate::context::notifications::NotificationPriority::Immediate,
+                        )
+                        .with_timeout_ms(3000);
+                        select_notifications.add_notification(if enabled {
+                            notification.with_color(
+                                crate::context::notifications::NotificationColor::Suggestion,
+                            )
+                        } else {
+                            notification
+                        });
+                    },
+                    // CC :2735-2737 `handleThinkingCancel`.
+                    on_cancel: move |_| show_thinking_toggle.set(false),
                 )
             }
         }
@@ -3029,13 +3064,19 @@ pub fn PromptInput<'a>(
         cursor_offset.get(),
         &slash_command_triggers,
     );
-    let history_query = history_search.query.read().clone();
+    let history_query = history_search.query;
     let history_failed_match = history_search.failed_match.get();
     let input_row_height = rendered_lines.len().max(1);
     let terminal_focus = hooks.use_terminal_focus();
-    let editor_for_external_hint = std::env::var("EDITOR")
-        .ok()
-        .or_else(|| std::env::var("VISUAL").ok());
+    // CC `Notifications.tsx:131` `getExternalEditor()` (`utils/editor.ts:166-171`):
+    // $VISUAL wins over $EDITOR, each only when non-blank after trim. Residual:
+    // the platform fallbacks (`:175-182`: notepad, code/vi/nano) are not
+    // consulted for this hint yet.
+    let editor_for_external_hint = crate::utils::process_env::var("VISUAL")
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            crate::utils::process_env::var("EDITOR").filter(|value| !value.trim().is_empty())
+        });
     let external_editor_hint = external_editor_hint_notification_from_state(
         input_row_height > 1,
         false,
@@ -3147,7 +3188,14 @@ pub fn PromptInput<'a>(
         };
     let input_box_height = input_row_height + 2;
     let stash_height = usize::from(stashed_prompt.read().is_some());
-    let prompt_height = queue_height + stash_height + input_box_height + footer_height;
+    // CC PromptInput.tsx:2981-2985: `<Box marginTop={1} marginLeft={2}>` + one
+    // dim line.
+    let suppressed_dialogs_height = if props.has_suppressed_dialogs { 2 } else { 0 };
+    let prompt_height = queue_height
+        + suppressed_dialogs_height
+        + stash_height
+        + input_box_height
+        + footer_height;
     // Fill viewing fields from AppState (not REPL dual props).
     let mut swarm_banner_input = props.swarm_banner_input.clone();
     if effective_viewing_agent_name.is_some() {
@@ -3289,6 +3337,13 @@ pub fn PromptInput<'a>(
                 viewing_agent: effective_viewing_agent_name.is_some(),
                 use_brief_layout: use_brief_layout,
             )
+            // Maps to: CC PromptInput.tsx:2981-2985, between the queued
+            // commands and the stash notice.
+            #(props.has_suppressed_dialogs.then(|| element! {
+                View(margin_top: 1u32, margin_left: 2u32) {
+                    Text(content: "Waiting for permission…", dim: true, wrap: TextWrap::NoWrap)
+                }
+            }))
             PromptInputStashNotice(has_stash: stashed_prompt.read().is_some())
             #(prompt_input_box)
 
@@ -3349,6 +3404,10 @@ pub fn PromptInput<'a>(
                             background_task_count: pill_tasks.len(),
                             background_tasks_label: crate::tasks::pill_label::get_pill_label(&pill_tasks),
                             teammate_count: teams_dialog_data.as_ref().map(|data| data.teammates.len()).unwrap_or(0),
+                            // Maps to: CC PromptInput.tsx:3064-3066.
+                            tasks_selected: tasks_selected,
+                            teams_selected: teams_selected,
+                            bridge_selected: bridge_selected,
                             vim_mode: show_vim_insert_footer.then(|| "INSERT".to_string()),
                             mode: input_mode.get(),
                             is_pasting: false,
@@ -3367,7 +3426,7 @@ mod tests {
     use super::*;
     use crate::context::notifications::{Notification, NotificationPriority, NotificationsState};
     use crate::utils::cursor::Cursor;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use crate::utils::theme;
     use futures::{StreamExt, stream};
     use std::collections::BTreeMap;
@@ -3814,7 +3873,7 @@ mod tests {
 
     #[test]
     fn fast_icon_renders_once_in_top_right_border_only_when_fast_mode_is_on() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _disable_guard = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_FAST_MODE");
 
         let off = element! { PromptFastIconHarness(enabled: false) }.render(Some(80));
@@ -4319,6 +4378,21 @@ mod tests {
         );
         assert_eq!(thinking_store.get().thinking_enabled, Some(false));
 
+        // CC PromptInput.tsx:2735-2737: cancelling leaves the mode alone.
+        let cancelled_thinking_store = crate::state::store::AppStore::new(
+            crate::state::app_state_store::AppState::default(),
+            None,
+        );
+        drive_prompt_with_store(
+            cancelled_thinking_store.clone(),
+            vec![
+                key_with_modifiers(KeyCode::Char('t'), KeyModifiers::ALT),
+                key(KeyCode::Down),
+                key(KeyCode::Esc),
+            ],
+        );
+        assert_eq!(cancelled_thinking_store.get().thinking_enabled, None);
+
         let fast_store = crate::state::store::AppStore::new(
             crate::state::app_state_store::AppState::default(),
             None,
@@ -4336,6 +4410,8 @@ mod tests {
 
     #[test]
     fn prompt_input_chat_actions_open_model_and_thinking_boundaries() {
+        // Selecting a thinking mode posts a timed notification.
+        crate::utils::process_runtime::initialize_test_process_runtime();
         let model = prompt_after_events(
             false,
             vec![key_with_modifiers(KeyCode::Char('p'), KeyModifiers::ALT)],
@@ -4350,6 +4426,13 @@ mod tests {
             thinking.contains("Toggle thinking mode"),
             "canvas=\n{thinking}"
         );
+        // CC :2713-2737: selecting and cancelling both close the toggle.
+        for closing in [vec![key(KeyCode::Down), key(KeyCode::Enter)], vec![key(KeyCode::Esc)]] {
+            let mut events = vec![key_with_modifiers(KeyCode::Char('t'), KeyModifiers::ALT)];
+            events.extend(closing);
+            let closed = prompt_after_events(false, events);
+            assert!(!closed.contains("Toggle thinking mode"), "canvas=\n{closed}");
+        }
 
         let fast = prompt_after_events(
             false,
@@ -4402,7 +4485,7 @@ mod tests {
     fn prompt_input_history_suppression_matches_official_navigation_and_reactivation() {
         // CC PromptInput.tsx:1245-1286,1508 and useTypeahead.tsx:684-688:
         // history suppresses the suggestion state, not just the dropdown.
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let _skip = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         prompt_history::add_to_history("/help");
@@ -4967,6 +5050,60 @@ mod tests {
         );
     }
 
+    #[derive(Default, Props)]
+    struct PromptSuppressedDialogsHarnessProps {
+        suppressed: bool,
+    }
+
+    #[component]
+    fn PromptSuppressedDialogsHarness(
+        props: &PromptSuppressedDialogsHarnessProps,
+        hooks: Hooks,
+    ) -> impl Into<AnyElement<'static>> {
+        let _ = hooks;
+        let suppressed = props.suppressed;
+        element! {
+            ContextProvider(value: Context::owned(*theme::current())) {
+                crate::state::app_state::AppStateProvider(
+                    children: crate::state::app_state::ProviderChildren::new(move || element! {
+                        View(width: 80u32) {
+                            PromptInput(
+                                on_submit: move |_| {},
+                                on_exit: move |_| {},
+                                has_suppressed_dialogs: suppressed,
+                            )
+                        }
+                    }.into_any()),
+                )
+            }
+        }
+    }
+
+    // CC PromptInput.tsx:2981-2985: a permission dialog held back while the
+    // user types leaves a dim "Waiting for permission…" above the input box.
+    #[test]
+    fn prompt_input_says_it_is_waiting_while_dialogs_are_suppressed() {
+        let shown = element!(PromptSuppressedDialogsHarness(suppressed: true))
+            .render(Some(80))
+            .to_string();
+        let lines: Vec<&str> = shown.lines().collect();
+        let hint = lines
+            .iter()
+            .position(|line| line.trim() == "Waiting for permission…")
+            .unwrap_or_else(|| panic!("hint missing:\n{shown}"));
+        assert!(lines[hint].starts_with("  Waiting"), "marginLeft 2:\n{shown}");
+        let prompt = lines
+            .iter()
+            .position(|line| line.contains(PROMPT_CHAR))
+            .expect("prompt line");
+        assert!(hint < prompt, "hint sits above the input box:\n{shown}");
+
+        let hidden = element!(PromptSuppressedDialogsHarness(suppressed: false))
+            .render(Some(80))
+            .to_string();
+        assert!(!hidden.contains("Waiting for permission"), "canvas=\n{hidden}");
+    }
+
     #[test]
     fn prompt_input_renders_notifications_in_native_document_flow() {
         let text = element!(PromptWithNotification)
@@ -5292,7 +5429,7 @@ mod tests {
     #[test]
     fn prompt_input_queues_external_editor_hint_when_wrapped() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _editor_guard = EnvVarGuard::set("EDITOR", "code --wait");
         let _visual_guard = EnvVarGuard::unset("VISUAL");
         let long_input = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";

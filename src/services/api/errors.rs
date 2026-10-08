@@ -354,7 +354,7 @@ pub fn get_oauth_org_not_allowed_error_message() -> &'static str {
 ///
 /// Maps to: CC services/api/errors.ts:217-219
 fn is_ccr_mode() -> bool {
-    crate::utils::env_utils::is_env_truthy(std::env::var("CLAUDE_CODE_REMOTE").ok().as_deref())
+    crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_REMOTE").as_deref())
 }
 
 // ---------------------------------------------------------------------------
@@ -673,7 +673,7 @@ pub fn classify_api_error(error: &ApiErrorInfo) -> ApiErrorClass {
 
     // Bedrock model access
     if crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_USE_BEDROCK").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_USE_BEDROCK").as_deref(),
     ) && msg_lower.contains("model id")
     {
         return ApiErrorClass::BedrockModelAccess;
@@ -1058,7 +1058,7 @@ pub fn get_assistant_message_from_error(error: &ApiErrorInfo, model: &str) -> Ap
 
     // --- Bedrock model ID errors ---
     if crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_USE_BEDROCK").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_USE_BEDROCK").as_deref(),
     ) && msg_lower.contains("model id")
     {
         let switch_cmd = if get_is_non_interactive_session() {
@@ -1158,6 +1158,8 @@ pub fn get_error_message_if_refusal(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "anthropic_internal")]
+    use crate::utils::test_env::TEST_ENV_LOCK;
     use std::collections::HashMap;
 
     #[test]
@@ -1487,7 +1489,7 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[test]
     fn unified_mock_429_uses_centralized_rate_limit_message() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         crate::services::mock_rate_limits::reset_for_test();
         crate::services::mock_rate_limits::set_mock_rate_limit_scenario(
             crate::services::mock_rate_limits::MockScenario::WeeklyLimitReached,

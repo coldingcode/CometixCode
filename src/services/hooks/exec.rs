@@ -142,12 +142,23 @@ pub async fn exec_command_hook(
             shell.kill_on_drop(true).args(["/C", command.as_str()]);
             shell
         };
+        // CC spawns with `shell: true`, which is `/bin/sh` off Windows
+        // (`hooks.ts:975-977`).
         #[cfg(not(windows))]
         let mut shell = {
-            let mut shell = tokio::process::Command::new("sh");
+            let mut shell = tokio::process::Command::new("/bin/sh");
             shell.kill_on_drop(true).args(["-c", command.as_str()]);
             shell
         };
+        // CC hooks.ts:813-816,882-885: `{ ...subprocessEnv(), CLAUDE_PROJECT_DIR:
+        // getProjectRoot() }`, set here for every caller; the caller's and the
+        // plugin variables in `env_vars` go over it. The original cwd stands in
+        // for the project root this port does not have.
+        crate::utils::subprocess_env::apply_subprocess_env(&mut shell);
+        shell.env(
+            "CLAUDE_PROJECT_DIR",
+            crate::bootstrap::state::get_original_cwd(),
+        );
         let mut child = match shell
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -254,6 +265,7 @@ pub async fn exec_command_hook(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[tokio::test]
     async fn echo_command_captures_stdout() {
@@ -388,7 +400,7 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn plugin_substitution_and_environment_match_official_exec_setup() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let plugin_root = std::env::temp_dir().join(format!(
             "cometix-hook-plugin-{}",
             uuid::Uuid::new_v4().simple()
@@ -430,7 +442,7 @@ mod tests {
     #[cfg(not(windows))]
     #[tokio::test]
     async fn plugin_options_are_substituted_after_plugin_paths_and_override_base_env() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let config_root = std::env::temp_dir().join(format!(
             "cometix-hook-config-{}",
             uuid::Uuid::new_v4().simple()
@@ -452,7 +464,7 @@ mod tests {
             serde_json::to_vec(&settings).unwrap(),
         )
         .unwrap();
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_root);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_root);
 
         let plugin_root = std::env::temp_dir().display().to_string();
         let result = exec_command_hook(

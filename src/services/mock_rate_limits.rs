@@ -12,6 +12,8 @@ use std::sync::{LazyLock, Mutex};
 
 use chrono::{Datelike, Local, TimeZone, Utc};
 
+use crate::utils::process_env::JsTruthy;
+
 pub type MockHeaders = HashMap<String, String>;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -473,10 +475,8 @@ pub fn get_mock_headerless_429_message() -> Option<String> {
     if !internal_mock_capability() {
         return None;
     }
-    if let Ok(value) = std::env::var("CLAUDE_MOCK_HEADERLESS_429") {
-        if !value.is_empty() {
-            return Some(value);
-        }
+    if let Some(value) = crate::utils::process_env::var("CLAUDE_MOCK_HEADERLESS_429").truthy() {
+        return Some(value);
     }
     let state = MOCK_STATE.lock().expect("mock limits lock poisoned");
     state
@@ -506,9 +506,9 @@ pub fn should_process_mock_limits() -> bool {
     if !internal_mock_capability() {
         return false;
     }
-    let env_enabled = std::env::var("CLAUDE_MOCK_HEADERLESS_429")
-        .ok()
-        .is_some_and(|value| !value.is_empty());
+    let env_enabled = crate::utils::process_env::var("CLAUDE_MOCK_HEADERLESS_429")
+        .truthy()
+        .is_some();
     MOCK_STATE
         .lock()
         .expect("mock limits lock poisoned")
@@ -708,10 +708,11 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn mock_limit_activation_respects_compile_time_internal_capability() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_for_test();
         set_mock_rate_limit_scenario(MockScenario::SessionLimitReached);
         if internal_mock_capability() {
@@ -733,7 +734,7 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[test]
     fn mock_header_overlay_and_opus_model_gate_match_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_for_test();
         set_mock_rate_limit_scenario(MockScenario::OpusLimit);
         let original = [("server".to_string(), "real".to_string())]
@@ -753,7 +754,7 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[test]
     fn fast_mode_mock_starts_countdown_on_first_active_request() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_for_test();
         set_mock_rate_limit_scenario(MockScenario::FastModeShortLimit);
         assert!(check_mock_fast_mode_rate_limit(false).is_none());

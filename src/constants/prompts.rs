@@ -5,6 +5,7 @@
 use std::collections::HashSet;
 
 use crate::services::api::claude::SystemPrompt;
+use crate::utils::process_env::JsTruthy;
 
 /// Maps to CC `constants/prompts.ts` `SYSTEM_PROMPT_DYNAMIC_BOUNDARY`.
 pub const SYSTEM_PROMPT_DYNAMIC_BOUNDARY: &str = "__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__";
@@ -73,7 +74,7 @@ pub fn get_system_prompt_with_settings(
     #[cfg(test)]
     crate::constants::system_prompt_sections::clear_system_prompt_sections();
 
-    if crate::utils::env_utils::is_env_truthy(std::env::var("CLAUDE_CODE_SIMPLE").ok().as_deref()) {
+    if crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_SIMPLE").as_deref()) {
         return get_simple_system_prompt_if_enabled();
     }
 
@@ -113,7 +114,7 @@ pub fn get_system_prompt_with_settings(
         system_prompt_section("session_guidance", || {
             get_session_specific_guidance_section(&enabled_tools, &skill_tool_commands)
         }),
-        system_prompt_section("memory", || get_memory_prompt_section(settings)),
+        system_prompt_section("memory", get_memory_prompt_section),
         system_prompt_section("ant_model_override", get_ant_model_override_section),
         // Maps to CC `prompts.ts:499-501` `computeSimpleEnvInfo(model,
         // additionalWorkingDirectories)`.
@@ -172,7 +173,7 @@ fn prompt_settings_snapshot() -> crate::utils::settings::types::SettingsJson {
 
 /// Maps to: CC `constants/prompts.ts` `getSystemPrompt(...)` simple-mode branch.
 pub fn get_simple_system_prompt_if_enabled() -> SystemPrompt {
-    if !crate::utils::env_utils::is_env_truthy(std::env::var("CLAUDE_CODE_SIMPLE").ok().as_deref())
+    if !crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_SIMPLE").as_deref())
     {
         return Vec::new();
     }
@@ -455,10 +456,8 @@ fn get_agent_tool_section() -> String {
 }
 
 /// Maps to CC `constants/prompts.ts` dynamic `systemPromptSection('memory', ...)`.
-fn get_memory_prompt_section(
-    settings: &crate::utils::settings::types::SettingsJson,
-) -> Option<String> {
-    crate::memdir::memdir::load_memory_prompt(settings)
+fn get_memory_prompt_section() -> Option<String> {
+    crate::memdir::memdir::load_memory_prompt()
 }
 
 /// Maps to CC `constants/prompts.ts` `getAntModelOverrideSection()`.
@@ -743,7 +742,7 @@ fn get_knowledge_cutoff(model_id: &str) -> Option<&'static str> {
 /// Maps to CC `constants/prompts.ts` `getShellInfoLine()`.
 fn get_shell_info_line() -> String {
     let shell = crate::utils::process_env::var("SHELL")
-        .filter(|shell| !shell.is_empty())
+        .truthy()
         .unwrap_or_else(|| "unknown".to_string());
     let shell_name = if shell.contains("zsh") {
         "zsh".to_string()
@@ -767,7 +766,7 @@ fn get_shell_info_line() -> String {
 pub fn get_uname_sr() -> String {
     #[cfg(target_os = "windows")]
     {
-        std::env::var("OS").unwrap_or_else(|_| "Windows_NT".to_string())
+        crate::utils::process_env::var("OS").unwrap_or_else(|| "Windows_NT".to_string())
     }
     #[cfg(not(target_os = "windows"))]
     {
@@ -806,6 +805,7 @@ fn should_use_global_cache_scope() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     // Test-only RAII fixture; no runtime counterpart or additional dependency.
     struct TestDir(std::path::PathBuf);
@@ -831,7 +831,7 @@ mod tests {
 
     #[test]
     fn simple_system_prompt_matches_official_shape_when_enabled() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("CLAUDE_CODE_SIMPLE", "1");
         let prompt = get_simple_system_prompt_if_enabled();
         crate::utils::process_env::remove("CLAUDE_CODE_SIMPLE");
@@ -844,14 +844,14 @@ mod tests {
 
     #[test]
     fn simple_system_prompt_is_absent_when_official_gate_is_disabled() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_SIMPLE");
         assert!(get_simple_system_prompt_if_enabled().is_empty());
     }
 
     #[test]
     fn default_system_prompt_uses_official_section_order_and_environment() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_SIMPLE");
         crate::utils::process_env::remove("CLAUDE_CODE_USE_GLOBAL_CACHE_SCOPE");
         crate::utils::process_env::remove("ANTHROPIC_USE_GLOBAL_CACHE_SCOPE");
@@ -894,7 +894,7 @@ mod tests {
 
     #[test]
     fn default_system_prompt_includes_global_cache_boundary_when_enabled() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_SIMPLE");
         crate::utils::process_env::set("CLAUDE_CODE_USE_GLOBAL_CACHE_SCOPE", "1");
         crate::utils::process_env::set("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1");
@@ -912,7 +912,7 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[test]
     fn default_system_prompt_includes_internal_static_guidance() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_SIMPLE");
         crate::utils::process_env::remove("CLAUDE_CODE_USE_GLOBAL_CACHE_SCOPE");
         crate::utils::process_env::remove("ANTHROPIC_USE_GLOBAL_CACHE_SCOPE");
@@ -958,7 +958,7 @@ mod tests {
 
     #[test]
     fn default_system_prompt_threads_language_and_output_style_dynamic_sections() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_SIMPLE");
         crate::utils::process_env::remove("CLAUDE_CODE_USE_GLOBAL_CACHE_SCOPE");
         crate::utils::process_env::remove("ANTHROPIC_USE_GLOBAL_CACHE_SCOPE");
@@ -1003,7 +1003,7 @@ mod tests {
 
     #[test]
     fn default_system_prompt_includes_auto_memory_section_when_enabled() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let temp = std::env::temp_dir().join(format!(
             "cometix-prompt-memory-{}-{}",
             std::process::id(),
@@ -1057,7 +1057,7 @@ mod tests {
     /// vetoes in an INTERACTIVE session, so this is the arm real CC emits.
     #[test]
     fn agent_tool_section_ships_the_fork_copy_in_an_interactive_session() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _fork_gate = crate::tools::agent_tool::fork_subagent::fork_gate_environment();
         assert!(
             crate::tools::agent_tool::fork_subagent::is_fork_subagent_enabled(),
@@ -1081,7 +1081,7 @@ mod tests {
     /// binary. Both arms are live; this one is what `--print` renders.
     #[test]
     fn agent_tool_section_keeps_the_delegation_copy_in_a_non_interactive_session() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _headless = crate::tools::agent_tool::fork_subagent::fork_veto_environment();
         assert!(
             !crate::tools::agent_tool::fork_subagent::is_fork_subagent_enabled(),
@@ -1107,7 +1107,7 @@ mod tests {
     /// divergence — this assertion is the tripwire for that.
     #[test]
     fn interactive_session_guidance_carries_the_fork_copy_and_no_explore_bullets() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _fork_gate = crate::tools::agent_tool::fork_subagent::fork_gate_environment();
         assert!(crate::tools::agent_tool::fork_subagent::is_fork_subagent_enabled());
 
@@ -1129,10 +1129,9 @@ mod tests {
     fn pin_session_interactivity(
         non_interactive: bool,
     ) -> (
-        [crate::utils::env_utils::EnvVarGuard; 3],
+        [EnvVarGuard; 3],
         crate::bootstrap::state::IsInteractiveGuard,
     ) {
-        use crate::utils::env_utils::EnvVarGuard;
         let env = [
             EnvVarGuard::unset("CLAUDE_CODE_NON_INTERACTIVE"),
             EnvVarGuard::unset("COMETIX_NON_INTERACTIVE"),
@@ -1161,11 +1160,10 @@ mod tests {
     /// A plain assertion failure, not a hang.
     #[test]
     fn shell_hint_bullet_is_interactive_only() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         // Keep `getAgentToolSection()`'s own gate off this test's back: the
         // coordinator veto is the other half of `isForkSubagentEnabled()`.
-        let _coordinator =
-            crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_COORDINATOR_MODE");
+        let _coordinator = EnvVarGuard::unset("CLAUDE_CODE_COORDINATOR_MODE");
         let enabled_tools =
             HashSet::from([crate::tools::agent_tool::constants::AGENT_TOOL_NAME.to_string()]);
 
@@ -1202,7 +1200,7 @@ mod tests {
     /// the unconditional bullet always filled it. Fails on the old shape.
     #[test]
     fn headless_guidance_section_disappears_when_nothing_else_fills_it() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let empty = HashSet::new();
 
         {
@@ -1278,9 +1276,9 @@ mod tests {
 
     #[test]
     fn compute_env_info_matches_official_xml_dirs_and_model_format() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _shell = crate::utils::env_utils::EnvVarGuard::set("SHELL", "/custom/bin/zsh");
-        let _foundry = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_USE_FOUNDRY");
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _shell = EnvVarGuard::set("SHELL", "/custom/bin/zsh");
+        let _foundry = EnvVarGuard::unset("CLAUDE_CODE_USE_FOUNDRY");
         let root = TestDir::new();
         let dirs = vec!["/z-last".to_string(), "/a-first".to_string()];
         let actual = compute_env_info("claude-sonnet-4-6[1m]", &dirs, root.path());
@@ -1317,8 +1315,8 @@ mod tests {
 
     #[test]
     fn compute_env_info_matches_official_unknown_model_and_empty_shell() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _shell = crate::utils::env_utils::EnvVarGuard::set("SHELL", "");
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _shell = EnvVarGuard::set("SHELL", "");
         let root = TestDir::new();
         let actual = compute_env_info("deployment-private", &[], root.path());
         // CC constants/prompts.ts:627, 630-638, 733: no empty dirs/cutoff; JS ||
@@ -1337,8 +1335,8 @@ mod tests {
 
     #[test]
     fn compute_env_info_matches_official_foundry_marketing_name_omission() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _foundry = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CODE_USE_FOUNDRY", "1");
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _foundry = EnvVarGuard::set("CLAUDE_CODE_USE_FOUNDRY", "1");
         let root = TestDir::new();
         let actual = compute_env_info("claude-opus-4-6", &[], root.path());
         // CC utils/model/model.ts:571-574 declines deployment marketing labels.
@@ -1353,8 +1351,8 @@ mod tests {
 
     #[test]
     fn compute_simple_env_info_matches_official_marketing_name_and_undercover_omission() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _foundry = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_USE_FOUNDRY");
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _foundry = EnvVarGuard::unset("CLAUDE_CODE_USE_FOUNDRY");
         let root = TestDir::new();
         let actual = compute_simple_env_info_with_cwd("claude-opus-4-5", &[], root.path());
         // CC constants/prompts.ts:659-668 and :691-702 retain the original model
@@ -1378,13 +1376,13 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn get_uname_sr_matches_official_os_api_independently_of_path() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let output = std::process::Command::new("/usr/bin/uname")
             .arg("-sr")
             .output()
             .unwrap();
         assert!(output.status.success());
-        let _path = crate::utils::env_utils::EnvVarGuard::set("PATH", "/nonexistent-uname-path");
+        let _path = EnvVarGuard::set("PATH", "/nonexistent-uname-path");
         // CC constants/prompts.ts:742-755 uses Node os.type/os.release; its result
         // is documented byte-identical to uname -sr without a PATH process lookup.
         assert_eq!(
@@ -1397,7 +1395,7 @@ mod tests {
     /// the enabled Skill tool are required, with byte-identical instruction.
     #[test]
     fn skill_guidance_matches_official_listing_and_tool_gates() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _headless = pin_session_interactivity(true);
         let root = TestDir::new();
         let skill_dir = root.path().join("guidance");
@@ -1435,8 +1433,8 @@ mod tests {
                 crate::commands::clear_command_memoization_caches();
             }
         }
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _simple = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         let _dynamic = crate::skills::load_skills_dir::DynamicSkillsTestSnapshot::capture();
         let _sources =
             AllowedSourcesRestore(crate::bootstrap::state::get_allowed_setting_sources());

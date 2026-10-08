@@ -395,26 +395,30 @@ fn full_input_fields() -> Vec<crate::utils::zod::ObjectField> {
     ]
 }
 
+/// Maps to: CC `BashTool.tsx:332-335` module-level `isBackgroundTasksDisabled`,
+/// evaluated at import, before `init()` applies settings env (its eslint
+/// exemption reads "Intentional: schema must be defined at module load").
+/// `entrypoints/cli.rs` forces it in the startup window, so a value only
+/// settings env sets is not seen here, as in CC; a mid-process change does not
+/// re-shape the schema either.
+pub(crate) static IS_BACKGROUND_TASKS_DISABLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| {
+        crate::utils::env_utils::is_env_truthy(
+            crate::utils::process_env::var("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS").as_deref(),
+        )
+    });
+
 /// Maps to: CC `BashTool.tsx:378-385` `inputSchema`.
 ///
 /// `_simulatedSedEdit` is ALWAYS omitted: it is set by SedEditPermissionRequest
 /// after the user approves a preview, and exposing it would let the model pair
 /// an innocuous command with an arbitrary file write, bypassing both the
 /// permission check and the sandbox. `run_in_background` is additionally
-/// omitted when background tasks are off.
-///
-/// The gate is read once, matching CC's module-load `isBackgroundTasksDisabled`
-/// (`BashTool.tsx:332-334`, which carries an explicit eslint exemption reading
-/// "Intentional: schema must be defined at module load"). A mid-process env
-/// change therefore does NOT re-shape the schema, in either implementation.
+/// omitted when background tasks are off ([`IS_BACKGROUND_TASKS_DISABLED`]).
 pub fn input_schema() -> &'static crate::utils::zod::Schema {
     static SCHEMA: std::sync::OnceLock<crate::utils::zod::Schema> = std::sync::OnceLock::new();
     SCHEMA.get_or_init(|| {
-        let background_disabled = crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")
-                .ok()
-                .as_deref(),
-        );
+        let background_disabled = *IS_BACKGROUND_TASKS_DISABLED;
         // CC composes with `.omit()`; the contract puts composition at the
         // definition site, so the field list is filtered here instead.
         let fields = full_input_fields()
@@ -504,9 +508,10 @@ async fn apply_simulated_sed_edit(
         &simulated.file_path,
         Some(context.effective_cwd().as_path()),
     )?;
+    let fs = crate::utils::fs_operations::get_fs_implementation();
     let encoding = crate::utils::file::detect_file_encoding(&path);
-    let original = match crate::utils::file::read_text_with_encoding(&path, encoding) {
-        Ok(content) => content,
+    let original = match fs.read_file(&path, encoding.into()).await {
+        Ok(content) => content.to_string_lossy(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(BashOutput {
                 stderr: format!(
@@ -672,11 +677,8 @@ fn run_shell_command(
             crate::tools::shared::write_gate::BACKGROUND_COMMAND_DISABLED_ERROR.to_string(),
         );
     }
-    let background_disabled = crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")
-            .ok()
-            .as_deref(),
-    );
+    // CC `BashTool.tsx:1159` reads the module-level constant.
+    let background_disabled = *IS_BACKGROUND_TASKS_DISABLED;
     let should_auto_background = !background_disabled
         && is_auto_backgrounding_allowed(command)
         && task_store(context).is_some()
@@ -1095,7 +1097,12 @@ impl crate::tool::ToolCall for BashTool {
     fn is_read_only(&self, args: &serde_json::Value) -> bool {
         args.get("command")
             .and_then(|value| value.as_str())
-            .is_some_and(read_only_validation::check_read_only_constraints)
+            .is_some_and(|command| {
+                read_only_validation::check_read_only_constraints(
+                    command,
+                    &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                )
+            })
     }
 
     fn search_hint(&self) -> Option<&'static str> {
@@ -1166,8 +1173,7 @@ impl crate::tool::ToolCall for BashTool {
         let mut ast_commands = None;
         if crate::utils::build_profile::build_audience().is_internal()
             && !crate::utils::env_utils::is_env_truthy(
-                std::env::var("CLAUDE_CODE_DISABLE_COMMAND_INJECTION_CHECK")
-                    .ok()
+                crate::utils::process_env::var("CLAUDE_CODE_DISABLE_COMMAND_INJECTION_CHECK")
                     .as_deref(),
             )
         {
@@ -1229,11 +1235,7 @@ impl crate::tool::ToolCall for BashTool {
                 &cwd,
             );
         }
-        bash_permissions::bash_tool_has_permission_at_cwd(
-            command,
-            &context.tool_permission_context,
-            &cwd,
-        )
+        bash_permissions::bash_tool_has_permission(command, &context.tool_permission_context, &cwd)
     }
 
     fn call<'a>(
@@ -1489,7 +1491,7 @@ impl crate::tool::ToolCall for BashTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[cfg(feature = "anthropic_internal")]
     #[test]
@@ -1543,7 +1545,7 @@ mod tests {
             PermissionDecisionReason, PermissionResult,
         };
 
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-bash-sandbox-permission-{}",
             uuid::Uuid::new_v4().simple()
@@ -1691,7 +1693,7 @@ mod tests {
     /// which owns its own process under nextest.
     #[test]
     fn bash_tool_schema_matches_official_background_task_gate() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _disabled = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
         let schema = bash_tool_schema();
         assert!(
@@ -1721,7 +1723,7 @@ mod tests {
     /// nextest, which is what lets the one-shot read be observed at all.
     #[test]
     fn bash_tool_schema_omits_background_when_gate_is_off() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _enabled = EnvVarGuard::set("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "true");
         let schema = bash_tool_schema();
         assert!(
@@ -1740,7 +1742,7 @@ mod tests {
 
     #[test]
     fn bash_output_applies_approved_simulated_sed_edit_without_shelling_out() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let path = std::env::temp_dir().join(format!(
             "cometix-bash-sed-{}.txt",
@@ -1780,7 +1782,7 @@ mod tests {
 
     #[test]
     fn bash_output_reports_missing_file_for_simulated_sed_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let path = std::env::temp_dir().join(format!(
             "cometix-missing-sed-{}.txt",
@@ -1809,7 +1811,7 @@ mod tests {
 
     #[test]
     fn simulated_sed_respects_explicit_no_write_seam() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "0");
         let context = crate::tool::ToolUseContext::default();
         let error = futures::executor::block_on(apply_simulated_sed_edit(
@@ -1870,7 +1872,7 @@ mod tests {
 
     #[test]
     fn persisted_output_copies_verified_source_and_commits_atomically() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-bash-persist-copy-{}",
             uuid::Uuid::new_v4().simple()
@@ -1896,7 +1898,7 @@ mod tests {
 
     #[test]
     fn persisted_output_rename_failure_keeps_source_artifact_and_cleans_temporary() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-bash-persist-rename-failure-{}",
             uuid::Uuid::new_v4().simple()
@@ -1934,7 +1936,7 @@ mod tests {
     fn persisted_output_rejects_symlink_swap_without_truncating_target() {
         use std::os::unix::fs::symlink;
 
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-bash-persist-symlink-{}",
             uuid::Uuid::new_v4().simple()
@@ -1982,7 +1984,7 @@ mod tests {
 
     #[test]
     fn foreground_timeout_maps_to_exit_143_without_abort_or_display_stderr() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _background = EnvVarGuard::set("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
         let output = bash_output(
             &serde_json::json!({"command": "sleep 1", "timeout": 40}),
@@ -2015,7 +2017,7 @@ mod tests {
 
     #[test]
     fn file_mode_merges_stdout_stderr_and_preserves_partial_binary_tail() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-bash-file-mode-{}",
             uuid::Uuid::new_v4().simple()
@@ -2041,7 +2043,7 @@ mod tests {
 
     #[test]
     fn no_write_pipe_fallback_keeps_child_stderr_model_visible() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-bash-no-write-stderr-{}",
             uuid::Uuid::new_v4().simple()
@@ -2072,7 +2074,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn file_mode_returns_on_shell_exit_without_waiting_for_grandchild_fd() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-bash-grandchild-fd-{}",
             uuid::Uuid::new_v4().simple()
@@ -2110,7 +2112,7 @@ mod tests {
             }
         }
 
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _tasks = TaskStateGuard;
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let _background = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
@@ -2173,7 +2175,7 @@ mod tests {
             }
         }
 
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _tasks = TaskStateGuard;
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let _background = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
@@ -2224,7 +2226,7 @@ mod tests {
 
     #[test]
     fn large_foreground_output_is_copied_to_retained_tool_result_artifact() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let _max_output = EnvVarGuard::unset("BASH_MAX_OUTPUT_LENGTH");
         let output = bash_output(
@@ -2254,7 +2256,7 @@ mod tests {
 
     #[test]
     fn large_error_output_keeps_task_artifact_without_success_persistence_link() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let _max_output = EnvVarGuard::unset("BASH_MAX_OUTPUT_LENGTH");
         let directory = crate::utils::task::disk_output::get_task_output_dir();
@@ -2296,7 +2298,7 @@ mod tests {
             }
         }
 
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _cache = CacheGuard;
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "0");
         let path = std::env::temp_dir().join(format!(

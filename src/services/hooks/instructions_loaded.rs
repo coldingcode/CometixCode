@@ -60,7 +60,7 @@ pub async fn execute_instructions_loaded_hooks_with_config(
         hook_input,
         Some(input.load_reason),
         INSTRUCTIONS_LOADED_TIMEOUT_MS,
-        super::build_hook_env_vars(&context),
+        Vec::new(),
     )
     .await;
 }
@@ -90,10 +90,9 @@ pub fn dispatch_instructions_loaded_hooks(input: InstructionsLoadedInput) {
         .display()
         .to_string();
     let context = HookContext {
-        session_id: std::env::var("CLAUDE_SESSION_ID").unwrap_or_default(),
-        transcript_path: std::env::var("CLAUDE_TRANSCRIPT_PATH").unwrap_or_default(),
-        cwd: cwd.clone(),
-        project_dir: cwd,
+        session_id: crate::utils::process_env::var("CLAUDE_SESSION_ID").unwrap_or_default(),
+        transcript_path: crate::utils::process_env::var("CLAUDE_TRANSCRIPT_PATH").unwrap_or_default(),
+        cwd,
         ..HookContext::default()
     };
     let config = loaded.config;
@@ -116,11 +115,12 @@ pub fn dispatch_instructions_loaded_hooks(input: InstructionsLoadedInput) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[cfg(unix)]
     #[tokio::test]
     async fn instructions_loaded_input_carries_nested_provenance() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         struct TrustRestore(bool);

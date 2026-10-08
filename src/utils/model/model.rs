@@ -1,6 +1,8 @@
 //! Model identity helpers.
 //! Maps to CC `utils/model/model.ts`.
 
+use crate::utils::process_env::JsTruthy;
+
 /// Maps to: CC `utils/model/configs.ts` `CLAUDE_HAIKU_4_5_CONFIG.firstParty`.
 pub const DEFAULT_HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 
@@ -10,18 +12,20 @@ pub const DEFAULT_SONNET_MODEL: &str = "claude-sonnet-4-6";
 /// Maps to: CC `utils/model/configs.ts` `CLAUDE_OPUS_4_6_CONFIG.firstParty`.
 pub const DEFAULT_OPUS_MODEL: &str = "claude-opus-4-6";
 
-use crate::utils::env_utils::truthy_env_var;
-
-/// Maps to: CC `utils/model/model.ts:36-38` `getSmallFastModel()`.
+/// Maps to: CC `utils/model/model.ts:36-38` `getSmallFastModel()`:
+/// `process.env.ANTHROPIC_SMALL_FAST_MODEL || getDefaultHaikuModel()`.
 pub fn get_small_fast_model() -> String {
-    truthy_env_var("ANTHROPIC_SMALL_FAST_MODEL").unwrap_or_else(get_default_haiku_model)
+    crate::utils::process_env::var("ANTHROPIC_SMALL_FAST_MODEL")
+        .truthy()
+        .unwrap_or_else(get_default_haiku_model)
 }
 
 /// Maps to: CC `utils/model/model.ts` `getDefaultSonnetModel()`.
 /// TODO: Port provider-specific model string tables; first-party defaults are
 /// kept in sync with CC `utils/model/configs.ts`.
 pub fn get_default_sonnet_model() -> String {
-    truthy_env_var("ANTHROPIC_DEFAULT_SONNET_MODEL")
+    crate::utils::process_env::var("ANTHROPIC_DEFAULT_SONNET_MODEL")
+        .truthy()
         .unwrap_or_else(|| DEFAULT_SONNET_MODEL.to_string())
 }
 
@@ -29,14 +33,17 @@ pub fn get_default_sonnet_model() -> String {
 /// TODO: Port provider-specific model string tables; first-party defaults are
 /// kept in sync with CC `utils/model/configs.ts`.
 pub fn get_default_opus_model() -> String {
-    truthy_env_var("ANTHROPIC_DEFAULT_OPUS_MODEL").unwrap_or_else(|| DEFAULT_OPUS_MODEL.to_string())
+    crate::utils::process_env::var("ANTHROPIC_DEFAULT_OPUS_MODEL")
+        .truthy()
+        .unwrap_or_else(|| DEFAULT_OPUS_MODEL.to_string())
 }
 
 /// Maps to: CC `utils/model/model.ts:131-138` `getDefaultHaikuModel()`.
 /// TODO: Port provider-specific model string tables; first-party defaults are
 /// kept in sync with CC `utils/model/configs.ts`.
 pub fn get_default_haiku_model() -> String {
-    truthy_env_var("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+    crate::utils::process_env::var("ANTHROPIC_DEFAULT_HAIKU_MODEL")
+        .truthy()
         .unwrap_or_else(|| DEFAULT_HAIKU_MODEL.to_string())
 }
 
@@ -77,7 +84,8 @@ pub fn get_user_specified_model_setting() -> Option<String> {
         if let Some(model_override) = crate::bootstrap::state::get_main_loop_model_override() {
             model_override
         } else {
-            truthy_env_var("ANTHROPIC_MODEL")
+            crate::utils::process_env::var("ANTHROPIC_MODEL")
+                .truthy()
                 .or_else(|| crate::utils::settings::get_initial_settings().model)
         };
 
@@ -479,6 +487,7 @@ pub fn get_marketing_name_for_model(model_id: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     fn env<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
         move |key| {
@@ -499,19 +508,19 @@ mod tests {
     /// rejects it as a misleading "rate limit reached".
     #[test]
     fn opus_1m_merge_gate_matches_official_provider_and_unknown_subscriber_guards() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _providers = [
             "CLAUDE_CODE_DISABLE_1M_CONTEXT",
             "CLAUDE_CODE_USE_BEDROCK",
             "CLAUDE_CODE_USE_VERTEX",
             "CLAUDE_CODE_USE_FOUNDRY",
         ]
-        .map(crate::utils::env_utils::EnvVarGuard::unset);
+        .map(EnvVarGuard::unset);
 
         let config_dir =
             std::env::temp_dir().join(format!("cometix-opus1m-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&config_dir).unwrap();
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_dir);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_dir);
         let write_credentials = |oauth: serde_json::Value| {
             std::fs::write(
                 config_dir.join(".credentials.json"),
@@ -556,7 +565,7 @@ mod tests {
     /// and `process.env.X || fallback` treats an empty value as unset.
     #[test]
     fn default_model_helpers_read_official_env_names_with_js_truthiness() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_SONNET_MODEL", "official-sonnet");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_OPUS_MODEL", "official-opus");
         crate::utils::process_env::set("ANTHROPIC_SMALL_FAST_MODEL", "official-haiku");
@@ -579,7 +588,7 @@ mod tests {
 
     #[test]
     fn default_model_helpers_match_current_official_first_party_defaults() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("ANTHROPIC_DEFAULT_SONNET_MODEL");
         crate::utils::process_env::remove("ANTHROPIC_DEFAULT_OPUS_MODEL");
         crate::utils::process_env::remove("ANTHROPIC_DEFAULT_HAIKU_MODEL");
@@ -593,7 +602,7 @@ mod tests {
 
     #[test]
     fn default_main_loop_model_keeps_query_fallback_distribution_split() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_SONNET_MODEL", "default-sonnet");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_OPUS_MODEL", "default-opus");
         assert_eq!(
@@ -614,7 +623,7 @@ mod tests {
 
     #[test]
     fn parse_user_specified_model_resolves_official_aliases_and_preserves_custom_case() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_SONNET_MODEL", "default-sonnet");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_OPUS_MODEL", "default-opus");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_HAIKU_MODEL", "default-haiku");
@@ -645,21 +654,12 @@ mod tests {
     /// 200K and trip autocompact at ~23% apparent usage.
     #[test]
     fn resolve_skill_model_override_carries_the_1m_suffix_only_where_supported() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _model_env = [
-            crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_DISABLE_1M_CONTEXT"),
-            crate::utils::env_utils::EnvVarGuard::set(
-                "ANTHROPIC_DEFAULT_SONNET_MODEL",
-                "claude-sonnet-4-5",
-            ),
-            crate::utils::env_utils::EnvVarGuard::set(
-                "ANTHROPIC_DEFAULT_OPUS_MODEL",
-                "claude-opus-4-6",
-            ),
-            crate::utils::env_utils::EnvVarGuard::set(
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-                "claude-haiku-4-5",
-            ),
+            EnvVarGuard::unset("CLAUDE_CODE_DISABLE_1M_CONTEXT"),
+            EnvVarGuard::set("ANTHROPIC_DEFAULT_SONNET_MODEL", "claude-sonnet-4-5"),
+            EnvVarGuard::set("ANTHROPIC_DEFAULT_OPUS_MODEL", "claude-opus-4-6"),
+            EnvVarGuard::set("ANTHROPIC_DEFAULT_HAIKU_MODEL", "claude-haiku-4-5"),
         ];
 
         // 1M session + 1M-capable target → carry the tag.
@@ -692,9 +692,9 @@ mod tests {
     /// leaves an empty setting alone.
     #[test]
     fn user_specified_model_setting_drops_models_the_allowlist_forbids() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_override = crate::bootstrap::state::get_main_loop_model_override();
-        let model = crate::utils::env_utils::EnvVarGuard::unset("ANTHROPIC_MODEL");
+        let model = EnvVarGuard::unset("ANTHROPIC_MODEL");
         let root = std::env::temp_dir().join(format!(
             "cometix-model-allowlist-{}",
             uuid::Uuid::new_v4().simple()
@@ -705,11 +705,8 @@ mod tests {
             r#"{"availableModels":["haiku"]}"#,
         )
         .unwrap();
-        let config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root);
-        let haiku = crate::utils::env_utils::EnvVarGuard::set(
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            "default-haiku",
-        );
+        let config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root);
+        let haiku = EnvVarGuard::set("ANTHROPIC_DEFAULT_HAIKU_MODEL", "default-haiku");
         crate::utils::settings::settings_cache::reset_settings_cache();
         crate::bootstrap::state::set_main_loop_model_override(None);
 
@@ -734,7 +731,7 @@ mod tests {
 
     #[test]
     fn get_main_loop_model_parses_official_env_aliases_before_defaults() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("ANTHROPIC_MODEL", "haiku");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_HAIKU_MODEL", "default-haiku");
 
@@ -746,7 +743,7 @@ mod tests {
 
     #[test]
     fn runtime_main_loop_model_matches_official_plan_mode_alias_overrides() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("ANTHROPIC_MODEL", "opusplan");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_OPUS_MODEL", "default-opus");
         crate::utils::process_env::set("ANTHROPIC_DEFAULT_SONNET_MODEL", "default-sonnet");
@@ -786,7 +783,7 @@ mod tests {
 
     #[test]
     fn get_main_loop_model_prefers_anthropic_model_env() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("ANTHROPIC_MODEL", "official-main-model");
 
         assert_eq!(get_main_loop_model(), "official-main-model");

@@ -66,14 +66,16 @@ pub async fn fetch_official_marketplace_from_gcs(
     let mut bytes = None;
     let mut err_kind = None;
     let fetched:anyhow::Result<String>=async {
-        let client=reqwest::Client::new();
+        // CC `axios.get` (`officialMarketplaceGcs.ts:81-84,107-110`), through
+        // the global interceptor.
+        let client=crate::utils::proxy::create_axios_instance()?.build()?;
         let latest=client.get(format!("{GCS_BASE}/latest")).timeout(std::time::Duration::from_secs(10)).send().await?.error_for_status()?.text().await?;
         let latest=latest.trim_matches(|c:char|matches!(c,'\u{9}'..='\u{d}'|'\u{20}'|'\u{a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}')).to_owned();sha=Some(latest.clone());if latest.is_empty(){anyhow::bail!("latest pointer returned empty body");}
         let sentinel=gcs_path!(install_location,".gcs-sha");let current=tokio::fs::read(&sentinel).await.ok().map(|b|String::from_utf8_lossy(&b).trim_matches(|c:char|matches!(c,'\u{9}'..='\u{d}'|'\u{20}'|'\u{a0}'|'\u{1680}'|'\u{2000}'..='\u{200a}'|'\u{2028}'|'\u{2029}'|'\u{202f}'|'\u{205f}'|'\u{3000}'|'\u{feff}')).to_owned());
         if current.as_deref()==Some(&latest){outcome="noop";return Ok(latest);}
         let zip=client.get(format!("{GCS_BASE}/{latest}.zip")).timeout(std::time::Duration::from_secs(60)).send().await?.error_for_status()?.bytes().await?;bytes=Some(zip.len());
         let files=crate::utils::dxt::zip::unzip_file(&zip).await?;let modes=crate::utils::dxt::zip::parse_zip_modes(&zip);
-        let staging=PathBuf::from(format!("{}.staging",install_location.display()));crate::utils::fs_operations::rm(&staging,true,true).await?;tokio::fs::create_dir_all(&staging).await?;
+        let staging=PathBuf::from(format!("{}.staging",install_location.display()));crate::utils::fs_operations::native::rm(&staging, crate::utils::fs_operations::RmOptions { recursive: true, force: true }).await?;tokio::fs::create_dir_all(&staging).await?;
         for(arc_path,data)in files{
             let Some(relative)=arc_path.strip_prefix(ARC_PREFIX)else{continue};if relative.is_empty()||relative.ends_with('/'){continue;}
             let dest=gcs_path!(&staging,relative);tokio::fs::create_dir_all(gcs_path!(&dest,"..")).await?;tokio::fs::write(&dest,data).await?;
@@ -82,7 +84,7 @@ pub async fn fetch_official_marketplace_from_gcs(
                 #[cfg(not(unix))]{let _=mode;}
             }
         }
-        tokio::fs::write(gcs_path!(&staging,".gcs-sha"),&latest).await?;crate::utils::fs_operations::rm(install_location,true,true).await?;tokio::fs::rename(&staging,install_location).await?;outcome="updated";Ok(latest)
+        tokio::fs::write(gcs_path!(&staging,".gcs-sha"),&latest).await?;crate::utils::fs_operations::native::rm(install_location, crate::utils::fs_operations::RmOptions { recursive: true, force: true }).await?;tokio::fs::rename(&staging,install_location).await?;outcome="updated";Ok(latest)
     }.await;
     let result = match fetched {
         Ok(sha) => Some(sha),

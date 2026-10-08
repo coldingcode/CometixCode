@@ -136,7 +136,7 @@ pub fn interpolate_env_vars_with(
 
 /// Maps to: CC `interpolateEnvVars(...)`.
 pub fn interpolate_env_vars(value: &str, allowed_env_vars: &HashSet<String>) -> String {
-    interpolate_env_vars_with(value, allowed_env_vars, |name| std::env::var(name).ok())
+    interpolate_env_vars_with(value, allowed_env_vars, |name| crate::utils::process_env::var(name))
 }
 
 fn effective_allowed_env_vars(hook: &HttpHook, policy: &HttpHookPolicy) -> HashSet<String> {
@@ -230,19 +230,45 @@ pub async fn exec_http_hook_with_policy(
         }
     };
 
-    // Safe divergence from CC proxy/sandbox handling: Cometix has not ported
-    // the sandbox network proxy/global proxy interceptor yet, so this path uses
-    // a direct reqwest client and validates the target host before I/O.
-    if let Err(error) = validate_ssrf_preflight(&url) {
-        return ExecHttpHookResult {
-            ok: false,
-            body: String::new(),
-            error: Some(error),
-            ..Default::default()
-        };
+    // Maps to: CC `execHttpHook.ts:173-199`. The env-var proxy (HTTP_PROXY /
+    // HTTPS_PROXY, respecting NO_PROXY) resolves the target itself.
+    // DEVIATION(SCOPE): the sandbox network proxy (`getSandboxProxyConfig`,
+    // `:21-41`) is not wired here yet.
+    // Cometix-specific deviation: CC tests `getProxyUrl() !== undefined`, so a
+    // proxy variable set to "" drops the SSRF guard while `configureGlobalAgents`
+    // (`if (proxyUrl)`) installs no proxy: an unguarded direct request. Here an
+    // empty value is no proxy, and the guard stays.
+    let env = crate::utils::process_env::snapshot();
+    let env_proxy_active = crate::utils::proxy::get_proxy_url(&env).is_some()
+        && !crate::utils::proxy::should_bypass_proxy(
+            &hook.url,
+            crate::utils::proxy::get_no_proxy(&env).as_deref(),
+        );
+    if env_proxy_active {
+        crate::utils::debug::log_for_debugging(&format!(
+            "Hooks: HTTP hook POST to {} (via env-var proxy)",
+            hook.url
+        ));
+    } else {
+        crate::utils::debug::log_for_debugging(&format!("Hooks: HTTP hook POST to {}", hook.url));
     }
 
-    let headers = match build_headers_with(hook, policy, |name| std::env::var(name).ok()) {
+    // SSRF guard (`:210-215`): skipped when a proxy is in use. The proxy
+    // resolves the target, and a corporate proxy on a private IP must not be
+    // blocked. Cometix checks the target before connecting, where CC guards
+    // the connection's DNS lookup.
+    if !env_proxy_active {
+        if let Err(error) = validate_ssrf_preflight(&url) {
+            return ExecHttpHookResult {
+                ok: false,
+                body: String::new(),
+                error: Some(error),
+                ..Default::default()
+            };
+        }
+    }
+
+    let headers = match build_headers_with(hook, policy, |name| crate::utils::process_env::var(name)) {
         Ok(headers) => headers,
         Err(error) => {
             return ExecHttpHookResult {
@@ -258,18 +284,16 @@ pub async fn exec_http_hook_with_policy(
         .timeout
         .map(|seconds| seconds * 1_000)
         .unwrap_or(DEFAULT_HTTP_HOOK_TIMEOUT_MS);
-    // Rust-only transport initialization: CC runs on Node's TLS stack, while
-    // Cometix builds reqwest/rustls with `rustls-no-provider`; tests and
-    // service callers that do not enter `main()` must install the selected
-    // provider before constructing an HTTP client.
-    crate::utils::tls_provider::install_crypto_provider();
-
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_millis(timeout_ms))
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
-        .build()
-    {
+    // CC posts through the global axios instance, whose interceptor
+    // `configureGlobalAgents` installs; `create_axios_instance` resolves the
+    // same proxy, NO_PROXY, mTLS and CA options. `maxRedirects: 0`.
+    let client = match crate::utils::proxy::create_axios_instance().and_then(|builder| {
+        builder
+            .timeout(Duration::from_millis(timeout_ms))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(anyhow::Error::from)
+    }) {
         Ok(client) => client,
         Err(error) => {
             return ExecHttpHookResult {
@@ -323,6 +347,7 @@ pub async fn exec_http_hook(hook: &HttpHook, json_input: &str) -> ExecHttpHookRe
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::collections::HashMap;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -415,8 +440,25 @@ mod tests {
         );
     }
 
+    /// No env-var proxy. The system-proxy fallback reads the OS `NO_PROXY`,
+    /// which `just test` pins to loopback; the carrier value set here no
+    /// longer reaches it.
+    fn without_env_proxy() -> Vec<EnvVarGuard> {
+        let mut guards: Vec<_> = ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"]
+            .into_iter()
+            .map(EnvVarGuard::unset)
+            .collect();
+        guards.push(EnvVarGuard::unset("no_proxy"));
+        guards.push(EnvVarGuard::set("NO_PROXY", "127.0.0.1"));
+        guards
+    }
+
     #[tokio::test]
     async fn posts_json_to_loopback_and_returns_text_response() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = without_env_proxy();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -462,6 +504,10 @@ mod tests {
 
     #[tokio::test]
     async fn ssrf_guard_blocks_metadata_ip_before_request() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = without_env_proxy();
         let hook = http_hook("http://169.254.169.254/latest/meta-data".to_string());
         let result = exec_http_hook_with_policy(&hook, "{}", &Default::default()).await;
         assert!(!result.ok);
@@ -471,6 +517,57 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("private/link-local address")
+        );
+    }
+
+    /// CC `execHttpHook.ts:184-215`: through an env-var proxy the target is
+    /// the proxy's to resolve, so there is no SSRF check; NO_PROXY brings the
+    /// check back.
+    #[tokio::test]
+    async fn env_proxy_carries_the_hook_and_skips_the_ssrf_guard() {
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env = without_env_proxy();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_address = proxy.local_addr().unwrap();
+        let _proxy_url = EnvVarGuard::set("HTTP_PROXY", format!("http://{proxy_address}"));
+        let _no_proxy = EnvVarGuard::set("NO_PROXY", "169.254.169.254");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut temp = [0_u8; 1024];
+            while !String::from_utf8_lossy(&buffer).contains("{}") {
+                let read = socket.read(&mut temp).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&temp[..read]);
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8_lossy(&buffer).into_owned()
+        });
+
+        // A host only the proxy could resolve.
+        let hook = http_hook("http://hooks.invalid/hook".to_string());
+        let result = exec_http_hook_with_policy(&hook, "{}", &Default::default()).await;
+        assert!(result.ok, "{result:?}");
+        let request = server.await.unwrap();
+        assert!(request.starts_with("POST http://hooks.invalid/hook HTTP/1.1"), "{request}");
+
+        // Bypassed by NO_PROXY: direct, and the guard applies again.
+        let hook = http_hook("http://169.254.169.254/latest/meta-data".to_string());
+        let result = exec_http_hook_with_policy(&hook, "{}", &Default::default()).await;
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("private/link-local address"),
+            "{result:?}"
         );
     }
 }

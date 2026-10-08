@@ -67,7 +67,6 @@
 //! CC's synchronous rename/materialize/cleanup helpers are serialized by that
 //! same owner before writing inline.
 
-use crate::utils::config;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -132,8 +131,7 @@ impl Project {
         if !SESSION_WRITE_ENABLED
             || crate::bootstrap::state::is_session_persistence_disabled()
             || crate::utils::env_utils::is_env_truthy(
-                std::env::var("CLAUDE_CODE_SKIP_PROMPT_HISTORY")
-                    .ok()
+                crate::utils::process_env::var("CLAUDE_CODE_SKIP_PROMPT_HISTORY")
                     .as_deref(),
             )
         {
@@ -144,13 +142,13 @@ impl Project {
         #[cfg(test)]
         {
             !crate::utils::env_utils::is_env_truthy(
-                std::env::var("COMETIX_WRITE_ENABLED").ok().as_deref(),
+                crate::utils::process_env::var("COMETIX_WRITE_ENABLED").as_deref(),
             )
         }
         #[cfg(not(test))]
         {
             crate::utils::env_utils::is_env_defined_falsy(
-                std::env::var("COMETIX_WRITE_ENABLED").ok().as_deref(),
+                crate::utils::process_env::var("COMETIX_WRITE_ENABLED").as_deref(),
             )
         }
     }
@@ -720,7 +718,7 @@ pub fn get_projects_dir() -> PathBuf {
         }
     }
 
-    config::get_config_home().join("projects")
+    crate::utils::env_utils::get_claude_config_home_dir().join("projects")
 }
 
 /// Maps to: CC `sessionStoragePortable.ts` `sanitizePath(name)`.
@@ -2255,8 +2253,7 @@ fn read_transcript_entries(path: &Path) -> Vec<serde_json::Value> {
 
     if file_size > SKIP_PRECOMPACT_THRESHOLD
         && !crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP")
-                .ok()
+            crate::utils::process_env::var("CLAUDE_CODE_DISABLE_PRECOMPACT_SKIP")
                 .as_deref(),
         )
     {
@@ -3512,9 +3509,10 @@ pub fn resolve_session_file_path(
             }
         }
 
-        // Maps to portable `getWorktreePathsPortable(canonical)` fallback.
-        for worktree_path in crate::utils::get_worktree_paths::get_worktree_paths(&canonical) {
-            let worktree_path = worktree_path.nfc().collect::<String>();
+        // Worktree fallback — sessions may live under a different worktree root.
+        for worktree_path in
+            crate::utils::get_worktree_paths_portable::get_worktree_paths_portable(&canonical)
+        {
             if worktree_path == canonical {
                 continue;
             }
@@ -4790,8 +4788,7 @@ fn attachment_row_is_withheld(payload: &serde_json::Value) -> bool {
     let is_hook_context =
         payload.get("type").and_then(|value| value.as_str()) == Some("hook_additional_context");
     let keep_hook_context = crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT")
             .as_deref(),
     );
     !(is_hook_context && keep_hook_context)
@@ -5820,6 +5817,7 @@ pub fn scan_pre_boundary_metadata(path: &Path, end_offset: u64) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use serde_json::{Value, json};
     use std::fs;
     use uuid::Uuid;
@@ -5841,9 +5839,9 @@ mod tests {
                 let _ = fs::remove_dir_all(&self.root);
             }
         }
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _history = EnvRestore::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         let restore = Restore {
             session_id: crate::bootstrap::state::get_session_id(),
             project_dir: crate::bootstrap::state::get_session_project_dir(),
@@ -6064,24 +6062,6 @@ mod tests {
             // Stable across calls, which is what makes a second record a no-op.
             let (_, again) = typed_message_entry(&message).expect("loggable");
             assert_eq!(again, expected);
-        }
-    }
-
-    struct EnvRestore {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::unset(key),
-            }
         }
     }
 
@@ -6510,7 +6490,7 @@ mod tests {
     fn resolve_session_file_path_falls_back_to_sibling_worktree() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-worktree-resolve-{}", Uuid::new_v4()));
         let current = root.join("current");
@@ -6542,9 +6522,9 @@ mod tests {
         let mut permissions = fs::metadata(&git).unwrap().permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&git, permissions).unwrap();
-        let old_path = std::env::var("PATH").unwrap_or_default();
+        let old_path = crate::utils::process_env::var("PATH").unwrap_or_default();
         let _path_guard =
-            EnvRestore::set("PATH", &format!("{}:{}", bin.to_string_lossy(), old_path));
+            EnvVarGuard::set("PATH", format!("{}:{}", bin.to_string_lossy(), old_path));
 
         let resolved = resolve_session_file_path(session_id, Some(&current)).unwrap();
         assert_eq!(resolved.project_path.as_deref(), Some(sibling.as_str()));
@@ -6558,9 +6538,9 @@ mod tests {
 
     #[test]
     fn should_skip_persistence_honors_bootstrap_and_prompt_history_gates() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _skip_history = EnvRestore::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _skip_history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         crate::bootstrap::state::set_session_persistence_disabled(false);
         assert!(is_session_write_enabled());
 
@@ -6575,8 +6555,8 @@ mod tests {
 
     #[test]
     fn record_content_replacement_is_safe_noop_while_session_writes_disabled() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_disabled = EnvRestore::unset("COMETIX_WRITE_ENABLED");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_disabled = EnvVarGuard::unset("COMETIX_WRITE_ENABLED");
         assert!(!is_session_write_enabled());
         let records = vec![
             crate::utils::tool_result_storage::ContentReplacementRecord::tool_result(
@@ -6592,8 +6572,8 @@ mod tests {
 
     #[test]
     fn project_flush_drains_per_file_queue_in_enqueue_order() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-write-queue-{}", Uuid::new_v4()));
         let path = root.join("queued-session.jsonl");
         let previous_session_id = crate::bootstrap::state::get_session_id();
@@ -6630,8 +6610,8 @@ mod tests {
 
     #[test]
     fn append_entry_to_file_is_serialized_after_queued_entries() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_env = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_env = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root =
             std::env::temp_dir().join(format!("cometix-sync-append-{}", uuid::Uuid::new_v4()));
         let path = root.join("ordered.jsonl");
@@ -6658,8 +6638,8 @@ mod tests {
 
     #[test]
     fn remove_transcript_message_tracks_discarded_future_and_removes_queued_entry() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-tombstone-{}", Uuid::new_v4()));
         let path = root.join("session.jsonl");
         let previous_session_id = crate::bootstrap::state::get_session_id();
@@ -6686,8 +6666,8 @@ mod tests {
 
     #[test]
     fn remove_message_by_uuid_fast_path_reappends_trailing_lines() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-tombstone-tail-{}", Uuid::new_v4()));
         let path = root.join("session.jsonl");
         let previous_session_id = crate::bootstrap::state::get_session_id();
@@ -6724,8 +6704,8 @@ mod tests {
 
     #[test]
     fn remove_message_by_uuid_slow_path_preserves_other_and_malformed_lines() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-tombstone-slow-{}", Uuid::new_v4()));
         let path = root.join("session.jsonl");
         let previous_session_id = crate::bootstrap::state::get_session_id();
@@ -6776,8 +6756,8 @@ mod tests {
     /// reintroducing a second uuid on the identity block fails it.
     #[test]
     fn transcript_row_is_removable_by_its_in_memory_uuid_matches_official() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-tombstone-join-{}", Uuid::new_v4()));
         let path = root.join("session.jsonl");
         let previous_session_id = crate::bootstrap::state::get_session_id();
@@ -6834,8 +6814,8 @@ mod tests {
 
     #[test]
     fn remove_message_by_uuid_skips_slow_rewrite_above_official_limit() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-tombstone-limit-{}", Uuid::new_v4()));
         let path = root.join("session.jsonl");
         let previous_session_id = crate::bootstrap::state::get_session_id();
@@ -6882,8 +6862,8 @@ mod tests {
 
     #[test]
     fn project_schedule_drain_writes_after_official_batch_interval() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-schedule-drain-{}", Uuid::new_v4()));
         let path = root.join("scheduled-session.jsonl");
         let previous_session_id = crate::bootstrap::state::get_session_id();
@@ -6909,8 +6889,8 @@ mod tests {
 
     #[test]
     fn project_pending_entries_wait_for_first_user_message_materialization() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-pending-entry-{}", Uuid::new_v4()));
         let session_id = "pending-entry-session";
         let path = root.join(format!("{session_id}.jsonl"));
@@ -6978,8 +6958,8 @@ mod tests {
     /// preference, and a later user rename always wins.
     #[test]
     fn ai_generated_title_surfaces_until_a_user_rename_wins() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-ai-title-{}", Uuid::new_v4()));
         let _guard = set_test_projects_dir_override(root.join("projects"));
         let previous_cwd = crate::bootstrap::state::get_original_cwd();
@@ -7115,8 +7095,8 @@ mod tests {
 
     #[test]
     fn rename_metadata_appends_to_the_selected_cross_project_file() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-rename-{}", Uuid::new_v4()));
         let path = root.join("other-project/session-rename.jsonl");
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -7148,8 +7128,8 @@ mod tests {
 
     #[test]
     fn adopted_resume_records_new_messages_on_the_existing_parent_chain() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-adopt-{}", Uuid::new_v4()));
         let project_dir = root.join("cross-project");
         let session_id = "adopted-session";
@@ -7318,11 +7298,11 @@ mod tests {
     /// override, the reader is the resume one.
     #[test]
     fn agent_transcript_written_under_a_cwd_override_is_found_by_the_resume_reader() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _skip_history = EnvRestore::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _skip_history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         crate::bootstrap::state::set_session_persistence_disabled(false);
         assert!(is_session_write_enabled());
 
@@ -7431,11 +7411,11 @@ mod tests {
     /// resumed session's subagent artifacts in the wrong project directory.
     #[test]
     fn resumed_session_agent_transcript_lives_under_the_session_project_dir() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _skip_history = EnvRestore::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _skip_history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         crate::bootstrap::state::set_session_persistence_disabled(false);
         assert!(is_session_write_enabled());
 
@@ -7576,11 +7556,11 @@ mod tests {
     /// no longer last keeps its `message_start` usage in CC as well.
     #[test]
     fn sidechain_assistant_rows_capture_the_message_delta_finalisation() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _skip_history = EnvRestore::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _skip_history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         crate::bootstrap::state::set_session_persistence_disabled(false);
         assert!(is_session_write_enabled());
 
@@ -7732,12 +7712,12 @@ mod tests {
     /// than CC from the same run.
     #[test]
     fn sidechain_cursor_seeds_from_the_last_initial_message_like_official() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _skip_history = EnvRestore::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
-        let _hook_context = EnvRestore::unset("CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT");
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _skip_history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _hook_context = EnvVarGuard::unset("CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT");
         crate::bootstrap::state::set_session_persistence_disabled(false);
         assert!(is_session_write_enabled());
 
@@ -7828,11 +7808,11 @@ mod tests {
     /// that reached no file.
     #[test]
     fn parked_assistant_keeps_its_park_time_parent_and_progress_never_advances_the_cursor() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _skip_history = EnvRestore::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _skip_history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         crate::bootstrap::state::set_session_persistence_disabled(false);
         assert!(is_session_write_enabled());
 
@@ -7946,11 +7926,11 @@ mod tests {
     /// interleaved runs to prove it.
     #[test]
     fn interleaved_agent_recorders_do_not_disturb_each_other() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _write_enabled = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _skip_history = EnvRestore::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _skip_history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         crate::bootstrap::state::set_session_persistence_disabled(false);
         assert!(is_session_write_enabled());
 
@@ -8109,8 +8089,8 @@ mod tests {
 
     #[test]
     fn sidechain_record_and_metadata_write_are_safe_noops_while_writes_disabled() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_disabled = EnvRestore::unset("COMETIX_WRITE_ENABLED");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write_disabled = EnvVarGuard::unset("COMETIX_WRITE_ENABLED");
         assert!(!is_session_write_enabled());
         let stamp = SessionStamp {
             session_id: "session-sidechain".to_string(),
@@ -8848,7 +8828,7 @@ mod tests {
     /// both sides are covered by `just test-all-audiences`.
     #[test]
     fn attachments_are_withheld_from_external_transcripts_like_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::utils::process_env::remove("CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT");
@@ -8897,7 +8877,7 @@ mod tests {
     /// both sides run under `just test-all-audiences`.
     #[test]
     fn hook_results_take_the_attachment_withholding_like_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::utils::process_env::remove("CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT");
@@ -9065,7 +9045,7 @@ mod tests {
     }
     #[test]
     fn transcript_helpers_match_official_type_and_session_path_rules() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         struct Restore {
             id: String,
             dir: Option<PathBuf>,
@@ -9120,41 +9100,67 @@ mod tests {
     #[test]
     fn search_custom_titles_matches_official_all_pages_worktrees_and_limits() {
         use std::os::unix::fs::PermissionsExt;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let root = std::env::temp_dir().join(format!("cometix-title-search-{}", Uuid::new_v4()));
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = fs::remove_dir_all(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(root.clone());
-        let _projects = set_test_projects_dir_override(root.join("projects"));
+        // getWorktreePaths runs gitExe(), whose Bun.which lookup reads the startup
+        // PATH (utils/git.ts:212-216), so the fake git must be on PATH when the
+        // process starts: the parent writes it and re-runs this test as a child.
+        const PROBE: &str = "COMETIX_TITLE_SEARCH_ROOT";
         let cwd = crate::bootstrap::state::get_original_cwd()
             .to_string_lossy()
             .into_owned();
+        let Some(root) = crate::utils::process_env::var(PROBE) else {
+            let root =
+                std::env::temp_dir().join(format!("cometix-title-search-{}", Uuid::new_v4()));
+            struct Cleanup(PathBuf);
+            impl Drop for Cleanup {
+                fn drop(&mut self) {
+                    let _ = fs::remove_dir_all(&self.0);
+                }
+            }
+            let _cleanup = Cleanup(root.clone());
+            let sibling = root.join("sibling").to_string_lossy().into_owned();
+            let bin = root.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            let git = bin.join("git");
+            fs::write(
+                &git,
+                format!("#!/bin/sh\nprintf '%s\\n' 'worktree {cwd}' '' 'worktree {sibling}' ''\n"),
+            )
+            .unwrap();
+            fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "utils::session_storage::tests::search_custom_titles_matches_official_all_pages_worktrees_and_limits",
+                    "--nocapture",
+                ])
+                .env(PROBE, &root)
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        bin.display(),
+                        crate::utils::process_env::var("PATH").unwrap_or_default()
+                    ),
+                )
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed"),
+                "{stdout} {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let root = PathBuf::from(root);
+        let _projects = set_test_projects_dir_override(root.join("projects"));
         let sibling = root.join("sibling").to_string_lossy().into_owned();
         let current_dir = get_project_dir(&cwd);
         let sibling_dir = get_project_dir(&sibling);
-        let bin = root.join("bin");
-        for dir in [&current_dir, &sibling_dir, &bin] {
+        for dir in [&current_dir, &sibling_dir] {
             fs::create_dir_all(dir).unwrap();
         }
-        let git = bin.join("git");
-        fs::write(
-            &git,
-            format!("#!/bin/sh\nprintf '%s\\n' 'worktree {cwd}' '' 'worktree {sibling}' ''\n"),
-        )
-        .unwrap();
-        fs::set_permissions(&git, fs::Permissions::from_mode(0o755)).unwrap();
-        let _path = EnvRestore::set(
-            "PATH",
-            &format!(
-                "{}:{}",
-                bin.display(),
-                std::env::var("PATH").unwrap_or_default()
-            ),
-        );
         let write = |dir: &Path, id: &str, title: &str, time: u64, extra: Value| {
             let path = dir.join(format!("{id}.jsonl"));
             let mut entry = json!({"type":"user", "sessionId":id, "message":{"content":"hello"}});
@@ -9265,7 +9271,7 @@ mod tests {
 
     #[test]
     fn get_last_session_log_matches_official_terminal_system_and_vacant_cache_prime() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         struct Restore {
             id: String,
             dir: Option<PathBuf>,
@@ -9356,7 +9362,7 @@ mod tests {
     }
     #[test]
     fn session_message_cache_matches_official_per_id_priming_and_clear() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let previous_id = crate::bootstrap::state::get_session_id();
         let previous_dir = crate::bootstrap::state::get_session_project_dir();
         let dir = temp_jsonl_path("session-id-memo-dir");
@@ -9444,9 +9450,9 @@ mod tests {
     /// the broader optional API-envelope carrier remains a separately recorded gap.
     #[test]
     fn cold_sentinel_matches_official_identity_usage_and_api_roundtrip() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write = EnvRestore::set("COMETIX_WRITE_ENABLED", "1");
-        let _history = EnvRestore::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         struct Restore {
             session_id: String,
             project_dir: Option<PathBuf>,

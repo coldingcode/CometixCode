@@ -1067,7 +1067,7 @@ impl FileReadTool {
         // conditional activation then runs synchronously. Simple mode skips
         // the complete block. There is no separate dynamic-discovery gate.
         if !crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_SIMPLE").ok().as_deref(),
+            crate::utils::process_env::var("CLAUDE_CODE_SIMPLE").as_deref(),
         ) {
             let cwd = context.effective_cwd();
             let paths = vec![full_file_path.clone()];
@@ -1233,7 +1233,7 @@ impl FileReadTool {
                         .and_then(serde_json::Value::as_str)
                         .ok_or_else(|| anyhow::anyhow!("pages.trim is not a function"))?;
                     let range = parse_pdf_page_range(pages);
-                    let extract = extract_pdf_pages(resolved_file_path, range)
+                    let extract = futures::executor::block_on(extract_pdf_pages(resolved_file_path, range))
                         .map_err(|error| anyhow::anyhow!(error.message))?;
                     let entries = std::fs::read_dir(&extract.output_dir)?
                         .collect::<std::io::Result<Vec<_>>>()?;
@@ -1266,9 +1266,11 @@ impl FileReadTool {
                         ));
                     }
                 }
-                let opened_metadata = std::fs::metadata(resolved_file_path)?;
+                let opened_metadata = futures::executor::block_on(
+                    crate::utils::fs_operations::get_fs_implementation().stat(resolved_file_path),
+                )?;
                 if !is_pdf_supported() || opened_metadata.len() > PDF_EXTRACT_SIZE_THRESHOLD {
-                    let _ = extract_pdf_pages(resolved_file_path, None);
+                    let _ = futures::executor::block_on(extract_pdf_pages(resolved_file_path, None));
                 }
                 if !is_pdf_supported() {
                     return Err(anyhow::anyhow!(
@@ -1276,7 +1278,7 @@ impl FileReadTool {
                     ));
                 }
                 let pdf =
-                    read_pdf(resolved_file_path).map_err(|error| anyhow::anyhow!(error.message))?;
+                    futures::executor::block_on(read_pdf(resolved_file_path)).map_err(|error| anyhow::anyhow!(error.message))?;
                 return Ok(PreparedReadOutput::Pdf {
                     output: ReadPdfOutput {
                         file_path: resolved_file_path.display().to_string(),
@@ -1775,7 +1777,7 @@ impl crate::tool::ToolCall for FileReadTool {
         use crate::types::permissions::PermissionBehavior;
         use crate::utils::pdf_utils::parse_pdf_page_range;
         use crate::utils::permissions::filesystem::{
-            FilePermissionType, matching_rule_for_input_at_cwd,
+            FilePermissionType, matching_rule_for_input,
         };
 
         let Ok(input) = FileReadInput::from_args(args) else {
@@ -1812,7 +1814,7 @@ impl crate::tool::ToolCall for FileReadTool {
             Err(message) => return crate::tool::ValidationResult::fatal(message),
         };
         let full_file_path_str = full_file_path.display().to_string();
-        if matching_rule_for_input_at_cwd(
+        if matching_rule_for_input(
             &full_file_path_str,
             &context.tool_permission_context,
             FilePermissionType::Read,
@@ -1874,7 +1876,7 @@ impl crate::tool::ToolCall for FileReadTool {
             .filter(|path| !path.is_empty())
             .map(str::to_string)
             .unwrap_or_else(|| cwd.display().to_string());
-        crate::utils::permissions::filesystem::check_read_permission_for_tool_at_cwd(
+        crate::utils::permissions::filesystem::check_read_permission_for_tool(
             &file_path,
             &parsed,
             &context.tool_permission_context,
@@ -1951,6 +1953,7 @@ impl crate::tool::ToolCall for FileReadTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::sync::atomic::Ordering;
 
     async fn invoke_text_read_listener_path(
@@ -2448,7 +2451,7 @@ mod tests {
 
     #[tokio::test]
     async fn preaborted_read_retains_reached_dynamic_skill_insertion_only() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -2960,7 +2963,7 @@ trailer<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
 
     #[cfg(unix)]
     struct PdfFifoRestore {
-        path: Option<crate::utils::env_utils::EnvVarGuard>,
+        path: Option<EnvVarGuard>,
         read_task: Option<tokio::task::AbortHandle>,
         prefix_marker: Option<std::path::PathBuf>,
         producer_cancel: Option<std::path::PathBuf>,
@@ -3059,7 +3062,7 @@ trailer<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         use std::io::Write as _;
         use std::os::unix::ffi::OsStrExt as _;
 
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "cometix-read-pdf-cleanup-{}",
             uuid::Uuid::new_v4().simple()
@@ -3267,9 +3270,9 @@ trailer<< /Size 4 /Root 1 0 R >>\nstartxref\n190\n%%EOF\n";
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
 
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let mut restore = PdfFifoRestore {
-            path: Some(crate::utils::env_utils::EnvVarGuard::preserve("PATH")),
+            path: Some(EnvVarGuard::preserve("PATH")),
             read_task: None,
             prefix_marker: None,
             producer_cancel: None,
@@ -3538,7 +3541,7 @@ PY\n\
 
     #[tokio::test]
     async fn cached_read_dedup_killswitch_config_cannot_disable_dedup() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         struct ConfigRestore(Option<crate::utils::config::GlobalConfig>);
         impl Drop for ConfigRestore {
             fn drop(&mut self) {
@@ -3557,7 +3560,7 @@ PY\n\
             "DISABLE_TELEMETRY",
         ]
         .into_iter()
-        .map(crate::utils::env_utils::EnvVarGuard::unset)
+        .map(EnvVarGuard::unset)
         .collect::<Vec<_>>();
         let mut config = crate::utils::config::GlobalConfig::default();
         config.cached_growth_book_features = Some(std::collections::HashMap::from([(
@@ -3604,7 +3607,7 @@ PY\n\
 
     #[tokio::test]
     async fn dedup_returns_file_unchanged_when_mtime_matches() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         struct ConfigRestore(Option<crate::utils::config::GlobalConfig>);
         impl Drop for ConfigRestore {
             fn drop(&mut self) {

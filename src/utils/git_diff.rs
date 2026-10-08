@@ -6,6 +6,7 @@
 //! and retain the official five-second timeout.
 
 use crate::types::message::StructuredDiffHunk;
+use crate::utils::process_env::JsTruthy;
 use regex::Regex;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -58,12 +59,12 @@ static SHORTSTAT_RE: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 async fn git_output(cwd: &Path, args: &[&str]) -> Option<(i32, String)> {
-    let mut command = tokio::process::Command::new("git");
+    let mut command = tokio::process::Command::new(crate::utils::git::git_exe());
+    // CC gitDiff.ts runs git through execFileNoThrow: process.env, nothing added.
+    crate::utils::subprocess_env::apply_process_env(&mut command);
     command
         .args(args)
         .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "")
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .kill_on_drop(true);
@@ -424,17 +425,14 @@ impl ToolUseDiff {
 }
 
 async fn run_single_file_git(root: &Path, args: &[&str]) -> Option<(bool, String)> {
-    let output = tokio::time::timeout(
-        Duration::from_millis(3_000),
-        tokio::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
+    let mut command = tokio::process::Command::new(crate::utils::git::git_exe());
+    // CC gitDiff.ts runs git through execFileNoThrow: process.env, nothing added.
+    crate::utils::subprocess_env::apply_process_env(&mut command);
+    command.args(args).current_dir(root);
+    let output = tokio::time::timeout(Duration::from_millis(3_000), command.output())
+        .await
+        .ok()?
+        .ok()?;
     Some((
         output.status.success(),
         String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -493,9 +491,8 @@ fn parse_raw_single_file_diff(
 }
 
 async fn get_single_file_diff_ref(root: &Path) -> String {
-    let base_branch = if let Some(base_ref) = std::env::var("CLAUDE_CODE_BASE_REF")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    let base_branch = if let Some(base_ref) =
+        crate::utils::process_env::var("CLAUDE_CODE_BASE_REF").truthy()
     {
         base_ref
     } else {

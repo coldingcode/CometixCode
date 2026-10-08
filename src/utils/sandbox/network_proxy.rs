@@ -640,11 +640,15 @@ fn start_linux_bridges(
     shutdown: Arc<AtomicBool>,
 ) -> Result<(PathBuf, PathBuf, Vec<Child>)> {
     let token = uuid::Uuid::new_v4().simple().to_string();
-    let http_socket = std::env::temp_dir().join(format!("cometix-http-{token}.sock"));
-    let socks_socket = std::env::temp_dir().join(format!("cometix-socks-{token}.sock"));
+    // sandbox-runtime `linux-sandbox-utils.js:326-327` `join(tmpdir(), …)`.
+    let http_socket = crate::utils::node_os::tmpdir().join(format!("cometix-http-{token}.sock"));
+    let socks_socket = crate::utils::node_os::tmpdir().join(format!("cometix-socks-{token}.sock"));
     let mut bridges = Vec::new();
     for (socket, port) in [(&http_socket, http_port), (&socks_socket, socks_port)] {
-        let child = Command::new("socat")
+        let mut command = Command::new("socat");
+        // sandbox-runtime `spawn('socat', ...)` inherits process.env; the carrier is its counterpart.
+        crate::utils::subprocess_env::apply_process_env_std(&mut command);
+        let child = command
             .arg(format!("UNIX-LISTEN:{},fork,reuseaddr", socket.display()))
             .arg(format!(
                 "TCP:localhost:{port},keepalive,keepidle=10,keepintvl=5,keepcnt=3"
@@ -705,6 +709,7 @@ pub fn reset_network_proxy_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn canonicalization_blocks_inet_aton_and_wildcard_ip_bypasses() {
@@ -725,7 +730,7 @@ mod tests {
 
     #[test]
     fn regular_http_proxy_rewrites_absolute_uri_and_relays_one_response() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_network_proxy_for_test();
         super::super::sandbox_adapter::clear_sandbox_ask_callback_for_test();
         let origin = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -769,7 +774,7 @@ mod tests {
 
     #[test]
     fn http_connect_proxy_allows_only_configured_host() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_network_proxy_for_test();
         super::super::sandbox_adapter::clear_sandbox_ask_callback_for_test();
         let echo = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();

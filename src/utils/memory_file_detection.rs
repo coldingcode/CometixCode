@@ -30,7 +30,7 @@ fn to_comparable(path: &str) -> String {
 
 /// Maps to: CC `utils/memoryFileDetection.ts:40-58` `detectSessionFileType`.
 pub fn detect_session_file_type(file_path: &str) -> Option<SessionFileType> {
-    let config_dir = crate::utils::config::get_config_home();
+    let config_dir = crate::utils::env_utils::get_claude_config_home_dir();
     let normalized = to_comparable(file_path);
     let config_dir = to_comparable(&config_dir.display().to_string());
     if !normalized.starts_with(&config_dir) {
@@ -63,19 +63,17 @@ pub fn detect_session_pattern_type(pattern: &str) -> Option<SessionFileType> {
 
 /// Maps to: CC `utils/memoryFileDetection.ts:87-92` `isAutoMemFile`.
 ///
-/// Auto-memory enablement intentionally observes merged settings (project
-/// opt-out is supported), while path ownership delegates to the trusted-source
-/// resolver that excludes project `autoMemoryDirectory` redirection.
+/// Auto-memory enablement observes merged settings (project opt-out is
+/// supported), while `isAutoMemPath` takes `autoMemoryDirectory` from the
+/// trusted sources only, so a project cannot redirect it.
 pub fn is_auto_mem_file(file_path: &Path) -> bool {
-    let settings = crate::utils::settings::get_initial_settings();
-    crate::memdir::paths::is_auto_memory_enabled(&settings)
-        && crate::memdir::paths::is_auto_mem_path_from_trusted_sources(file_path)
+    crate::memdir::paths::is_auto_memory_enabled()
+        && crate::memdir::paths::is_auto_mem_path(file_path)
 }
 
 /// Maps to: CC `utils/memoryFileDetection.ts:119-125` `isAgentMemFile`.
 fn is_agent_mem_file(file_path: &Path) -> bool {
-    let settings = crate::utils::settings::get_initial_settings();
-    crate::memdir::paths::is_auto_memory_enabled(&settings)
+    crate::memdir::paths::is_auto_memory_enabled()
         && crate::tools::agent_tool::agent_memory::is_agent_memory_path(
             file_path,
             &crate::bootstrap::state::get_original_cwd(),
@@ -120,8 +118,7 @@ pub fn is_memory_directory(dir_path: &str) -> bool {
         normalized
     };
     let normalized_cmp = to_comparable(&normalized_path.display().to_string());
-    let settings = crate::utils::settings::get_initial_settings();
-    let auto_memory_enabled = crate::memdir::paths::is_auto_memory_enabled(&settings);
+    let auto_memory_enabled = crate::memdir::paths::is_auto_memory_enabled();
 
     if auto_memory_enabled
         && (normalized_cmp.contains("/agent-memory/")
@@ -135,14 +132,12 @@ pub fn is_memory_directory(dir_path: &str) -> bool {
     {
         return true;
     }
-    if auto_memory_enabled
-        && crate::memdir::paths::is_auto_mem_path_from_trusted_sources(&normalized_path)
-    {
+    if auto_memory_enabled && crate::memdir::paths::is_auto_mem_path(&normalized_path) {
         return true;
     }
 
     let config_dir = to_comparable(
-        &crate::utils::config::get_config_home()
+        &crate::utils::env_utils::get_claude_config_home_dir()
             .display()
             .to_string(),
     );
@@ -172,12 +167,10 @@ static ABSOLUTE_SHELL_PATH: LazyLock<regex::Regex> = LazyLock::new(|| {
 /// Maps to: CC `utils/memoryFileDetection.ts:215-269`
 /// `isShellCommandTargetingMemory`.
 pub fn is_shell_command_targeting_memory(command: &str) -> bool {
-    let config_dir = crate::utils::config::get_config_home();
+    let config_dir = crate::utils::env_utils::get_claude_config_home_dir();
     let memory_base = crate::memdir::paths::get_memory_base_dir();
-    let settings = crate::utils::settings::get_initial_settings();
-    let auto_memory_enabled = crate::memdir::paths::is_auto_memory_enabled(&settings);
-    let auto_mem_dir =
-        auto_memory_enabled.then(crate::memdir::paths::get_auto_mem_path_from_trusted_sources);
+    let auto_memory_enabled = crate::memdir::paths::is_auto_memory_enabled();
+    let auto_mem_dir = auto_memory_enabled.then(crate::memdir::paths::get_auto_mem_path);
 
     let command_cmp = to_comparable(command);
     let dirs = [
@@ -226,8 +219,7 @@ pub fn is_auto_managed_memory_pattern(pattern: &str) -> bool {
     if detect_session_pattern_type(pattern).is_some() {
         return true;
     }
-    let settings = crate::utils::settings::get_initial_settings();
-    if crate::memdir::paths::is_auto_memory_enabled(&settings) {
+    if crate::memdir::paths::is_auto_memory_enabled() {
         let normalized = pattern.replace('\\', "/");
         return normalized.contains("agent-memory/") || normalized.contains("agent-memory-local/");
     }
@@ -237,6 +229,7 @@ pub fn is_auto_managed_memory_pattern(pattern: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK, TestEnvGuard};
 
     const ENV_KEYS: [&str; 4] = [
         "CLAUDE_CONFIG_DIR",
@@ -246,19 +239,19 @@ mod tests {
     ];
 
     struct DetectionTestEnv {
-        _lock: crate::utils::env_utils::TestEnvGuard<'static>,
-        previous_env: Vec<crate::utils::env_utils::EnvVarGuard>,
+        _lock: TestEnvGuard<'static>,
+        previous_env: Vec<EnvVarGuard>,
         previous_cwd: PathBuf,
     }
 
     impl DetectionTestEnv {
         fn new(root: &Path) -> Self {
-            let lock = crate::utils::env_utils::TEST_ENV_LOCK
+            let lock = TEST_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             let previous_env = ENV_KEYS
                 .into_iter()
-                .map(crate::utils::env_utils::EnvVarGuard::preserve)
+                .map(EnvVarGuard::preserve)
                 .collect::<Vec<_>>();
             for key in ENV_KEYS {
                 crate::utils::process_env::remove(key);

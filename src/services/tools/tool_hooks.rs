@@ -672,6 +672,7 @@ fn tool_result_content(message: Option<&RenderableMessage>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     /// Parse a settings-shaped hooks fixture and fold it into the
     /// execution-facing `RegisteredHooks` table.
@@ -716,7 +717,6 @@ mod tests {
             session_id: "session-triple".to_string(),
             transcript_path: "/tmp/session-triple.jsonl".to_string(),
             cwd: "/tmp/triple".to_string(),
-            project_dir: "/tmp/triple".to_string(),
             permission_mode: Some("acceptEdits".to_string()),
             agent_id: Some("agent-triple".to_string()),
             agent_type: Some("code-reviewer".to_string()),
@@ -738,7 +738,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn every_tool_event_payload_carries_the_tool_use_context_triple() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let _managed = crate::services::hooks::test_support::ManagedSettingsGuard::install(None);
         let context = subagent_hook_context();
@@ -884,7 +884,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn post_tool_use_failure_payload_carries_is_interrupt_both_ways() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let _managed = crate::services::hooks::test_support::ManagedSettingsGuard::install(None);
         let request = read_request("toolu_interrupt");

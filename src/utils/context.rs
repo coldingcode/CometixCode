@@ -53,8 +53,7 @@ pub fn get_model_max_output_tokens(model: &str) -> ModelMaxOutputTokens {
 /// Maps to CC `utils/context.ts` `is1mContextDisabled()`.
 pub fn is_1m_context_disabled() -> bool {
     crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_DISABLE_1M_CONTEXT")
             .as_deref(),
     )
 }
@@ -134,13 +133,14 @@ pub fn get_context_window_for_model(model: &str, betas: &[String]) -> i64 {
         model,
         betas,
         crate::utils::build_profile::build_audience(),
-        &|key| std::env::var(key).ok(),
+        &|key| crate::utils::process_env::var(key),
     )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn model_max_output_tokens_matches_official_known_models() {
@@ -176,7 +176,7 @@ mod tests {
 
     #[test]
     fn context_window_defaults_to_official_200k() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_DISABLE_1M_CONTEXT");
         crate::utils::process_env::remove("CLAUDE_CODE_MAX_CONTEXT_TOKENS");
 
@@ -188,7 +188,7 @@ mod tests {
 
     #[test]
     fn context_window_honors_internal_override_and_1m_suffix() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_DISABLE_1M_CONTEXT");
         assert_eq!(
             get_context_window_for_model_for_audience(

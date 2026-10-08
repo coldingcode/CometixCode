@@ -2,6 +2,7 @@
 //! Log/session display, loading, and API capture remain with their existing
 //! owners or unported; this file does not claim those independent functions.
 
+use crate::utils::process_env::JsTruthy;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
 use std::{
@@ -229,10 +230,10 @@ pub fn log_error(error: impl Into<McpLogError>) {
         "CLAUDE_CODE_USE_FOUNDRY",
     ]
     .iter()
-    .any(|key| crate::utils::env_utils::is_env_truthy(std::env::var(key).ok().as_deref()))
-        || std::env::var("DISABLE_ERROR_REPORTING")
-            .ok()
-            .is_some_and(|value| !value.is_empty())
+    .any(|key| crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var(key).as_deref()))
+        || crate::utils::process_env::var("DISABLE_ERROR_REPORTING")
+            .truthy()
+            .is_some()
         || crate::utils::privacy_level::is_essential_traffic_only()
     {
         return;
@@ -319,7 +320,7 @@ pub fn _reset_error_log_for_testing() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::{EnvVarGuard, TEST_ENV_LOCK};
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use serde_json::json;
 
     fn clean_env() -> Vec<EnvVarGuard> {

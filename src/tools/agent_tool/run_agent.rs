@@ -827,13 +827,9 @@ pub async fn run_agent(input: RunAgentInput<'_>) -> anyhow::Result<RunAgentOutco
         ),
     };
 
-    let subagent_start_results = execute_subagent_start_hooks_from_settings(
-        &agent_id,
-        &input.agent_definition.agent_type,
-        &permission_context,
-        &run_cwd,
-    )
-    .await;
+    let subagent_start_results =
+        execute_subagent_start_hooks_from_settings(&agent_id, &input.agent_definition.agent_type)
+            .await;
     // Maps to: CC `runAgent.ts:530-555` — collect every hook's
     // additionalContexts and, when any exist, push the
     // `createAttachmentMessage` equivalent: a `hook_additional_context`
@@ -1266,9 +1262,7 @@ pub async fn run_agent(input: RunAgentInput<'_>) -> anyhow::Result<RunAgentOutco
     execute_subagent_stop_hooks_from_settings(
         &agent_id,
         &input.agent_definition.agent_type,
-        &permission_context,
         last_assistant_text_from_messages(&agent_messages).as_deref(),
-        &run_cwd,
     )
     .await;
 
@@ -1527,16 +1521,15 @@ fn register_agent_frontmatter_hooks_for_run(
 async fn execute_subagent_start_hooks_from_settings(
     agent_id: &str,
     agent_type: &str,
-    permission_context: &crate::tool::ToolPermissionContext,
-    cwd: &std::path::Path,
 ) -> Vec<crate::services::hooks::HookResult> {
-    let Some((config, base_env)) =
-        subagent_hook_config_and_env(agent_id, agent_type, permission_context, cwd)
-    else {
+    let Some(config) = subagent_hook_config(agent_id) else {
         return Vec::new();
     };
     crate::services::hooks::teammate::execute_subagent_start_hooks(
-        &config, agent_id, agent_type, base_env,
+        &config,
+        agent_id,
+        agent_type,
+        Vec::new(),
     )
     .await
 }
@@ -1548,13 +1541,9 @@ async fn execute_subagent_start_hooks_from_settings(
 async fn execute_subagent_stop_hooks_from_settings(
     agent_id: &str,
     agent_type: &str,
-    permission_context: &crate::tool::ToolPermissionContext,
     last_assistant_message: Option<&str>,
-    cwd: &std::path::Path,
 ) -> Vec<crate::services::hooks::HookResult> {
-    let Some((config, base_env)) =
-        subagent_hook_config_and_env(agent_id, agent_type, permission_context, cwd)
-    else {
+    let Some(config) = subagent_hook_config(agent_id) else {
         return Vec::new();
     };
     let transcript_path = crate::utils::session_storage::get_agent_transcript_path(agent_id)
@@ -1566,48 +1555,18 @@ async fn execute_subagent_stop_hooks_from_settings(
         agent_type,
         &transcript_path,
         last_assistant_message,
-        base_env,
+        Vec::new(),
     )
     .await
 }
 
-fn subagent_hook_config_and_env(
-    agent_id: &str,
-    agent_type: &str,
-    permission_context: &crate::tool::ToolPermissionContext,
-    cwd: &std::path::Path,
-) -> Option<(
-    crate::services::hooks::RegisteredHooks,
-    Vec<(String, String)>,
-)> {
+fn subagent_hook_config(agent_id: &str) -> Option<crate::services::hooks::RegisteredHooks> {
     let loaded_hooks = crate::services::hooks::load_hooks_config();
     let mut config = loaded_hooks.config;
     if !loaded_hooks.allow_managed_hooks_only {
         crate::utils::hooks::session_hooks::merge_session_hooks_into_config(&mut config, agent_id);
     }
-    if config.is_empty() {
-        return None;
-    }
-    let cwd = cwd.display().to_string();
-    let transcript_path = crate::utils::session_storage::get_agent_transcript_path(agent_id)
-        .display()
-        .to_string();
-    let hook_context = crate::services::hooks::HookContext {
-        session_id: crate::bootstrap::state::get_session_id(),
-        transcript_path,
-        cwd: cwd.clone(),
-        project_dir: cwd,
-        permission_mode: Some(
-            crate::utils::permissions::permission_mode::to_external_permission_mode(
-                permission_context.mode,
-            )
-            .to_string(),
-        ),
-        agent_id: Some(agent_id.to_string()),
-        agent_type: Some(agent_type.to_string()),
-    };
-    let base_env = crate::services::hooks::build_hook_env_vars(&hook_context);
-    Some((config, base_env))
+    (!config.is_empty()).then_some(config)
 }
 
 fn last_assistant_text_from_messages(messages: &[Message]) -> Option<String> {
@@ -2017,6 +1976,7 @@ mod tests {
     use crate::types::message::{
         AssistantContent, AssistantMessage, StopReason, ToolResult, ToolUseBlock, UserMessage,
     };
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::io::Write;
 
     fn tool(name: &str) -> Tool {
@@ -2293,7 +2253,7 @@ mod tests {
 
     #[test]
     fn resolves_model_override_before_agent_model_before_parent_inherit() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_SUBAGENT_MODEL");
         crate::utils::process_env::remove("ANTHROPIC_MODEL");
 
@@ -2315,7 +2275,7 @@ mod tests {
 
     #[test]
     fn agent_system_prompt_appends_persistent_agent_memory_prompt() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "false");
         let root = std::env::temp_dir().join(format!(
             "cometix-agent-system-memory-{}",
@@ -2777,7 +2737,7 @@ mod tests {
             }
         }
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _dynamic = crate::skills::load_skills_dir::DynamicSkillsTestSnapshot::capture();
         let _sources =
             AllowedSourcesRestore(crate::bootstrap::state::get_allowed_setting_sources());
@@ -2869,24 +2829,17 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    struct EnvGuard(Option<crate::utils::env_utils::EnvVarGuard>);
+    struct SettingsCacheGuard;
 
-    impl EnvGuard {
-        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-            Self(Some(crate::utils::env_utils::EnvVarGuard::set(key, value)))
-        }
-    }
-
-    impl Drop for EnvGuard {
+    impl Drop for SettingsCacheGuard {
         fn drop(&mut self) {
-            drop(self.0.take());
             crate::utils::settings::settings_cache::reset_settings_cache();
         }
     }
 
     #[test]
     fn agent_mcp_initialization_skips_user_frontmatter_when_policy_locks_mcp() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-agent-mcp-policy-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
@@ -2895,7 +2848,10 @@ mod tests {
             serde_json::json!({"strictPluginOnlyCustomization": ["mcp"]}).to_string(),
         )
         .unwrap();
-        let _managed_guard = EnvGuard::set_path("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &root);
+        // Declared before the env guard so the settings cache is reset after
+        // the managed settings path has been restored.
+        let _settings_cache = SettingsCacheGuard;
+        let _managed_guard = EnvVarGuard::set("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &root);
         // The policy source is served from the process-global settings cache,
         // so an earlier test that read settings pins the managed layer this
         // test just wrote to disk (`settings_cache.rs:10-12`).
@@ -2952,7 +2908,7 @@ mod tests {
     /// tool restrictions" (`:834-837`).
     #[test]
     fn available_tools_for_agent_assembles_the_pool_from_app_state_not_the_parents_tools() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
 
@@ -3160,7 +3116,7 @@ mod tests {
     /// `just test-all-audiences`.
     #[test]
     fn sidechain_write_set_matches_official_is_loggable_message() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::utils::process_env::remove("CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT");
@@ -4112,13 +4068,11 @@ mod tests {
             }
         }
 
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _write_enabled =
-            crate::utils::env_utils::EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
-        let _skip_history =
-            crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _skip_history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
 
         struct PersistenceRestore(bool);
         impl Drop for PersistenceRestore {
@@ -4285,19 +4239,16 @@ mod tests {
             is_session_write_enabled, reset_session_file_pointer, set_test_projects_dir_override,
         };
 
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _write_enabled =
-            crate::utils::env_utils::EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
-        let _skip_history =
-            crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _skip_history = EnvVarGuard::unset("CLAUDE_CODE_SKIP_PROMPT_HISTORY");
         // The one attachment CC does hand to the writer is `initialMessages`'
         // trailing hook context, and only behind this flag off-`ant`. Nothing
         // in this test goes through that path, so hold it cleared: any
         // attachment row here came from the loop.
-        let _hook_context =
-            crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT");
+        let _hook_context = EnvVarGuard::unset("CLAUDE_CODE_SAVE_HOOK_ADDITIONAL_CONTEXT");
 
         struct PersistenceRestore(bool);
         impl Drop for PersistenceRestore {
@@ -4484,6 +4435,7 @@ mod input_contract_tests {
 
     use super::super::load_agents_dir::AgentDefinitionSource;
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::collections::BTreeMap;
 
     /// CC `runAgent.ts:913-932` preserves successful strings (including empty);
@@ -4525,8 +4477,8 @@ mod input_contract_tests {
     /// within one string; built-in `generalPurposeAgent.ts:24-28` does not.
     #[test]
     fn get_agent_system_prompt_matches_official_custom_memory_inside_original_block() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let previous = std::env::var("CLAUDE_CODE_DISABLE_AUTO_MEMORY").ok();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let previous = crate::utils::process_env::var("CLAUDE_CODE_DISABLE_AUTO_MEMORY");
         crate::utils::process_env::set("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "false");
         let root =
             std::env::temp_dir().join(format!("cometix-agent-input-{}", uuid::Uuid::new_v4()));
@@ -4565,14 +4517,14 @@ mod input_contract_tests {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // The production CLI installs this provider before constructing API clients.
         crate::utils::tls_provider::install_crypto_provider();
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-agent-input-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         struct Fixture {
             root: std::path::PathBuf,
             previous_cwd: std::path::PathBuf,
-            previous_env: Vec<(&'static str, Option<String>)>,
+            env: Vec<EnvVarGuard>,
             server: Option<tokio::task::JoinHandle<()>>,
         }
         impl Drop for Fixture {
@@ -4581,19 +4533,16 @@ mod input_contract_tests {
                     server.abort();
                 }
                 crate::bootstrap::state::set_original_cwd(self.previous_cwd.clone());
-                for (key, value) in &self.previous_env {
-                    match value {
-                        Some(value) => crate::utils::process_env::set(key, value),
-                        None => crate::utils::process_env::remove(key),
-                    }
-                }
+                // Restore the environment here, in the order the variables
+                // were set, before the temporary root is removed.
+                self.env.clear();
                 let _ = std::fs::remove_dir_all(&self.root);
             }
         }
         let mut fixture = Fixture {
             root: root.clone(),
             previous_cwd: crate::bootstrap::state::get_original_cwd(),
-            previous_env: Vec::new(),
+            env: Vec::new(),
             server: None,
         };
         crate::bootstrap::state::set_original_cwd(root.clone());
@@ -4609,13 +4558,10 @@ mod input_contract_tests {
             ("DISABLE_AUTO_COMPACT", "1".to_string()),
             ("NODE_ENV", String::new()),
         ];
-        fixture.previous_env = env
+        fixture.env = env
             .iter()
-            .map(|(key, _)| (*key, std::env::var(key).ok()))
+            .map(|(key, value)| EnvVarGuard::set(*key, value))
             .collect();
-        for (key, value) in &env {
-            crate::utils::process_env::set(key, value);
-        }
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         fixture.server = Some(tokio::spawn(async move {
             tokio::time::timeout(std::time::Duration::from_secs(45), async move {
@@ -4897,7 +4843,7 @@ mod input_contract_tests {
     #[test]
     fn background_agent_plugin_preparation_keeps_published_current_thread_live() {
         const CHILD: &str = "COMETIX_BACKGROUND_AGENT_PLUGIN_CHILD";
-        if let Some(root) = std::env::var_os(CHILD) {
+        if let Some(root) = crate::utils::process_env::var_os(CHILD) {
             assert!(crate::utils::process_runtime::process_runtime_handle().is_none());
             let root = std::path::PathBuf::from(root);
             crate::utils::process_env::set("CLAUDE_CONFIG_DIR", root.join("config"));

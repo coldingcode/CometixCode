@@ -278,7 +278,9 @@ impl crate::tool::ToolCall for GlobTool {
         {
             return crate::tool::ValidationResult::Ok;
         }
-        match std::fs::metadata(&absolute_path) {
+        match futures::executor::block_on(
+            crate::utils::fs_operations::get_fs_implementation().stat(&absolute_path),
+        ) {
             Ok(metadata) if metadata.is_dir() => crate::tool::ValidationResult::Ok,
             Ok(_) => crate::tool::ValidationResult::Error {
                 message: format!("Path is not a directory: {path}"),
@@ -322,7 +324,7 @@ impl crate::tool::ToolCall for GlobTool {
             .and_then(serde_json::Value::as_str)
             .unwrap_or_default();
         let requested_permission =
-            crate::utils::permissions::filesystem::check_read_permission_for_tool_at_cwd(
+            crate::utils::permissions::filesystem::check_read_permission_for_tool(
                 &requested_root.display().to_string(),
                 args,
                 &context.tool_permission_context,
@@ -339,7 +341,7 @@ impl crate::tool::ToolCall for GlobTool {
             return requested_permission;
         }
         let traversal_permission =
-            crate::utils::permissions::filesystem::check_read_permission_for_tool_at_cwd(
+            crate::utils::permissions::filesystem::check_read_permission_for_tool(
                 &permission_root.display().to_string(),
                 args,
                 &context.tool_permission_context,
@@ -466,6 +468,7 @@ impl crate::tool::ToolCall for GlobTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{PinnedProjectDir, TEST_ENV_LOCK};
 
     #[test]
     fn relative_model_paths_keep_dotdot_prefixed_filenames_absolute() {
@@ -629,7 +632,7 @@ mod tests {
         use crate::tool::ToolCall as _;
         use crate::utils::permissions::permission_result::PermissionResult;
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-glob-permission-root-{}",
             uuid::Uuid::new_v4().simple()
@@ -646,7 +649,7 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::create_dir_all(&traversal_outside).unwrap();
         // CC filesystem.ts:667-674 authorizes original cwd, not every cwd override.
-        let _project = crate::utils::env_utils::PinnedProjectDir::at(&root);
+        let _project = PinnedProjectDir::at(&root);
         let context = crate::tool::ToolUseContext {
             cwd_override: Some(root.clone()),
             ..crate::tool::ToolUseContext::default()

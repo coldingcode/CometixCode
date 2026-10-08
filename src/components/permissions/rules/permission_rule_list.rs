@@ -537,11 +537,16 @@ fn RulesTabContent<'a>(
         (props.on_focus_header)(true);
     }
     let navigation = state.navigation.snapshot();
+    // CC :192, :207 `width={useTabsWidth()}`, always undefined in CC (no
+    // caller sets useFullWidth), so the box follows the tab's content. This
+    // list draws its own header and provides no Tabs context, which gives
+    // the same `None`.
+    let tab_width = crate::components::design_system::tabs::use_tabs_width(&hooks).map(u32::from);
     element! {
         View(flex_direction: FlexDirection::Column) {
             View(margin_bottom: 1u32, flex_direction: FlexDirection::Column) {
                 SearchBox(query: props.search_query.clone(), is_focused: props.is_search_mode && !props.header_focused,
-                    is_terminal_focused: props.is_focused, cursor_offset: Some(props.cursor_offset))
+                    is_terminal_focused: props.is_focused, width: tab_width, cursor_offset: Some(props.cursor_offset))
             }
             Select(options: props.options.clone(), focused_index: navigation.focused_index().unwrap_or(0),
                 visible_option_count: navigation.visible_option_count, visible_from_index: navigation.visible_from_index,
@@ -626,7 +631,7 @@ fn PermissionRuleListCancelBinding(
     let active = props.active;
     let mut pending = props.pending;
     #[cfg(test)]
-    if std::env::var_os("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC").is_some() {
+    if crate::utils::process_env::var_os("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC").is_some() {
         eprintln!("cancel binding render active={active}");
         hooks.use_terminal_events({
             let runtime = runtime.clone();
@@ -646,7 +651,7 @@ fn PermissionRuleListCancelBinding(
         move || active,
         move || {
             #[cfg(test)]
-            if std::env::var_os("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC").is_some() {
+            if crate::utils::process_env::var_os("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC").is_some() {
                 eprintln!("cancel binding invoked active={active}");
             }
             if let Some(pending) = pending.as_mut() {
@@ -877,7 +882,7 @@ pub fn PermissionRuleList<'a>(
 
     if pending_cancel.get() {
         #[cfg(test)]
-        if std::env::var_os("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC").is_some() {
+        if crate::utils::process_env::var_os("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC").is_some() {
             eprintln!("parent pending_cancel");
         }
         pending_cancel.set(false);
@@ -891,7 +896,7 @@ pub fn PermissionRuleList<'a>(
     let completed_exit = { pending_exit_result.read().clone() };
     if let Some(result) = completed_exit {
         #[cfg(test)]
-        if std::env::var_os("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC").is_some() {
+        if crate::utils::process_env::var_os("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC").is_some() {
             eprintln!("parent on_exit={result:?}");
         }
         pending_exit_result.set(None);
@@ -1192,6 +1197,7 @@ pub fn PermissionRuleList<'a>(
 mod tests {
     use super::*;
     use crate::types::permissions::PermissionRuleValue;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use crate::utils::theme;
     use std::collections::HashMap;
 
@@ -1351,12 +1357,11 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_add_remove_lifecycle_matches_official_callbacks_and_exit() {
-        let _diagnostic =
-            crate::utils::env_utils::EnvVarGuard::set("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC", "1");
+        let _diagnostic = EnvVarGuard::set("COMETIX_PERMISSION_CANCEL_DIAGNOSTIC", "1");
         chalk::set_stdout_level(3);
         use futures::StreamExt;
         use std::time::Duration;
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cc-permissions-workspace-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();

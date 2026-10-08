@@ -75,7 +75,7 @@ struct LogEntry {
 }
 
 pub fn history_file_path() -> PathBuf {
-    config::get_config_home().join("history.jsonl")
+    crate::utils::env_utils::get_claude_config_home_dir().join("history.jsonl")
 }
 
 /// Maps to: `addToHistory(command)`.
@@ -89,8 +89,7 @@ pub fn add_to_history_with_pasted(
 ) {
     if !history_write_enabled()
         || crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_SKIP_PROMPT_HISTORY")
-                .ok()
+            crate::utils::process_env::var("CLAUDE_CODE_SKIP_PROMPT_HISTORY")
                 .as_deref(),
         )
     {
@@ -257,7 +256,7 @@ fn pasted_contents_from_json(value: &serde_json::Value) -> BTreeMap<usize, Paste
 }
 
 fn history_write_enabled() -> bool {
-    crate::utils::env_utils::is_env_truthy(std::env::var("COMETIX_WRITE_ENABLED").ok().as_deref())
+    crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("COMETIX_WRITE_ENABLED").as_deref())
 }
 
 fn append_log_entry(entry: &LogEntry) -> anyhow::Result<()> {
@@ -294,10 +293,10 @@ fn current_project_root() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK, TestEnvLock};
 
-    fn env_lock() -> &'static crate::utils::env_utils::TestEnvLock {
-        &crate::utils::env_utils::TEST_ENV_LOCK
+    fn env_lock() -> &'static TestEnvLock {
+        &TEST_ENV_LOCK
     }
 
     fn temp_history_home() -> std::path::PathBuf {

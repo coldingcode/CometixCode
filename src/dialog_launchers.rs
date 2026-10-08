@@ -24,14 +24,19 @@ pub fn launch_resume_chooser(
     filter_by_pr: Option<ResumeFilterByPr>,
     repl_props: ReplProps,
 ) -> AnyElement<'static> {
+    // Maps to: CC `dialogLaunchers.tsx:191-197` — `<App><KeybindingSetup>
+    // <ResumeConversation/>`. The REPL the picker opens mounts its own
+    // KeybindingSetup inside this one, as CC's does.
     let children = AppChildren::new(move || {
         element! {
-            ResumeConversation(
-                repl_props: repl_props.clone(),
-                worktree_paths: worktree_paths.clone(),
-                initial_search_query: initial_search_query.clone(),
-                filter_by_pr: filter_by_pr.clone(),
-            )
+            crate::keybindings::keybinding_provider_setup::KeybindingSetup {
+                ResumeConversation(
+                    repl_props: repl_props.clone(),
+                    worktree_paths: worktree_paths.clone(),
+                    initial_search_query: initial_search_query.clone(),
+                    filter_by_pr: filter_by_pr.clone(),
+                )
+            }
         }
         .into_any()
     });
@@ -61,13 +66,14 @@ pub fn launch_resume_chooser(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
     use futures::{StreamExt, stream};
     use std::fs;
     use std::time::Duration;
 
     #[test]
     fn launch_resume_chooser_survives_loading_to_non_empty_selector_and_cancel() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_cwd = std::env::current_dir().unwrap();
         let previous_original_cwd = crate::bootstrap::state::get_original_cwd();
         let root = std::env::temp_dir().join(format!(
@@ -185,7 +191,7 @@ mod tests {
 
     #[test]
     fn launch_resume_chooser_loads_more_than_the_initial_fifty_near_list_end() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_cwd = std::env::current_dir().unwrap();
         let previous_original_cwd = crate::bootstrap::state::get_original_cwd();
         let root = std::env::temp_dir().join(format!(
@@ -300,7 +306,7 @@ mod tests {
 
     #[test]
     fn launch_resume_chooser_mounts_resume_conversation_before_repl_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_cwd = std::env::current_dir().unwrap();
         let previous_original_cwd = crate::bootstrap::state::get_original_cwd();
         let cwd =

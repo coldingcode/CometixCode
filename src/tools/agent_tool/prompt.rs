@@ -10,15 +10,12 @@ use crate::tools::send_message_tool::prompt::SEND_MESSAGE_TOOL_NAME;
 /// Maps to CC `tools/AgentTool/prompt.ts:59-64`
 /// `shouldInjectAgentListInMessages()`.
 pub fn should_inject_agent_list_in_messages() -> bool {
-    match std::env::var("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES") {
-        Ok(value) => matches!(
-            value.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        ),
-        // GrowthBook delivery is intentionally absent; preserve the source
-        // default rather than assigning this process to a fabricated cohort.
-        Err(_) => false,
-    }
+    // The `isEnvDefinedFalsy` branch and the GrowthBook fallback both yield
+    // `false`: GrowthBook delivery is intentionally absent; preserve the source
+    // default rather than assigning this process to a fabricated cohort.
+    crate::utils::env_utils::is_env_truthy(
+        crate::utils::process_env::var("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES").as_deref(),
+    )
 }
 
 /// Maps to CC `tools/AgentTool/prompt.ts:15-37` `getToolsDescription(agent)`.
@@ -189,8 +186,7 @@ pub fn get_prompt(
     };
 
     let background_notes = if !crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")
             .as_deref(),
     ) && !fork_enabled
     {
@@ -240,7 +236,7 @@ pub fn get_prompt(
 mod tests {
     use super::*;
     use crate::tools::agent_tool::load_agents_dir::AgentDefinitionSource;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     fn agent(agent_type: &str, when_to_use: &str) -> AgentDefinition {
         AgentDefinition::new(agent_type, when_to_use, AgentDefinitionSource::BuiltIn)
@@ -275,7 +271,7 @@ mod tests {
 
     #[test]
     fn prompt_lists_available_agent_types_inline_when_attachment_gate_is_off() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _list_in_messages = EnvVarGuard::unset("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES");
@@ -296,7 +292,7 @@ mod tests {
 
     #[test]
     fn prompt_defers_the_agent_list_to_attachments_when_the_gate_is_on() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let prompt = {
@@ -317,7 +313,7 @@ mod tests {
 
     #[test]
     fn allowed_agent_types_restrict_the_inline_listing_like_official() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _list_in_messages = EnvVarGuard::unset("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES");
@@ -340,7 +336,7 @@ mod tests {
     /// actually receives.
     #[test]
     fn non_coordinator_prompt_carries_the_official_sections() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _list_in_messages = EnvVarGuard::unset("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES");
@@ -386,7 +382,7 @@ mod tests {
     /// so both stay under test.
     #[test]
     fn a_vetoed_fork_gate_restores_the_pre_fork_sections() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _list_in_messages = EnvVarGuard::unset("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES");
@@ -418,7 +414,7 @@ mod tests {
 
     #[test]
     fn coordinator_prompt_stops_after_the_shared_header() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _list_in_messages = EnvVarGuard::unset("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES");
@@ -444,7 +440,7 @@ mod tests {
     /// switch and prove nothing about it.
     #[test]
     fn background_notes_drop_when_background_tasks_are_disabled() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _list_in_messages = EnvVarGuard::unset("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES");

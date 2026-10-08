@@ -21,6 +21,8 @@ use super::types::{
     McpToolSnapshot, ScopedMcpServerConfig, ServerResource, Transport,
 };
 use crate::state::app_state_store::McpState;
+#[cfg(test)]
+use crate::utils::test_env::TestStateLock;
 // CC's `String(...)` / template-literal conversion on MCP payload fields
 // (`client.ts:2505` `String(resultContent.data)`, `:2670`
 // `String(result.toolResult)`, and the `${resource.uri}` / `${resource.text}` /
@@ -78,9 +80,8 @@ pub(crate) fn connected_mcp_server_instructions(
 }
 
 #[cfg(test)]
-pub(crate) static TEST_MCP_INSTRUCTIONS_LOCK: std::sync::LazyLock<
-    crate::utils::env_utils::TestStateLock,
-> = std::sync::LazyLock::new(crate::utils::env_utils::TestStateLock::new);
+pub(crate) static TEST_MCP_INSTRUCTIONS_LOCK: std::sync::LazyLock<TestStateLock> =
+    std::sync::LazyLock::new(TestStateLock::new);
 
 #[cfg(test)]
 pub(crate) fn set_mcp_server_instructions_for_test(name: &str, instructions: Option<&str>) {
@@ -485,8 +486,7 @@ pub async fn process_mcp_result(
     }
 
     if crate::utils::env_utils::is_env_defined_falsy(
-        std::env::var("ENABLE_MCP_LARGE_OUTPUT_FILES")
-            .ok()
+        crate::utils::process_env::var("ENABLE_MCP_LARGE_OUTPUT_FILES")
             .as_deref(),
     ) || content_contains_images(&transformed.content)
     {
@@ -592,8 +592,7 @@ fn project_mcp_server_tools(
                         .as_ref()
                         .is_some_and(|config| config.transport == Transport::Sdk)
                         && crate::utils::env_utils::is_env_truthy(
-                            std::env::var("CLAUDE_AGENT_SDK_MCP_NO_PREFIX")
-                                .ok()
+                            crate::utils::process_env::var("CLAUDE_AGENT_SDK_MCP_NO_PREFIX")
                                 .as_deref(),
                         );
                     crate::types::tools::Tool {
@@ -831,8 +830,7 @@ pub fn resolve_mcp_tool_invocation(
                     .as_ref()
                     .is_some_and(|config| config.transport == Transport::Sdk)
                     && crate::utils::env_utils::is_env_truthy(
-                        std::env::var("CLAUDE_AGENT_SDK_MCP_NO_PREFIX")
-                            .ok()
+                        crate::utils::process_env::var("CLAUDE_AGENT_SDK_MCP_NO_PREFIX")
                             .as_deref(),
                     );
                 let candidate = if skip_prefix {
@@ -1281,13 +1279,11 @@ mod runtime {
             .display()
             .to_string();
         let hook_context = crate::services::hooks::HookContext {
-            cwd: cwd.clone(),
-            project_dir: cwd,
+            cwd,
             permission_mode: loaded_hooks.merged_settings.default_permission_mode,
             ..Default::default()
         };
-        let base_env = crate::services::hooks::build_hook_env_vars(&hook_context);
-        Some((config, hook_context, base_env))
+        Some((config, hook_context, Vec::new()))
     }
 
     async fn run_elicitation_hooks_for_request(
@@ -1985,12 +1981,9 @@ mod runtime {
         headers: BTreeMap<String, String>,
     ) -> anyhow::Result<LegacySseTransport> {
         // Maps to: CC `new SSEClientTransport(new URL(serverRef.url), ...)`.
-        // Rust-only transport initialization: CC uses Node's HTTP/TLS stack;
-        // Cometix compiles reqwest/rustls with `rustls-no-provider`, so tests
-        // and library callers that do not enter `main()` still need the
-        // selected crypto provider installed before building the HTTP client.
-        crate::utils::tls_provider::install_crypto_provider();
-        let client = reqwest::Client::new();
+        // Its event stream spreads `getProxyFetchOptions()` (`client.ts:657-669`)
+        // and its POSTs take the global `fetch`: the same transport.
+        let client = crate::utils::proxy::get_proxy_fetch_options(false)?.build()?;
         let mut request = client.get(url).header("Accept", "text/event-stream");
         for (key, value) in &headers {
             request = request.header(key, value);
@@ -2051,8 +2044,7 @@ mod runtime {
     }
 
     fn connection_timeout_ms() -> u64 {
-        std::env::var("MCP_TIMEOUT")
-            .ok()
+        crate::utils::process_env::var("MCP_TIMEOUT")
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(DEFAULT_MCP_CONNECTION_TIMEOUT_MS)
@@ -2061,8 +2053,7 @@ mod runtime {
     /// Maps to: CC `services/mcp/client.ts:552-554`
     /// `getMcpServerConnectionBatchSize`.
     pub(super) fn get_mcp_server_connection_batch_size() -> usize {
-        std::env::var("MCP_SERVER_CONNECTION_BATCH_SIZE")
-            .ok()
+        crate::utils::process_env::var("MCP_SERVER_CONNECTION_BATCH_SIZE")
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(3)
@@ -2071,8 +2062,7 @@ mod runtime {
     /// Maps to: CC `services/mcp/client.ts:556-561`
     /// `getRemoteMcpServerConnectionBatchSize`.
     pub(super) fn get_remote_mcp_server_connection_batch_size() -> usize {
-        std::env::var("MCP_REMOTE_SERVER_CONNECTION_BATCH_SIZE")
-            .ok()
+        crate::utils::process_env::var("MCP_REMOTE_SERVER_CONNECTION_BATCH_SIZE")
             .and_then(|value| value.parse::<usize>().ok())
             .filter(|value| *value > 0)
             .unwrap_or(20)
@@ -2092,7 +2082,7 @@ mod runtime {
 
     fn mcp_auth_cache_path() -> PathBuf {
         // Maps to: CC `getMcpAuthCachePath()`.
-        crate::utils::config::get_config_home().join("mcp-needs-auth-cache.json")
+        crate::utils::env_utils::get_claude_config_home_dir().join("mcp-needs-auth-cache.json")
     }
 
     fn remote_transport_uses_auth_cache(transport: Transport) -> bool {
@@ -2154,6 +2144,8 @@ mod runtime {
             .ok_or_else(|| anyhow::anyhow!("stdio MCP server is missing command"))?;
         let mut cmd = Command::new(command);
         cmd.args(&config.args);
+        // CC client.ts:953-956: `{ ...subprocessEnv(), ...serverRef.env }`.
+        crate::utils::subprocess_env::apply_subprocess_env(&mut cmd);
         cmd.envs(&config.env);
         cmd.stderr(Stdio::piped());
         Ok(cmd)
@@ -2284,20 +2276,28 @@ mod runtime {
         config: &ScopedMcpServerConfig,
         url: &str,
     ) -> anyhow::Result<RunningService<RoleClient, CometixMcpClientHandler>> {
-        // Rust-only transport initialization: CC uses Node's HTTP/TLS stack;
-        // Cometix compiles reqwest/rustls with `rustls-no-provider`, so tests
-        // and library callers that do not enter `main()` still need the
-        // selected crypto provider installed before building the HTTP client.
-        crate::utils::tls_provider::install_crypto_provider();
-
         let mut transport_config = streamable_http_config(name, config, url).await?;
         if transport_config.auth_header.as_deref() == Some("") {
             transport_config.auth_header = None;
         }
-        let transport = StreamableHttpClientTransport::from_config(transport_config);
+        let transport = StreamableHttpClientTransport::with_client(
+            streamable_http_client()?,
+            transport_config,
+        );
         let handler = CometixMcpClientHandler::new(name);
         let timeout = Duration::from_millis(connection_timeout_ms());
         Ok(tokio::time::timeout(timeout, serve_client(handler, transport)).await??)
+    }
+
+    /// The client rmcp's Streamable HTTP transport sends with. CC spreads
+    /// `getProxyFetchOptions()` into the transport's `requestInit`
+    /// (`client.ts:815-831`, `:887`). rmcp's own default has no idle pool and
+    /// follows no redirect (`default_http_client`); both are kept.
+    pub(super) fn streamable_http_client() -> anyhow::Result<reqwest::Client> {
+        Ok(crate::utils::proxy::get_proxy_fetch_options(false)?
+            .pool_max_idle_per_host(0)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()?)
     }
 
     async fn serve_claude_ai_proxy_http_with_token(
@@ -2308,7 +2308,10 @@ mod runtime {
         // Rust/rmcp transport boundary for the source's nested `doRequest`:
         // each retry must start a new service with the bearer token it sends.
         let transport_config = claude_ai_proxy_http_config(proxy_url, token)?;
-        let transport = StreamableHttpClientTransport::from_config(transport_config);
+        let transport = StreamableHttpClientTransport::with_client(
+            streamable_http_client()?,
+            transport_config,
+        );
         let handler = CometixMcpClientHandler::new(name);
         let timeout = Duration::from_millis(connection_timeout_ms());
         Ok(tokio::time::timeout(timeout, serve_client(handler, transport)).await??)
@@ -3631,7 +3634,7 @@ mod runtime {
         meta: Option<Map<String, Value>>,
     ) -> Result<Value, (anyhow::Error, Option<ScopedMcpServerConfig>)> {
         let timeout = Duration::from_millis(super::get_mcp_tool_timeout_ms_from_env(|key| {
-            std::env::var(key).ok()
+            crate::utils::process_env::var(key)
         }));
         let (peer, config) = {
             let clients = CONNECTED_CLIENTS.lock().unwrap();
@@ -4130,10 +4133,64 @@ pub use runtime::{
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use image::GenericImageView;
     use std::collections::BTreeMap;
     use std::io::{Read as _, Write as _};
+
+    /// rmcp's Streamable HTTP default follows no redirect, so a server's
+    /// custom headers never reach a redirect target; the proxy-aware client
+    /// keeps that.
+    #[cfg(feature = "mcp_runtime")]
+    #[tokio::test]
+    async fn streamable_http_client_follows_no_redirect() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _lock = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let _env: Vec<_> = ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY", "no_proxy"]
+            .into_iter()
+            .map(EnvVarGuard::unset)
+            .chain([EnvVarGuard::set("NO_PROXY", "127.0.0.1")])
+            .collect();
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_address = target.local_addr().unwrap();
+        let target_hit = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hit = target_hit.clone();
+        let target_server = tokio::spawn(async move {
+            let (mut stream, _) = target.accept().await.unwrap();
+            hit.store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+        });
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin_address = origin.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            let _ = stream.read(&mut buffer).await;
+            let reply = format!(
+                "HTTP/1.1 302 Found\r\nlocation: http://{target_address}/leak\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        });
+
+        let response = super::runtime::streamable_http_client()
+            .unwrap()
+            .get(format!("http://{origin_address}/mcp"))
+            .header("x-api-key", "secret")
+            .send()
+            .await
+            .unwrap();
+        server.await.unwrap();
+        target_server.abort();
+        assert_eq!(response.status(), 302);
+        // A followed redirect reaches the target before `send` resolves.
+        assert!(!target_hit.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     #[test]
     fn resource_helper_callback_scope_and_reconnect_match_actual_bun_oracle() {
@@ -4249,7 +4306,7 @@ mod tests {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn ide_identity_change_sends_official_reset_object_through_registered_sink() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = async_channel::unbounded();
@@ -4272,7 +4329,7 @@ mod tests {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn per_connection_ide_sink_drop_releases_only_that_connections_sender() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (tx, rx) = async_channel::unbounded::<crate::hooks::use_ide_selection::IdeSelection>();
@@ -4403,7 +4460,7 @@ mod tests {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn mcp_connection_batch_size_env_matches_official_defaults() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _local = EnvVarGuard::unset("MCP_SERVER_CONNECTION_BATCH_SIZE");
@@ -4659,10 +4716,10 @@ mod tests {
 
     #[tokio::test]
     async fn truncate_mcp_content_compresses_image_blocks_to_remaining_budget_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _max = crate::utils::env_utils::EnvVarGuard::set("MAX_MCP_OUTPUT_TOKENS", "100");
+        let _max = EnvVarGuard::set("MAX_MCP_OUTPUT_TOKENS", "100");
         let content = serde_json::json!([
             {
                 "type": "image",
@@ -4695,7 +4752,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_mcp_result_persists_large_non_image_output_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_cwd = crate::bootstrap::state::get_original_cwd();
         let previous_session_id = crate::bootstrap::state::get_session_id();
         let root =
@@ -5186,9 +5243,9 @@ mod tests {
             resources: Vec::new(),
         }]);
 
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let key = "CLAUDE_AGENT_SDK_MCP_NO_PREFIX";
-        let _prefix = crate::utils::env_utils::EnvVarGuard::unset(key);
+        let _prefix = EnvVarGuard::unset(key);
         refresh_flat_mcp_capabilities(&mut state);
 
         // Maps to: CC `client.ts:1774` — `mcpInfo` holds the unnormalized server
@@ -5381,7 +5438,7 @@ mod tests {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn channel_custom_notification_emits_callback_observation() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5458,7 +5515,7 @@ mod tests {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn channel_permission_custom_notification_emits_callback_observation() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5514,7 +5571,7 @@ mod tests {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn url_elicitation_prefers_the_sdk_handler_over_the_queue() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5571,7 +5628,7 @@ mod tests {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn url_elicitation_required_retry_queue_accept_and_decline_paths() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -5660,7 +5717,7 @@ mod tests {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn stdio_url_elicitation_required_retries_after_user_accepts() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let script_path = std::env::temp_dir().join(format!(
             "cometix-mcp-url-elicit-{}.mjs",
             uuid::Uuid::new_v4()
@@ -5807,7 +5864,7 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn stdio_tools_list_changed_notification_refreshes_live_tools() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let script_path = std::env::temp_dir().join(format!(
             "cometix-mcp-tools-list-changed-{}.mjs",
             uuid::Uuid::new_v4()
@@ -5921,7 +5978,7 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn stdio_prompts_and_resources_list_changed_refresh_live_state() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let script_path = std::env::temp_dir().join(format!(
             "cometix-mcp-prompts-resources-list-changed-{}.mjs",
             uuid::Uuid::new_v4()
@@ -6087,7 +6144,7 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn stdio_read_mcp_resource_reads_text_content_from_live_server() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let script_path = std::env::temp_dir().join(format!(
             "cometix-mcp-read-resource-{}.mjs",
             uuid::Uuid::new_v4()
@@ -6201,7 +6258,7 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn stdio_read_mcp_resource_checks_resource_capability_like_official_tool() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let script_path = std::env::temp_dir().join(format!(
             "cometix-mcp-read-resource-no-capability-{}.mjs",
             uuid::Uuid::new_v4()
@@ -6287,7 +6344,7 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn stdio_get_mcp_prompt_for_command_fetches_live_prompt_content() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let script_path = std::env::temp_dir().join(format!(
             "cometix-mcp-get-prompt-{}.mjs",
             uuid::Uuid::new_v4()
@@ -6400,7 +6457,7 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn streamable_http_connects_and_discovers_tools_from_live_server() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6560,7 +6617,7 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn legacy_sse_connects_and_discovers_tools_from_live_server() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6750,7 +6807,7 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn websocket_connects_and_discovers_tools_from_live_server() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6915,11 +6972,11 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn streamable_http_401_challenge_returns_unavailable_without_credential_or_auth_cache_write() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let config_home =
             std::env::temp_dir().join(format!("cometix-mcp-http-401-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&config_home).expect("create config home");
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7012,7 +7069,7 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn streamable_http_call_mcp_tool_uses_live_peer_and_meta() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -7244,11 +7301,11 @@ rl.on('line', line => {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn cached_needs_auth_skips_remote_probe_and_projects_auth_tool() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let temp_dir =
             std::env::temp_dir().join(format!("cometix-mcp-auth-cache-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &temp_dir);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &temp_dir);
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

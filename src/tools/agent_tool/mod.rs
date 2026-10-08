@@ -26,13 +26,18 @@ pub mod resume_agent;
 pub mod run_agent;
 pub mod ui;
 
-/// Maps to CC `AgentTool.tsx:145-147` `isBackgroundTasksDisabled`.
+/// Maps to CC `AgentTool.tsx:145-147` module-level `isBackgroundTasksDisabled`,
+/// evaluated at import, before `init()` applies settings env.
+/// `entrypoints/cli.rs` forces it in the startup window, as BashTool's.
+pub(crate) static IS_BACKGROUND_TASKS_DISABLED: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| {
+        crate::utils::env_utils::is_env_truthy(
+            crate::utils::process_env::var("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS").as_deref(),
+        )
+    });
+
 fn is_background_tasks_disabled() -> bool {
-    crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")
-            .ok()
-            .as_deref(),
-    )
+    *IS_BACKGROUND_TASKS_DISABLED
 }
 
 /// Maps to CC `AgentTool.tsx:252-254` — the fork gate routes every spawn
@@ -159,7 +164,7 @@ pub fn agent_tool_schema() -> crate::types::tools::Tool {
     // token estimation) — CC's counterparts of those call `tool.prompt(...)`
     // per read (`utils/toolSearch.ts:350`, `utils/analyzeContext.ts:652`), an
     // explicit remaining seam on those two paths only.
-    let agent_definitions = load_agents_dir::get_agent_definitions_with_overrides_readonly(
+    let agent_definitions = load_agents_dir::get_agent_definitions_with_overrides(
         &crate::bootstrap::state::get_original_cwd(),
     );
 
@@ -298,9 +303,7 @@ fn can_read_agent_output_file(context: &crate::tool::ToolUseContext) -> bool {
 /// Maps to CC `AgentTool.tsx#getAutoBackgroundMs` env branch.
 fn get_auto_background_ms_for_agent_tool() -> Option<u64> {
     crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_AUTO_BACKGROUND_TASKS")
-            .ok()
-            .as_deref(),
+        crate::utils::process_env::var("CLAUDE_AUTO_BACKGROUND_TASKS").as_deref(),
     )
     .then_some(120_000)
 }
@@ -2302,12 +2305,9 @@ impl crate::tool::ToolCall for AgentTool {
                 &request.tool_use_id,
                 on_progress,
             );
-            let foreground_registration = (!crate::utils::env_utils::is_env_truthy(
-                std::env::var("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS")
-                    .ok()
-                    .as_deref(),
-            ))
-            .then(|| {
+            // CC `:1104` `if (!isBackgroundTasksDisabled)`, the module-level
+            // constant.
+            let foreground_registration = (!is_background_tasks_disabled()).then(|| {
                 crate::tasks::local_agent_task::register_agent_foreground_with_store(
                     crate::tasks::local_agent_task::RegisterAgentForegroundParams {
                         // CC `:1106` `agentId: syncAgentId` — the registration
@@ -2596,11 +2596,11 @@ impl crate::tool::ToolCall for AgentTool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn agent_tool_schema_matches_official_base_input_shape() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _background = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
         let _fork_gate = fork_subagent::fork_gate_environment();
         let schema = agent_tool_schema();
@@ -2677,7 +2677,7 @@ mod tests {
     /// again, which is the leg this test is named for.
     #[test]
     fn agent_tool_schema_omits_background_when_gate_is_off() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fork_vetoed = fork_subagent::fork_veto_environment();
         let _disabled = EnvVarGuard::set("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "true");
         assert!(!fork_subagent::is_fork_subagent_enabled());
@@ -2703,7 +2703,7 @@ mod tests {
     /// emits the property at all.
     #[test]
     fn agent_tool_schema_advertises_background_when_neither_gate_omits_it() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _fork_vetoed = fork_subagent::fork_veto_environment();
         let _background = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
         let schema = agent_tool_schema();
@@ -2720,7 +2720,7 @@ mod tests {
 
     #[test]
     fn agent_tool_team_name_resolution_matches_teammate_context_order() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let context = crate::tool::ToolUseContext::default();
         {
             let _teams = EnvVarGuard::unset("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS");
@@ -2795,7 +2795,7 @@ mod tests {
 
     #[test]
     fn auto_background_ms_matches_official_env_gate() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         {
             let _auto = EnvVarGuard::unset("CLAUDE_AUTO_BACKGROUND_TASKS");
             assert_eq!(get_auto_background_ms_for_agent_tool(), None);
@@ -2869,7 +2869,7 @@ mod tests {
     #[test]
     fn execution_gate_rejects_bad_isolation_before_the_tool_runs() {
         use crate::services::tools::tool_execution::validate_tool_input_against_schema;
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _background = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS");
         let tool = agent_tool_schema();
 
@@ -3068,7 +3068,7 @@ mod tests {
     #[test]
     fn prompt_deny_rule_removes_agent_type_from_rendered_description() {
         use crate::tool::ToolCall as _;
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::utils::process_env::remove("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES");
@@ -3105,7 +3105,7 @@ mod tests {
     #[test]
     fn prompt_allowed_agent_types_narrows_the_rendered_listing() {
         use crate::tool::ToolCall as _;
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::utils::process_env::remove("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES");
@@ -3134,7 +3134,7 @@ mod tests {
     #[test]
     fn prompt_filters_agents_with_unmet_mcp_requirements_from_the_listing() {
         use crate::tool::ToolCall as _;
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::utils::process_env::remove("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES");
@@ -3654,7 +3654,7 @@ mod tests {
     #[test]
     fn agent_tool_rejects_nested_teammate_spawn_before_backend_execution() {
         use crate::tool::ToolCall;
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _teams = EnvVarGuard::set("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
         let _teammate_lock = crate::utils::teammate::TEST_TEAMMATE_CONTEXT_LOCK
             .lock()
@@ -3708,7 +3708,7 @@ mod tests {
     #[tokio::test]
     async fn agent_tool_rejects_in_process_teammate_background_before_runtime() {
         use crate::tool::ToolCall;
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _teams = EnvVarGuard::set("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
         let teammate_context = crate::utils::teammate_context::create_teammate_context(
             crate::utils::teammate_context::CreateTeammateContextConfig {
@@ -4127,7 +4127,7 @@ mod tests {
     /// truthy and wins; only `''` falls through to the context.
     #[test]
     fn team_name_resolution_uses_js_truthiness_not_trimming() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _teams = EnvVarGuard::set("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS", "1");
         let _teammate_lock = crate::utils::teammate::TEST_TEAMMATE_CONTEXT_LOCK
             .lock()
@@ -4147,7 +4147,7 @@ mod tests {
     /// branch — it reaches the lookup as `''` and misses every agent.
     #[test]
     fn empty_subagent_type_takes_the_not_found_path_like_official() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _fork_gate = fork_subagent::fork_gate_environment();
         let context = context_with_agent_definitions(vec![
             crate::tools::agent_tool::built_in::general_purpose_agent::general_purpose_agent(),
@@ -4196,7 +4196,7 @@ mod tests {
     /// is false. CC takes this arm for every headless and coordinator session.
     #[test]
     fn a_vetoed_fork_gate_defaults_a_missing_subagent_type_to_general_purpose() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _fork_vetoed = fork_subagent::fork_veto_environment();
         let context = context_with_agent_definitions(vec![
             crate::tools::agent_tool::built_in::general_purpose_agent::general_purpose_agent(),
@@ -4220,7 +4220,7 @@ mod tests {
     /// [`tests::a_compacted_fork_child_is_still_refused_by_the_query_source_check`].
     #[test]
     fn a_fork_child_cannot_fork_again() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _fork_gate = fork_subagent::fork_gate_environment();
         let mut context = context_with_agent_definitions(vec![
             crate::tools::agent_tool::built_in::general_purpose_agent::general_purpose_agent(),
@@ -4292,7 +4292,7 @@ mod tests {
     /// The gate is live: `c73d313` turned `FORK_SUBAGENT` on.
     #[test]
     fn a_compacted_fork_child_is_still_refused_by_the_query_source_check() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _fork_gate = fork_subagent::fork_gate_environment();
         let mut context = context_with_agent_definitions(vec![
             crate::tools::agent_tool::built_in::general_purpose_agent::general_purpose_agent(),
@@ -4364,7 +4364,7 @@ mod tests {
     /// reason the widening carries the agent type rather than a boolean.
     #[test]
     fn a_non_fork_subagent_query_source_does_not_trip_the_fork_guard() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _fork_gate = fork_subagent::fork_gate_environment();
         let mut context = context_with_agent_definitions(vec![
             crate::tools::agent_tool::built_in::general_purpose_agent::general_purpose_agent(),
@@ -4806,7 +4806,7 @@ mod tests {
     /// `finish_async_agent_run` had no `finally` at all.
     #[tokio::test]
     async fn the_background_terminal_releases_the_agent_scoped_skill_and_dump_state() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _task_lock = crate::tasks::local_agent_task::TEST_LOCAL_AGENT_TASK_LOCK
             .lock()
             .unwrap();
@@ -4889,7 +4889,7 @@ mod tests {
     /// Old shape: FAILS (no hang).
     #[tokio::test]
     async fn the_agent_scoped_release_also_covers_the_killed_and_failed_terminals() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _task_lock = crate::tasks::local_agent_task::TEST_LOCAL_AGENT_TASK_LOCK
             .lock()
             .unwrap();
@@ -5207,7 +5207,7 @@ mod tests {
     /// `classifyHandoffIfNeeded`'s mode gate and prepend nothing.
     #[tokio::test]
     async fn foreground_completion_prepends_the_handoff_warning_from_live_state() {
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let _force = EnvVarGuard::set("COMETIX_AUTO_CLASSIFIER_FORCE", "block");
         let context = handoff_classifier_context(
             crate::types::permissions::PermissionMode::Default,
@@ -5242,7 +5242,7 @@ mod tests {
     /// test and the one above symmetrically.
     #[tokio::test]
     async fn foreground_handoff_classifier_ignores_the_query_start_snapshot() {
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let _force = EnvVarGuard::set("COMETIX_AUTO_CLASSIFIER_FORCE", "block");
         let context = handoff_classifier_context(
             crate::types::permissions::PermissionMode::Auto,
@@ -5271,7 +5271,7 @@ mod tests {
     /// `:603`) — the #147 distinction `prepend_handoff_warning` documents.
     #[tokio::test]
     async fn completed_async_agent_reads_live_permission_state_for_the_handoff_warning() {
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let _task_lock = crate::tasks::local_agent_task::TEST_LOCAL_AGENT_TASK_LOCK
             .lock()
             .unwrap();
@@ -5359,7 +5359,7 @@ mod tests {
     /// general-purpose.
     #[test]
     fn a_headless_startup_takes_the_pre_fork_branch_at_every_gate() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _pins = startup_gate_environment(&["-p", "summarise this repo"]);
@@ -5418,7 +5418,7 @@ mod tests {
     /// the headless test above would be satisfied by a gate wired shut.
     #[test]
     fn an_interactive_startup_still_takes_the_fork_branch_at_every_gate() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _pins = startup_gate_environment(&[]);
@@ -5460,7 +5460,7 @@ mod tests {
     /// why it is absent here and asserted in `main.rs` instead.
     #[test]
     fn the_flagless_headless_inputs_reach_the_fork_gate_too() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 

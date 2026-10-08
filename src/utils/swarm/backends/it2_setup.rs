@@ -56,6 +56,8 @@ pub struct SetupCommandResult {
 
 fn run_command(program: &str, args: &[&str], cwd: Option<PathBuf>) -> SetupCommandResult {
     let mut command = Command::new(program);
+    // CC `execFileNoThrow[WithCwd]` inherits process.env (execa default); the carrier is its counterpart.
+    crate::utils::subprocess_env::apply_process_env_std(&mut command);
     command.args(args);
     if let Some(cwd) = cwd {
         command.current_dir(cwd);
@@ -72,13 +74,6 @@ fn run_command(program: &str, args: &[&str], cwd: Option<PathBuf>) -> SetupComma
             code: 1,
         },
     }
-}
-
-fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// Pure decision table for CC `detectPythonPackageManager()`.
@@ -148,9 +143,13 @@ pub fn install_command_for_package_manager(
 /// backend detection.
 pub async fn install_it2(package_manager: PythonPackageManager) -> It2InstallResult {
     let (program, args) = install_command_for_package_manager(package_manager);
-    let mut result = run_command(program, &args, Some(home_dir()));
+    let mut result = run_command(program, &args, Some(crate::utils::node_os::homedir()));
     if package_manager == PythonPackageManager::Pip && result.code != 0 {
-        result = run_command("pip3", &["install", "--user", "it2"], Some(home_dir()));
+        result = run_command(
+            "pip3",
+            &["install", "--user", "it2"],
+            Some(crate::utils::node_os::homedir()),
+        );
     }
 
     if result.code != 0 {
@@ -271,18 +270,7 @@ pub fn get_prefer_tmux_over_iterm2() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-    }
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     fn temp_config_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -382,11 +370,11 @@ mod tests {
 
     #[test]
     fn it2_setup_config_flags_match_official_global_config_keys() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let dir = temp_config_dir("flags");
-        let _config_guard = EnvGuard::set("CLAUDE_CONFIG_DIR", &dir);
-        let _session_write_guard = EnvGuard::set("SESSION_WRITE_ENABLED", "1");
-        let _write_guard = EnvGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
+        let _session_write_guard = EnvVarGuard::set("SESSION_WRITE_ENABLED", "1");
+        let _write_guard = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
 
         assert!(!get_prefer_tmux_over_iterm2());
         mark_it2_setup_complete().unwrap();
@@ -396,7 +384,7 @@ mod tests {
         assert_eq!(config.iterm2_it2_setup_complete, Some(true));
         assert_eq!(config.prefer_tmux_over_iterm2, Some(true));
 
-        let raw = std::fs::read_to_string(crate::utils::config::get_global_config_path()).unwrap();
+        let raw = std::fs::read_to_string(crate::utils::env::get_global_claude_file()).unwrap();
         assert!(raw.contains("iterm2It2SetupComplete"));
         assert!(raw.contains("preferTmuxOverIterm2"));
     }

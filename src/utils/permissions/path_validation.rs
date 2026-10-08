@@ -13,6 +13,7 @@ use crate::tool::ToolPermissionContext;
 use crate::types::permissions::{PermissionBehavior, PermissionMode};
 #[cfg(test)]
 use crate::types::permissions::{PermissionRuleSource, PermissionRuleValue};
+use crate::utils::fs_operations::{self, get_fs_implementation};
 use crate::utils::permissions::filesystem::{
     FilePermissionType, PathSafetyForAutoEdit, check_editable_internal_path,
     check_path_safety_for_auto_edit, check_readable_internal_path, matching_rule_for_input,
@@ -97,9 +98,11 @@ pub fn expand_tilde(path: &str) -> String {
         || path.starts_with("~/")
         || (cfg!(target_os = "windows") && path.starts_with("~\\"))
     {
-        if let Some(home) = home_dir() {
-            return format!("{home}{}", &path[1..]);
-        }
+        return format!(
+            "{}{}",
+            crate::utils::node_os::homedir().display(),
+            &path[1..]
+        );
     }
     path.to_string()
 }
@@ -149,6 +152,7 @@ pub fn is_path_allowed(
     operation_type: FileOperationType,
     precomputed_paths_to_check: Option<&[String]>,
 ) -> PathCheckResult {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let permission_type = if operation_type == FileOperationType::Read {
         FilePermissionType::Read
     } else {
@@ -160,6 +164,7 @@ pub fn is_path_allowed(
         context,
         permission_type,
         PermissionBehavior::Deny,
+        &cwd,
     ) {
         return PathCheckResult {
             allowed: false,
@@ -168,7 +173,7 @@ pub fn is_path_allowed(
     }
 
     if operation_type != FileOperationType::Read {
-        if let Some(reason) = check_editable_internal_path(resolved_path) {
+        if let Some(reason) = check_editable_internal_path(resolved_path, &cwd) {
             return PathCheckResult {
                 allowed: true,
                 decision_reason: Some(reason),
@@ -207,7 +212,7 @@ pub fn is_path_allowed(
     }
 
     if operation_type == FileOperationType::Read {
-        if let Some(reason) = check_readable_internal_path(resolved_path) {
+        if let Some(reason) = check_readable_internal_path(resolved_path, &cwd) {
             return PathCheckResult {
                 allowed: true,
                 decision_reason: Some(reason),
@@ -232,6 +237,7 @@ pub fn is_path_allowed(
         context,
         permission_type,
         PermissionBehavior::Allow,
+        &cwd,
     ) {
         return PathCheckResult {
             allowed: true,
@@ -254,8 +260,12 @@ pub fn validate_glob_pattern(
 ) -> ResolvedPathCheckResult {
     if contains_path_traversal(clean_path) {
         let absolute_path = absolute_path(clean_path, cwd);
-        let (resolved_path, is_canonical) = safe_resolve_path(&absolute_path);
-        let paths = is_canonical.then(|| vec![resolved_path.clone()]);
+        let result = fs_operations::safe_resolve_path(
+            get_fs_implementation().as_ref(),
+            Path::new(&absolute_path),
+        );
+        let resolved_path = result.resolved_path.to_string_lossy().into_owned();
+        let paths = result.is_canonical.then(|| vec![resolved_path.clone()]);
         let result = is_path_allowed(
             &resolved_path,
             tool_permission_context,
@@ -271,8 +281,12 @@ pub fn validate_glob_pattern(
 
     let base_path = get_glob_base_directory(clean_path);
     let absolute_base_path = absolute_path(&base_path, cwd);
-    let (resolved_path, is_canonical) = safe_resolve_path(&absolute_base_path);
-    let paths = is_canonical.then(|| vec![resolved_path.clone()]);
+    let result = fs_operations::safe_resolve_path(
+        get_fs_implementation().as_ref(),
+        Path::new(&absolute_base_path),
+    );
+    let resolved_path = result.resolved_path.to_string_lossy().into_owned();
+    let paths = result.is_canonical.then(|| vec![resolved_path.clone()]);
     let result = is_path_allowed(
         &resolved_path,
         tool_permission_context,
@@ -303,10 +317,9 @@ pub fn is_dangerous_removal_path(resolved_path: &str) -> bool {
         return true;
     }
 
-    if let Some(home) = home_dir() {
-        if normalized_path == collapse_to_forward_slashes(&home) {
-            return true;
-        }
+    let home = crate::utils::node_os::homedir();
+    if normalized_path == collapse_to_forward_slashes(&home.to_string_lossy()) {
+        return true;
     }
 
     if parent_dir_string(&normalized_path).as_deref() == Some("/") {
@@ -374,8 +387,12 @@ pub fn validate_path(
     }
 
     let absolute_path = absolute_path(&clean_path, cwd);
-    let (resolved_path, is_canonical) = safe_resolve_path(&absolute_path);
-    let paths = is_canonical.then(|| vec![resolved_path.clone()]);
+    let result = fs_operations::safe_resolve_path(
+        get_fs_implementation().as_ref(),
+        Path::new(&absolute_path),
+    );
+    let resolved_path = result.resolved_path.to_string_lossy().into_owned();
+    let paths = result.is_canonical.then(|| vec![resolved_path.clone()]);
     let result = is_path_allowed(
         &resolved_path,
         tool_permission_context,
@@ -398,9 +415,8 @@ fn contains_path_traversal(path: &str) -> bool {
 }
 
 fn strip_surrounding_quotes(path: &str) -> String {
-    path.trim_start_matches(['\'', '"'])
-        .trim_end_matches(['\'', '"'])
-        .to_string()
+    let path = path.strip_prefix(['\'', '"']).unwrap_or(path);
+    path.strip_suffix(['\'', '"']).unwrap_or(path).to_string()
 }
 
 fn has_glob_pattern(path: &str) -> bool {
@@ -409,22 +425,14 @@ fn has_glob_pattern(path: &str) -> bool {
 
 fn absolute_path(path: &str, cwd: &str) -> String {
     let path_buf = PathBuf::from(path);
-    if path_buf.is_absolute() {
-        normalize_path_string(path)
+    if crate::utils::fs_operations::native::is_absolute(&path_buf) {
+        path.to_string()
     } else {
-        normalize_path_string(&Path::new(cwd).join(path_buf).display().to_string())
+        crate::utils::fs_operations::native::resolve_path(Path::new(cwd), &path_buf)
+            .expect("node:path.resolve could not obtain the current directory")
+            .to_string_lossy()
+            .into_owned()
     }
-}
-
-fn safe_resolve_path(path: &str) -> (String, bool) {
-    match Path::new(path).canonicalize() {
-        Ok(resolved) => (resolved.display().to_string(), true),
-        Err(_) => (normalize_path_string(path), false),
-    }
-}
-
-fn normalize_path_string(path: &str) -> String {
-    normalize_path_buf(Path::new(path)).display().to_string()
 }
 
 fn normalize_path_buf(path: impl AsRef<Path>) -> PathBuf {
@@ -464,15 +472,25 @@ fn parent_dir_string(path: &str) -> Option<String> {
         .map(|parent| collapse_to_forward_slashes(&parent.display().to_string()))
 }
 
-fn home_dir() -> Option<String> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn absolute_path_matches_official_preserved_absolute_and_resolve() {
+        assert_eq!(super::absolute_path("/a/../b", "/cwd"), "/a/../b");
+        #[cfg(not(windows))]
+        assert_eq!(super::absolute_path("a/../b", "/cwd"), "/cwd/b");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn absolute_path_matches_official_windows_root_and_drive_relative() {
+        assert_eq!(super::absolute_path(r"\child", r"C:\base"), r"\child");
+        assert_eq!(super::absolute_path("C:foo", r"C:\base"), r"C:\base\foo");
+        assert_eq!(super::absolute_path(r"C:\a\..\b", r"C:\base"), r"C:\a\..\b");
+    }
+
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, HOME_VAR, PinnedProjectDir, TEST_ENV_LOCK};
 
     fn ctx() -> ToolPermissionContext {
         ToolPermissionContext::default()
@@ -494,8 +512,9 @@ mod tests {
         assert_eq!(get_glob_base_directory("*.txt"), ".");
         assert_eq!(get_glob_base_directory("/tmp/no-glob"), "/tmp/no-glob");
 
-        let home = home_dir().unwrap_or_else(|| "~".to_string());
-        assert_eq!(expand_tilde("~/file"), format!("{home}/file"));
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set(HOME_VAR, "/home/someone");
+        assert_eq!(expand_tilde("~/file"), "/home/someone/file");
         assert_eq!(expand_tilde("~root/file"), "~root/file");
     }
 
@@ -505,9 +524,9 @@ mod tests {
         assert!(is_dangerous_removal_path("/"));
         assert!(is_dangerous_removal_path("/tmp"));
         assert!(is_dangerous_removal_path("C:\\Windows"));
-        if let Some(home) = home_dir() {
-            assert!(is_dangerous_removal_path(&home));
-        }
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _home = EnvVarGuard::set(HOME_VAR, "/home/someone");
+        assert!(is_dangerous_removal_path("/home/someone"));
         assert!(!is_dangerous_removal_path("/tmp/project/file.txt"));
     }
 
@@ -574,7 +593,7 @@ mod tests {
     #[test]
     fn accept_edits_allows_safe_working_directory_writes_but_not_claude_config() {
         // "Working directory" is judged against the project dir.
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let cwd = std::env::current_dir().unwrap();
         let mut context = ToolPermissionContext {
             mode: PermissionMode::AcceptEdits,
@@ -619,6 +638,7 @@ mod tests {
             &context,
             FilePermissionType::Edit,
             PermissionBehavior::Allow,
+            &cwd,
         )
         .unwrap();
         assert_eq!(rule.source, PermissionRuleSource::Session);

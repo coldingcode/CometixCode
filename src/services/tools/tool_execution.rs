@@ -3696,10 +3696,9 @@ fn post_tool_hook_event(status: Option<ToolResultStatus>, aborted: bool) -> Post
 /// triple every tool-event hook builder is called with — CC `hooks.ts:3419`,
 /// `:3461`, `:3510`, `:3546`, `:4175`, resolved against `:301-328`.
 ///
-/// This is the SINGLE constructor for the tool family's hook context, so the
-/// JSON payload rail (`create_base_hook_input_object`) and the env rail
-/// ([`crate::services::hooks::build_hook_env_vars`]) cannot disagree: both are
-/// derived from the value this function returns for one `ToolUseContext`.
+/// This is the SINGLE constructor for the tool family's hook context, so every
+/// tool-event builder's JSON payload (`create_base_hook_input_object`) derives
+/// from the same value for one `ToolUseContext`.
 ///
 /// Field by field, at the tool-hook call site specifically:
 /// - `session_id`: CC passes `sessionId = undefined` (`:3419` et al), so
@@ -3725,31 +3724,18 @@ fn post_tool_hook_event(status: Option<ToolResultStatus>, aborted: bool) -> Post
 ///   `create_base_hook_input_object`.
 ///
 /// `session_id` and `transcript_path` used to be left at `Default::default()`
-/// here. The JSON rail hid that (its `is_empty()` fallbacks re-derive both),
-/// but `build_hook_env_vars` copies the struct fields verbatim, so every tool
-/// hook subprocess received `CLAUDE_SESSION_ID=""` and
-/// `CLAUDE_TRANSCRIPT_PATH=""`.
-///
-/// Deviation (env rail): CC's `execCommandHook` sets only `CLAUDE_PROJECT_DIR`
-/// (+ plugin/skill vars) on top of `subprocessEnv()` (`hooks.ts:881-926`); the
-/// `CLAUDE_SESSION_ID` / `CLAUDE_CWD` / `CLAUDE_TRANSCRIPT_PATH` /
-/// `CLAUDE_AGENT_ID` / `CLAUDE_AGENT_TYPE` keys are this port's own additions
-/// in `build_hook_env_vars` and are shared by every hook family. Removing them
-/// is a `services/hooks` decision, not a tool-execution one; what this function
-/// owes them is correct values.
-///
-/// `project_dir` stays the effective cwd: CC uses `getProjectRoot()`
-/// (`hooks.ts:816` — "the stable project root (not the worktree path)") and
-/// this port has no process-level project-root state to read.
+/// here; the JSON rail hid that (its `is_empty()` fallbacks re-derive both).
+/// The env rail is CC's `{ ...subprocessEnv(), CLAUDE_PROJECT_DIR }`
+/// (`hooks.ts:882-885`), which `exec_command_hook` sets itself; the
+/// session/agent variables this port used to add there were removed on
+/// 2026-10-03 (env C7).
 pub(crate) fn tool_hook_context(context: &ToolUseContext) -> crate::services::hooks::HookContext {
-    let cwd = context.effective_cwd().display().to_string();
     crate::services::hooks::HookContext {
         session_id: crate::bootstrap::state::get_session_id(),
         transcript_path: crate::utils::session_storage::get_transcript_path(None)
             .display()
             .to_string(),
-        cwd: cwd.clone(),
-        project_dir: cwd,
+        cwd: context.effective_cwd().display().to_string(),
         permission_mode: Some(
             crate::utils::permissions::permission_mode::to_external_permission_mode(
                 context.tool_permission_context.mode,
@@ -3767,8 +3753,8 @@ pub(crate) fn tool_hook_context(context: &ToolUseContext) -> crate::services::ho
 /// spread — is NOT returned here. It is [`tool_hook_context`], a pure function
 /// of the same `ToolUseContext` that every `*_with_config` hop already carries,
 /// so both rails are the same value by construction and no call site can hand
-/// the two halves a mismatched pair. `base_env` below is built from exactly
-/// that function's output.
+/// the two halves a mismatched pair. The tool family adds nothing to the hook
+/// env (`exec_command_hook` sets `CLAUDE_PROJECT_DIR`), so `base_env` is empty.
 fn load_tool_hooks_config_and_env(
     context: &ToolUseContext,
 ) -> Option<(RegisteredHooks, Vec<(String, String)>)> {
@@ -3796,8 +3782,7 @@ fn load_tool_hooks_config_and_env(
     if config.is_empty() {
         return None;
     }
-    let base_env = crate::services::hooks::build_hook_env_vars(&tool_hook_context(context));
-    Some((config, base_env))
+    Some((config, Vec::new()))
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4097,8 +4082,8 @@ mod tests {
         RenderableMessage, RenderableMessageKind, SystemMessage, ToolUseStatus,
     };
     use crate::types::permissions::PermissionRuleValue;
-    use crate::utils::env_utils::EnvVarGuard;
     use crate::utils::permissions::permissions::mock_permission_request;
+    use crate::utils::test_env::{EnvVarGuard, IsolatedProjectSettings, TEST_ENV_LOCK};
     use std::collections::HashMap;
 
     /// Parse a settings-shaped hooks fixture and fold it into the
@@ -4120,7 +4105,7 @@ mod tests {
     /// classifier's `decisionReason` was dropped upstream.
     #[test]
     fn permission_denied_hooks_match_official_auto_mode_classifier_reason() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("COMETIX_TRANSCRIPT_CLASSIFIER", "1");
 
         let with_reason = |reason: Option<
@@ -4189,8 +4174,8 @@ mod tests {
     /// loaded settings (hooks.ts session merge the doc comment cites).
     #[test]
     fn tool_hook_loader_reads_the_pinned_environment_and_session_hooks() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _settings = IsolatedProjectSettings::pin();
         let context = crate::tool::ToolUseContext::default();
 
         // The pinned environment configures no hooks anywhere.
@@ -4217,10 +4202,9 @@ mod tests {
         crate::utils::hooks::session_hooks::clear_session_hooks(&session_id);
         let (config, base_env) = loaded.expect("session hook must surface through the loader");
         assert!(!config.is_empty());
-        assert!(
-            base_env.iter().any(|(key, _)| key == "CLAUDE_PROJECT_DIR"),
-            "hook env must carry the project dir: {base_env:?}"
-        );
+        // `exec_command_hook` sets `CLAUDE_PROJECT_DIR` for every caller
+        // (CC `hooks.ts:816,882-885`); the tool family adds nothing.
+        assert!(base_env.is_empty(), "{base_env:?}");
     }
 
     /// Maps to: CC `utils/hooks.ts:301-328#createBaseHookInput`, resolved for
@@ -4229,22 +4213,26 @@ mod tests {
     /// (`:3419`, `:3461`, `:3510`, `:3546`, `:4175`).
     ///
     /// BOTH rails are asserted from ONE hook run, because they are two
-    /// projections of the same `HookContext` and only the JSON one had
-    /// fallbacks: `create_base_hook_input_object` re-derives an empty
-    /// `session_id`/`transcript_path`, `build_hook_env_vars` copies the fields
-    /// verbatim. With `..Default::default()` at the loader (the old shape) the
-    /// JSON half of this test PASSED and the env half read `""` for both keys —
-    /// a hook script doing `$CLAUDE_SESSION_ID` got the empty string. Old-shape
-    /// failure is an assertion failure on the env lines, not a hang.
+    /// projections of the same `HookContext`. The JSON rail carries the session,
+    /// transcript, cwd and agent fields; the env rail is CC's
+    /// `{ ...subprocessEnv(), CLAUDE_PROJECT_DIR }` (`hooks.ts:882-885`) and
+    /// carries none of them.
     ///
     /// `agent_id` / `agent_type` / `permission_mode` (CC `:324-326`) are the
     /// A2 half: PreToolUse could carry none of them before, so a hook could not
     /// tell a subagent's tool call from the main thread's.
     #[cfg(unix)]
     #[tokio::test]
-    async fn tool_hook_input_and_env_rails_both_carry_the_official_base_fields() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+    async fn tool_hook_input_carries_the_official_base_fields_and_env_only_the_project_dir() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        // A host value would be inherited through `subprocessEnv()`, as in CC.
+        let _absent = [
+            "CLAUDE_SESSION_ID",
+            "CLAUDE_TRANSCRIPT_PATH",
+            "CLAUDE_AGENT_ID",
+        ]
+        .map(EnvVarGuard::unset);
+        let _settings = IsolatedProjectSettings::pin();
         let _managed = crate::services::hooks::test_support::ManagedSettingsGuard::install(None);
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
 
@@ -4276,7 +4264,7 @@ mod tests {
             "Bash",
             crate::services::hooks::HookCommand {
                 command: format!(
-                    "cat > '{}'; printf '%s\\n%s\\n%s\\n' \"$CLAUDE_SESSION_ID\" \"$CLAUDE_TRANSCRIPT_PATH\" \"$CLAUDE_AGENT_ID\" > '{}'",
+                    "cat > '{}'; printf '%s\\n%s\\n%s\\n%s\\n' \"${{CLAUDE_SESSION_ID-<unset>}}\" \"${{CLAUDE_TRANSCRIPT_PATH-<unset>}}\" \"${{CLAUDE_AGENT_ID-<unset>}}\" \"$CLAUDE_PROJECT_DIR\" > '{}'",
                     input_capture.display(),
                     env_capture.display()
                 ),
@@ -4305,17 +4293,13 @@ mod tests {
         let env = std::fs::read_to_string(&env_capture).expect("the hook recorded its env");
         let _ = std::fs::remove_file(&input_capture);
         let _ = std::fs::remove_file(&env_capture);
-        let mut env_lines = env.lines();
-        let env_session_id = env_lines.next().unwrap_or_default();
-        let env_transcript_path = env_lines.next().unwrap_or_default();
-        let env_agent_id = env_lines.next().unwrap_or_default();
+        let env_lines = env.lines().collect::<Vec<_>>();
 
         // CC passes `sessionId = undefined`, so `sessionId ?? getSessionId()`
         // (`:315`) is the MAIN session — never `toolUseContext.agentId`, which
         // is the gate key above and reaches the payload as `agent_id`.
         assert!(!session_id.is_empty(), "precondition: a live session id");
         assert_eq!(payload["session_id"], serde_json::json!(session_id));
-        assert_eq!(env_session_id, session_id, "CLAUDE_SESSION_ID env rail");
 
         // `getTranscriptPathForSession(resolvedSessionId)` (`:322`).
         let transcript_path = crate::utils::session_storage::get_transcript_path(None)
@@ -4326,22 +4310,26 @@ mod tests {
             payload["transcript_path"],
             serde_json::json!(transcript_path)
         );
-        assert_eq!(
-            env_transcript_path, transcript_path,
-            "CLAUDE_TRANSCRIPT_PATH env rail"
-        );
 
         // `getCwd()` (`:323`).
-        assert_eq!(
-            payload["cwd"],
-            serde_json::json!(context.effective_cwd().display().to_string())
-        );
+        let cwd = context.effective_cwd().display().to_string();
+        assert_eq!(payload["cwd"], serde_json::json!(cwd));
 
         // The A2 triple CC reads off `toolUseContext` + `permissionMode`.
         assert_eq!(payload["agent_id"], "agent_rails");
-        assert_eq!(env_agent_id, "agent_rails", "CLAUDE_AGENT_ID env rail");
         assert_eq!(payload["agent_type"], "code-reviewer");
         assert_eq!(payload["permission_mode"], "acceptEdits");
+
+        // The env rail: `CLAUDE_PROJECT_DIR` only, from the project root that
+        // `exec_command_hook` reads (the original cwd stands in for it).
+        let project_dir = crate::bootstrap::state::get_original_cwd()
+            .display()
+            .to_string();
+        assert_eq!(
+            env_lines,
+            ["<unset>", "<unset>", "<unset>", project_dir.as_str()],
+            "hook env rail"
+        );
     }
 
     /// Maps to: CC `services/tools/toolExecution.ts:1206` (the `try` that wraps
@@ -4688,7 +4676,7 @@ mod tests {
 
     #[test]
     fn glob_large_model_result_is_persisted_at_official_effective_threshold() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let config = std::env::temp_dir().join(format!(
@@ -4733,7 +4721,7 @@ mod tests {
 
     #[test]
     fn grep_large_model_result_uses_its_20k_persistence_threshold() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let config = std::env::temp_dir().join(format!(
@@ -5837,7 +5825,7 @@ mod tests {
     async fn write_permission_transport_rejects_retargeted_dangling_symlink() {
         use std::os::unix::fs::symlink;
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!(
             "cometix-write-retarget-{}",
@@ -5900,7 +5888,7 @@ mod tests {
     async fn edit_permission_transport_pins_symlink_destination() {
         use std::os::unix::fs::symlink;
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
@@ -5999,7 +5987,7 @@ mod tests {
     async fn notebook_edit_permission_transport_rejects_retargeted_symlink() {
         use std::os::unix::fs::symlink;
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
@@ -6131,7 +6119,7 @@ mod tests {
     async fn edit_equivalence_io_error_propagates_before_pre_tool_hooks() {
         use std::os::unix::fs::symlink;
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
@@ -6192,7 +6180,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_no_write_preflight_skips_production_pre_tool_hook_side_effects() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "0");
@@ -6244,7 +6232,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_hook_path_rewrite_fails_closed_against_user_approved_destination() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
@@ -6330,7 +6318,7 @@ mod tests {
 
     #[tokio::test]
     async fn edit_execution_projects_dynamic_skill_and_read_state_effects() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
@@ -6414,7 +6402,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_execution_projects_dynamic_skill_dir_effect_into_next_context() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         crate::skills::load_skills_dir::clear_dynamic_skills();
         let root = std::env::temp_dir().join(format!(
@@ -6484,7 +6472,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_write_after_discovery_still_projects_dynamic_skill_trigger() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         crate::skills::load_skills_dir::clear_dynamic_skills();
         let root = std::env::temp_dir().join(format!(
@@ -6629,7 +6617,7 @@ mod tests {
 
     #[test]
     fn run_tool_use_deferred_schema_validation_adds_tool_search_hint_when_schema_was_not_sent() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _disable_betas_guard = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS");
         let _tool_search_guard = EnvVarGuard::unset("ENABLE_TOOL_SEARCH");
         let block = ToolUseBlock {
@@ -6676,7 +6664,7 @@ mod tests {
 
     #[test]
     fn run_tool_use_deferred_schema_validation_skips_tool_search_hint_after_discovery() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _disable_betas_guard = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS");
         let _tool_search_guard = EnvVarGuard::unset("ENABLE_TOOL_SEARCH");
         let block = ToolUseBlock {
@@ -6838,7 +6826,7 @@ mod tests {
     fn run_tool_use_nested_schema_validation_rejects_invalid_ask_user_question() {
         // `ToolUseContext::with_permission_context` resolves the live tool pool,
         // which sibling tests narrow through `CLAUDE_CODE_SIMPLE`.
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
@@ -6942,7 +6930,7 @@ mod tests {
         // `allowed-tools` reached only its own `!` blocks.
         use std::io::Write;
 
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-skill-context-modifier-{}",
             uuid::Uuid::new_v4()
@@ -7161,7 +7149,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn failing_tool_fires_post_tool_use_failure_with_is_interrupt_false() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let _managed = crate::services::hooks::test_support::ManagedSettingsGuard::install(None);
         let capture = std::env::temp_dir().join(format!(
@@ -7689,7 +7677,7 @@ mod tests {
 
     #[tokio::test]
     async fn typed_pre_tool_hook_rewrite_reaches_final_can_use_before_edit_permission() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
@@ -10230,12 +10218,12 @@ mod executor_tests {
     use crate::types::message::{ReadResultKind, SearchResultMode};
     use crate::types::permissions::PermissionMode;
     use crate::utils::cron_tasks::reset_cron_tasks_for_test;
-    use crate::utils::env_utils::EnvVarGuard;
     use crate::utils::permissions::permissions::{
         mock_permission_request, mock_permission_request_with_input,
     };
     use crate::utils::swarm::team_helpers::TEAM_TOOL_STATE;
     use crate::utils::tasks::TASK_TOOL_STORE;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     struct CwdStateGuard {
         process_cwd: std::path::PathBuf,
@@ -10303,7 +10291,7 @@ mod executor_tests {
     #[cfg(feature = "mcp_runtime")]
     #[test]
     fn local_tool_executor_runs_dynamic_mcp_tool_against_live_stdio_client() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let script_path = std::env::temp_dir().join(format!(
             "cometix-dynamic-mcp-tool-{}.mjs",
             uuid::Uuid::new_v4()
@@ -10501,7 +10489,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn local_tool_executor_times_out_bash_command() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _background = EnvVarGuard::set("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS", "1");
         let request = mock_permission_request_with_input(
             "perm-bash-timeout".to_string(),
@@ -10549,7 +10537,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn local_tool_executor_runs_background_bash_and_task_output() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let store = crate::state::store::AppStore::new(
             crate::state::app_state_store::AppState::default(),
@@ -10649,7 +10637,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn local_tool_executor_stops_background_bash_task() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let store = crate::state::store::AppStore::new(
             crate::state::app_state_store::AppState::default(),
@@ -10738,7 +10726,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn local_tool_executor_reads_file_after_permission() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _model = EnvVarGuard::set("ANTHROPIC_MODEL", "claude-sonnet-4-6");
         let path =
             std::env::temp_dir().join(format!("cometix-read-tool-{}.txt", uuid::Uuid::new_v4()));
@@ -10891,7 +10879,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn read_listener_runs_only_after_token_validation_succeeds() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _api_key = EnvVarGuard::unset("ANTHROPIC_API_KEY");
         let _auth_token = EnvVarGuard::unset("ANTHROPIC_AUTH_TOKEN");
         let _oauth_token = EnvVarGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
@@ -11107,7 +11095,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn read_then_write_updates_live_read_file_state_like_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let path = std::env::temp_dir().join(format!(
             "cometix-read-write-state-{}.txt",
@@ -11398,7 +11386,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn local_tool_executor_read_honors_structured_offset_and_limit_input() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _model = EnvVarGuard::set("ANTHROPIC_MODEL", "claude-sonnet-4-6");
         let path =
             std::env::temp_dir().join(format!("cometix-read-window-{}.txt", uuid::Uuid::new_v4()));
@@ -11445,7 +11433,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn local_tool_executor_writes_and_edits_files_after_permission() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root =
             std::env::temp_dir().join(format!("cometix-write-edit-{}", uuid::Uuid::new_v4()));
@@ -11543,7 +11531,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn local_tool_executor_plan_mode_tools_return_official_tool_results() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let config_home =
             std::env::temp_dir().join(format!("cometix-exit-plan-tool-{}", uuid::Uuid::new_v4()));
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
@@ -11654,7 +11642,7 @@ rl.on('line', line => {
     #[tokio::test]
     async fn local_tool_executor_task_v2_tools_use_in_memory_official_model_content() {
         let _task_guard = crate::utils::tasks::TASK_TOOL_TEST_LOCK.lock().unwrap();
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _temp = crate::utils::tasks::TempTaskConfig::new("executor-list");
         let create_request = mock_permission_request_with_input(
             "perm-task-create".to_string(),
@@ -12006,7 +11994,7 @@ rl.on('line', line => {
             .lock()
             .unwrap();
         let _task_lock = crate::utils::tasks::TASK_TOOL_TEST_LOCK.lock().unwrap();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let config_root = std::env::temp_dir().join(format!(
             "cometix-executor-team-tools-{}",
             uuid::Uuid::new_v4().simple()
@@ -12477,7 +12465,7 @@ rl.on('line', line => {
     #[tokio::test]
     async fn local_tool_executor_worktree_tools_create_and_exit_session() {
         // Maps to real EnterWorktree/ExitWorktree call path (no longer safe no-op).
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let cwd_state_guard = CwdStateGuard::capture();
         crate::utils::worktree::restore_worktree_session(None);
 
@@ -12721,7 +12709,7 @@ rl.on('line', line => {
 
     #[test]
     fn edit_no_write_preflight_stops_before_permission_and_hook_orchestration() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "0");
@@ -12757,7 +12745,7 @@ rl.on('line', line => {
 
     #[test]
     fn edit_semantic_validation_uses_official_error_envelope_tool_use_result_and_ui() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
@@ -12823,7 +12811,7 @@ rl.on('line', line => {
 
     #[tokio::test]
     async fn notebook_edit_no_write_preflight_skips_hooks_and_preserves_error_tool_use_result() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "0");
@@ -12878,7 +12866,7 @@ rl.on('line', line => {
 
     #[test]
     fn notebook_edit_semantic_validation_uses_error_tool_use_result_and_compact_ui() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
@@ -13387,6 +13375,7 @@ mod permission_request_hook_decision_tests {
     use super::*;
     use crate::services::hooks::{HookCallback, RegisteredHook, RegisteredHookMatcher};
     use crate::types::permissions::{PermissionDecisionReason, PermissionMode};
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use serde_json::{Value, json};
     use std::sync::Arc;
 
@@ -13449,10 +13438,10 @@ mod permission_request_hook_decision_tests {
 
     #[tokio::test]
     async fn permission_request_hook_deny_message_reason_and_terminal_result_matches_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let _managed = crate::services::hooks::test_support::ManagedSettingsGuard::install(None);
-        let _simple = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
+        let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         for reason in [Some("policy blocks this read"), Some(""), None] {
             let mut decision = json!({"behavior": "deny"});
             if let Some(reason) = reason {
@@ -13553,10 +13542,10 @@ mod permission_request_hook_decision_tests {
 
     #[tokio::test]
     async fn permission_request_hook_winning_allow_isolation_matches_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let _managed = crate::services::hooks::test_support::ManagedSettingsGuard::install(None);
-        let _simple = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
+        let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         let config = competing_decisions(
             json!({"behavior": "allow", "updatedInput": {"file_path": "/tmp/winner"}}),
             json!({"behavior": "deny", "message": "losing deny", "interrupt": true}),
@@ -13595,6 +13584,7 @@ mod pre_tool_hook_decision_tests {
     use super::*;
     use crate::services::hooks::{HookCallback, RegisteredHook, RegisteredHookMatcher};
     use crate::types::permissions::PermissionDecisionReason;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use serde_json::{Value, json};
     use std::sync::Arc;
 
@@ -13676,10 +13666,10 @@ mod pre_tool_hook_decision_tests {
 
     #[tokio::test]
     async fn pre_tool_hook_prepare_message_and_reason_matches_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let _managed = crate::services::hooks::test_support::ManagedSettingsGuard::install(None);
-        let _simple = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
+        let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         for behavior in ["allow", "ask", "deny"] {
             for reason in [Some("completion reason"), Some(""), None] {
                 let config = ordered_config(hook_output(behavior, reason), None);
@@ -13729,10 +13719,10 @@ mod pre_tool_hook_decision_tests {
 
     #[tokio::test]
     async fn pre_tool_hook_aggregated_deny_configured_terminal_matches_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let _managed = crate::services::hooks::test_support::ManagedSettingsGuard::install(None);
-        let _simple = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
+        let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         for (later, expected_reason, expected_message) in [
             (
                 hook_output("allow", Some("later allow reason")),
@@ -13810,6 +13800,7 @@ mod permission_request_mutation_tests {
     use crate::services::tools::streaming_tool_executor::streaming_hook_decision_tests::PermissionRequestFixture;
     use crate::tool::ToolPermissionContext;
     use crate::utils::query_helpers::{ReadFileStateEntry, ReadFileStateSource};
+    use crate::utils::test_env::TEST_ENV_LOCK;
     use serde_json::json;
     use std::sync::Arc;
 
@@ -13873,7 +13864,7 @@ mod permission_request_mutation_tests {
     /// permission.updatedInput replaces the approved logical call destination.
     #[tokio::test]
     async fn permission_request_hook_edit_updated_destination_matches_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let _skills = crate::skills::load_skills_dir::DynamicSkillsTestSnapshot::capture();
         crate::skills::load_skills_dir::clear_dynamic_skills();
@@ -13940,7 +13931,7 @@ mod permission_request_mutation_tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn permission_request_hook_same_edit_path_keeps_existing_destination_guard() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _trust = crate::services::hooks::test_support::SessionTrustGuard::accepted();
         let fixture = PermissionRequestFixture::new("1");
         crate::bootstrap::state::replace_registered_hooks(Default::default());

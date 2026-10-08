@@ -3,6 +3,7 @@
 //! Maps to: CC `tools/FileReadTool/limits.ts`.
 
 use crate::utils::file::MAX_OUTPUT_SIZE;
+use crate::utils::process_env::JsTruthy;
 use std::sync::OnceLock;
 
 /// Maps to: CC `DEFAULT_MAX_OUTPUT_TOKENS`.
@@ -25,10 +26,8 @@ pub struct FileReadingLimits {
 /// Maps to: CC `getEnvMaxTokens` (:24-33), including `parseInt(..., 10)`
 /// decimal-prefix behavior and JavaScript Number overflow.
 fn get_env_max_tokens() -> Option<f64> {
-    let override_value = std::env::var("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS").ok()?;
-    if override_value.is_empty() {
-        return None;
-    }
+    let override_value =
+        crate::utils::process_env::var("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS").truthy()?;
     let trimmed = override_value.trim_start_matches(|character| {
         matches!(
             character,
@@ -106,6 +105,7 @@ pub fn get_default_file_reading_limits() -> FileReadingLimits {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn default_limits_match_official_positive_caps() {
@@ -117,10 +117,8 @@ mod tests {
 
     #[test]
     fn env_parser_matches_official_javascript_parse_int_prefix_semantics() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _max = crate::utils::env_utils::EnvVarGuard::preserve(
-            "CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS",
-        );
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _max = EnvVarGuard::preserve("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS");
         let parse = |value: &str| {
             crate::utils::process_env::set("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", value);
             get_env_max_tokens()

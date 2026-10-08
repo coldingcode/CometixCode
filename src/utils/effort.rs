@@ -143,8 +143,7 @@ pub fn model_supports_effort(model: &str) -> bool {
         return false;
     }
     if crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_ALWAYS_ENABLE_EFFORT")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_ALWAYS_ENABLE_EFFORT")
             .as_deref(),
     ) {
         return true;
@@ -223,7 +222,7 @@ fn provider_supports_effort_default() -> bool {
 /// `None` = absent/invalid, `Some(None)` = `auto`/`unset`, and
 /// `Some(Some(value))` = an explicit override.
 pub fn get_effort_env_override() -> Option<Option<EffortValue>> {
-    let env_override = std::env::var("CLAUDE_CODE_EFFORT_LEVEL").ok()?;
+    let env_override = crate::utils::process_env::var("CLAUDE_CODE_EFFORT_LEVEL")?;
     let lower = env_override.to_lowercase();
     if matches!(lower.as_str(), "unset" | "auto") {
         return Some(None);
@@ -448,7 +447,7 @@ fn parse_js_parse_int_base10(value: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn parse_effort_value_matches_official_parse_int_behavior() {
@@ -490,7 +489,7 @@ mod tests {
 
     #[test]
     fn model_supports_effort_matches_official_public_model_gates() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_ALWAYS_ENABLE_EFFORT");
         crate::utils::process_env::remove("CLAUDE_CODE_USE_BEDROCK");
         crate::utils::process_env::remove("CLAUDE_CODE_USE_VERTEX");
@@ -520,7 +519,7 @@ mod tests {
 
     #[test]
     fn effort_suffix_matches_official_explicit_effort_display() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_EFFORT_LEVEL");
 
         assert_eq!(get_effort_suffix("claude-opus-4-6", None), "");
@@ -602,7 +601,7 @@ mod tests {
 
     #[test]
     fn initial_effort_setting_matches_official_canonical_settings() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let settings = InitialSettingsGuard::new();
 
         settings.set_effort_level("medium");
@@ -621,7 +620,7 @@ mod tests {
 
     #[test]
     fn effort_env_override_preserves_official_absent_auto_and_explicit_states() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _restore = EnvVarGuard::unset("CLAUDE_CODE_EFFORT_LEVEL");
 
         crate::utils::process_env::remove("CLAUDE_CODE_EFFORT_LEVEL");
@@ -641,7 +640,7 @@ mod tests {
 
     #[test]
     fn resolve_applied_effort_honors_env_unset_and_max_downgrade() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_EFFORT_LEVEL");
 
         assert_eq!(

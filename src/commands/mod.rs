@@ -447,33 +447,33 @@ fn is_internal_build() -> bool {
     )
 }
 
+/// CC `commands.ts:343`: `USER_TYPE === 'ant' && !process.env.IS_DEMO`.
 fn is_internal_non_demo() -> bool {
-    is_internal_build()
-        && !crate::utils::env_utils::is_env_truthy(std::env::var("IS_DEMO").ok().as_deref())
+    use crate::utils::process_env::JsTruthy as _;
+    is_internal_build() && crate::utils::process_env::var("IS_DEMO").truthy().is_none()
 }
 
 fn compact_enabled() -> bool {
-    !crate::utils::env_utils::is_env_truthy(std::env::var("DISABLE_COMPACT").ok().as_deref())
+    !crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("DISABLE_COMPACT").as_deref())
 }
 
 fn doctor_enabled() -> bool {
-    !crate::utils::env_utils::is_env_truthy(std::env::var("DISABLE_DOCTOR_COMMAND").ok().as_deref())
+    !crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("DISABLE_DOCTOR_COMMAND").as_deref())
 }
 
 fn install_github_app_enabled() -> bool {
     !crate::utils::env_utils::is_env_truthy(
-        std::env::var("DISABLE_INSTALL_GITHUB_APP_COMMAND")
-            .ok()
+        crate::utils::process_env::var("DISABLE_INSTALL_GITHUB_APP_COMMAND")
             .as_deref(),
     )
 }
 
 fn login_enabled() -> bool {
-    !crate::utils::env_utils::is_env_truthy(std::env::var("DISABLE_LOGIN_COMMAND").ok().as_deref())
+    !crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("DISABLE_LOGIN_COMMAND").as_deref())
 }
 
 fn logout_enabled() -> bool {
-    !crate::utils::env_utils::is_env_truthy(std::env::var("DISABLE_LOGOUT_COMMAND").ok().as_deref())
+    !crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("DISABLE_LOGOUT_COMMAND").as_deref())
 }
 
 fn is_using_3p_services() -> bool {
@@ -483,7 +483,7 @@ fn is_using_3p_services() -> bool {
         "CLAUDE_CODE_USE_FOUNDRY",
     ]
     .into_iter()
-    .any(|key| crate::utils::env_utils::is_env_truthy(std::env::var(key).ok().as_deref()))
+    .any(|key| crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var(key).as_deref()))
 }
 
 fn is_console_user() -> bool {
@@ -520,16 +520,16 @@ fn terminal_setup_hidden() -> bool {
 }
 
 fn session_enabled() -> bool {
-    crate::utils::env_utils::is_env_truthy(std::env::var("CLAUDE_CODE_REMOTE").ok().as_deref())
+    crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_REMOTE").as_deref())
 }
 
 fn feedback_enabled() -> bool {
     !is_using_3p_services()
         && !crate::utils::env_utils::is_env_truthy(
-            std::env::var("DISABLE_FEEDBACK_COMMAND").ok().as_deref(),
+            crate::utils::process_env::var("DISABLE_FEEDBACK_COMMAND").as_deref(),
         )
         && !crate::utils::env_utils::is_env_truthy(
-            std::env::var("DISABLE_BUG_COMMAND").ok().as_deref(),
+            crate::utils::process_env::var("DISABLE_BUG_COMMAND").as_deref(),
         )
         && !is_internal_build()
 }
@@ -554,7 +554,7 @@ fn privacy_settings_enabled() -> bool {
 
 fn upgrade_enabled() -> bool {
     if crate::utils::env_utils::is_env_truthy(
-        std::env::var("DISABLE_UPGRADE_COMMAND").ok().as_deref(),
+        crate::utils::process_env::var("DISABLE_UPGRADE_COMMAND").as_deref(),
     ) {
         return false;
     }
@@ -1298,6 +1298,7 @@ pub fn declared_commands_for_tests() -> Vec<Command> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn description_source_annotations_match_bun_prompt_and_plugin_gates() {
@@ -1428,8 +1429,8 @@ mod tests {
 
     #[test]
     fn commands_catalog_matches_official_direct_and_provider_shape() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _demo = crate::utils::env_utils::EnvVarGuard::unset("IS_DEMO");
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _demo = EnvVarGuard::unset("IS_DEMO");
 
         let catalog = commands();
         // 71 direct descriptors + provider-conditioned logout/login + internal /version.
@@ -1619,7 +1620,7 @@ mod tests {
             }
         }
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _dynamic = crate::skills::load_skills_dir::DynamicSkillsTestSnapshot::capture();
         let _sources =
             AllowedSourcesRestore(crate::bootstrap::state::get_allowed_setting_sources());
@@ -1680,7 +1681,7 @@ mod tests {
 
     #[test]
     fn load_all_commands_projects_inline_plugin_commands_and_skills_in_source_order() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_inline = crate::bootstrap::state::get_inline_plugins();
         let root = std::env::temp_dir().join(format!(
             "cometix-command-registry-plugin-{}",
@@ -1861,7 +1862,7 @@ mod tests {
     /// move with it.
     #[test]
     fn branch_alias_ignores_the_runtime_vetoes_that_gate_the_fork_route() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _headless = crate::tools::agent_tool::fork_subagent::fork_veto_environment();
         assert!(
             !crate::tools::agent_tool::fork_subagent::is_fork_subagent_enabled(),
@@ -1897,7 +1898,7 @@ mod tests {
     #[test]
     fn skill_tool_commands_matches_official_bundled_and_listing_filters() {
         use crate::skills::load_skills_dir::SkillLoadedFrom;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _dynamic = crate::skills::load_skills_dir::DynamicSkillsTestSnapshot::capture();
         crate::skills::load_skills_dir::clear_dynamic_skills();
         let root =

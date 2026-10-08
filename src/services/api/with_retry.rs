@@ -10,6 +10,7 @@ use crate::types::message::SystemMessage;
 use crate::utils::fast_mode::{is_fast_mode_cooldown, is_fast_mode_enabled};
 use crate::utils::messages::create_system_api_error_message;
 use crate::utils::model::model::is_non_custom_opus_model;
+use crate::utils::process_env::JsTruthy;
 use crate::utils::thinking::ThinkingConfig;
 use std::collections::HashSet;
 use std::fmt;
@@ -349,8 +350,7 @@ fn should_retry_529(query_source: Option<&RetryQuerySource>) -> bool {
 /// Maps to: CC `services/api/withRetry.ts:100-104`
 fn is_persistent_retry_enabled() -> bool {
     crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_UNATTENDED_RETRY")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_UNATTENDED_RETRY")
             .as_deref(),
     )
 }
@@ -409,7 +409,7 @@ fn is_oauth_token_revoked_error(error: &RetryableError) -> bool {
 /// Maps to: CC `services/api/withRetry.ts:631-644`
 fn is_bedrock_auth_error(error: &RetryableError) -> bool {
     if !crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_USE_BEDROCK").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_USE_BEDROCK").as_deref(),
     ) {
         return false;
     }
@@ -424,7 +424,7 @@ fn is_bedrock_auth_error(error: &RetryableError) -> bool {
 /// Maps to: CC `services/api/withRetry.ts:670-682`
 fn is_vertex_auth_error(error: &RetryableError) -> bool {
     if !crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_USE_VERTEX").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_USE_VERTEX").as_deref(),
     ) {
         return false;
     }
@@ -493,7 +493,7 @@ fn should_retry(error: &ApiError) -> bool {
     }
 
     // CCR mode: auth errors are transient blips
-    if crate::utils::env_utils::is_env_truthy(std::env::var("CLAUDE_CODE_REMOTE").ok().as_deref())
+    if crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_REMOTE").as_deref())
         && (error.status == Some(401) || error.status == Some(403))
     {
         return true;
@@ -700,8 +700,7 @@ fn get_rate_limit_reset_delay_ms(error: &ApiError) -> Option<u64> {
 ///
 /// Maps to: CC `services/api/withRetry.ts:789-794`
 pub fn get_default_max_retries() -> u32 {
-    std::env::var("CLAUDE_CODE_MAX_RETRIES")
-        .ok()
+    crate::utils::process_env::var("CLAUDE_CODE_MAX_RETRIES")
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_MAX_RETRIES)
 }
@@ -840,6 +839,21 @@ where
             &retry_context.model,
             was_fast_mode_active,
         );
+
+        // Maps to CC `withRetry.ts:217-230`: after a stale keep-alive socket,
+        // behind its gate, stop pooling so the retry opens a fresh connection.
+        // CC throws a mock error (`:207-209`) before this runs.
+        if mock_error.is_none()
+            && last_error.as_ref().is_some_and(is_stale_connection_error)
+            && crate::utils::feature_flags::feature_enabled(
+                crate::utils::feature_flags::FeatureFlag::DisableKeepaliveOnEconnreset,
+            )
+        {
+            crate::utils::debug::log_for_debugging(
+                "Stale connection (ECONNRESET/EPIPE) — disabling keep-alive for retry",
+            );
+            crate::utils::proxy::disable_keep_alive();
+        }
 
         // Refresh client when needed (first attempt, after auth errors, stale connections)
         let needs_client_refresh = !client_initialized
@@ -1010,7 +1024,7 @@ where
                     // TODO: Check FALLBACK_FOR_ALL_PRIMARY_MODELS and isNonCustomOpusModel
                     // once model utils are ported.
                     // See CC `utils/model/model.ts:isNonCustomOpusModel`.
-                    let should_track = std::env::var("FALLBACK_FOR_ALL_PRIMARY_MODELS").is_ok()
+                    let should_track = crate::utils::process_env::var("FALLBACK_FOR_ALL_PRIMARY_MODELS").truthy().is_some()
                         || is_non_custom_opus_model(&options.model);
                     if should_track {
                         consecutive_529_errors += 1;
@@ -1026,7 +1040,7 @@ where
                             // External users (non-sandbox, non-persistent) get a terminal error
                             if !crate::utils::build_profile::has_internal_capability(
                                 crate::utils::build_profile::InternalCapability::Api,
-                            ) && std::env::var("IS_SANDBOX").is_err()
+                            ) && crate::utils::process_env::var("IS_SANDBOX").truthy().is_none()
                                 && !is_persistent_retry_enabled()
                             {
                                 return Err(CannotRetryError {
@@ -1263,6 +1277,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     // -- BASE_DELAY_MS --
 
@@ -1388,7 +1403,7 @@ mod tests {
 
     #[test]
     fn default_max_retries_fallback() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         // When env var is not set (which it shouldn't be in tests), default is 10
         crate::utils::process_env::remove("CLAUDE_CODE_MAX_RETRIES");
         assert_eq!(get_default_max_retries(), 10);
@@ -1547,7 +1562,7 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[tokio::test]
     async fn internal_mock_429_short_circuits_network_and_normal_retry() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::services::mock_rate_limits::reset_for_test();
         crate::services::claude_ai_limits::reset_for_test();
         crate::services::mock_rate_limits::set_mock_rate_limit_scenario(
@@ -1626,6 +1641,53 @@ mod tests {
             "attempt 6 delay repeated {} across 64 draws",
             first
         );
+    }
+
+    /// CC `withRetry.ts:217-230`: a stale connection turns keep-alive off
+    /// only behind `tengu_disable_keepalive_on_econnreset`, whose frozen
+    /// default is CC's fallback, off.
+    #[tokio::test]
+    async fn stale_connection_keeps_keep_alive_while_its_gate_is_off() {
+        assert!(!crate::utils::feature_flags::feature_enabled(
+            crate::utils::feature_flags::FeatureFlag::DisableKeepaliveOnEconnreset
+        ));
+        async fn reset_then_succeed() {
+            let attempts = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let (heartbeat_tx, _heartbeat_rx) = tokio::sync::mpsc::channel(4);
+            let result: Result<(), WithRetryError> = with_retry(
+                || async { Ok(()) },
+                move |_attempt, _context| {
+                    let attempts = attempts.clone();
+                    async move {
+                        if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                            Err(RetryableError::Connection(ConnectionError {
+                                message: "connection reset".to_string(),
+                                code: Some("ECONNRESET".to_string()),
+                            }))
+                        } else {
+                            Ok(())
+                        }
+                    }
+                },
+                RetryOptions {
+                    max_retries: Some(2),
+                    model: "claude-sonnet-4-20250514".to_string(),
+                    fallback_model: None,
+                    thinking_config: ThinkingConfig::Disabled,
+                    fast_mode: None,
+                    abort_rx: None,
+                    query_source: Some(RetryQuerySource::ReplMainThread),
+                    initial_consecutive_529_errors: None,
+                },
+                heartbeat_tx,
+            )
+            .await;
+            assert!(result.is_ok());
+        }
+
+        crate::utils::proxy::reset_keep_alive_for_testing();
+        reset_then_succeed().await;
+        assert!(!crate::utils::proxy::is_keep_alive_disabled_for_testing());
     }
 
     // -- is_stale_connection_error --

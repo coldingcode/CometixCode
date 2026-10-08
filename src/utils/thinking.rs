@@ -6,6 +6,7 @@ use crate::utils::model::model_support_overrides::{
     ModelCapabilityOverride, get_3p_model_capability_override,
 };
 use crate::utils::model::providers::{ApiProvider, get_api_provider};
+use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::types::SettingsJson;
 use crate::utils::theme::Theme;
 use iocraft::prelude::Color;
@@ -106,12 +107,9 @@ pub fn parse_js_decimal_i64(value: &str) -> Option<i64> {
 /// No GrowthBook / feature gates (ultrathink is separate). Settings source is
 /// `alwaysThinkingEnabled` from merged settings, same as CC `getSettingsWithErrors()`.
 pub fn should_enable_thinking_by_default(settings: &SettingsJson) -> bool {
-    // JS: if (process.env.MAX_THINKING_TOKENS) — empty string is falsy.
-    if let Ok(value) = std::env::var("MAX_THINKING_TOKENS") {
-        if !value.is_empty() {
-            // parseInt → NaN yields false for `NaN > 0`.
-            return parse_js_decimal_i64(&value).is_some_and(|tokens| tokens > 0);
-        }
+    if let Some(value) = crate::utils::process_env::var("MAX_THINKING_TOKENS").truthy() {
+        // parseInt → NaN yields false for `NaN > 0`.
+        return parse_js_decimal_i64(&value).is_some_and(|tokens| tokens > 0);
     }
 
     if settings.always_thinking_enabled == Some(false) {
@@ -203,21 +201,19 @@ pub fn production_thinking_config_from_env_and_settings(settings: &SettingsJson)
 
     // main.tsx else branch when no --thinking: env MAX_THINKING_TOKENS only
     // (CLI maxThinkingTokens is applied by resolve_thinking_launch in main).
-    if let Ok(value) = std::env::var("MAX_THINKING_TOKENS") {
-        if !value.is_empty() {
-            if let Some(tokens) = parse_js_decimal_i64(&value) {
-                if tokens > 0 {
-                    return ThinkingConfig::Enabled {
-                        budget_tokens: Some(tokens),
-                    };
-                }
-                if tokens == 0 {
-                    return ThinkingConfig::Disabled;
-                }
+    if let Some(value) = crate::utils::process_env::var("MAX_THINKING_TOKENS").truthy() {
+        if let Some(tokens) = parse_js_decimal_i64(&value) {
+            if tokens > 0 {
+                return ThinkingConfig::Enabled {
+                    budget_tokens: Some(tokens),
+                };
             }
-            // Invalid/NaN: keep first-stage config (enable already false).
-            return config;
+            if tokens == 0 {
+                return ThinkingConfig::Disabled;
+            }
         }
+        // Invalid/NaN: keep first-stage config (enable already false).
+        return config;
     }
 
     config
@@ -237,6 +233,7 @@ pub fn production_thinking_config_from_env_and_config(
 mod tests {
     use super::*;
     use crate::utils::settings::types::SettingsJson;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn ultrathink_matching_uses_fresh_case_insensitive_word_boundaries() {
@@ -259,8 +256,7 @@ mod tests {
         );
     }
 
-    fn clear_provider_and_pin_env() -> Vec<crate::utils::env_utils::EnvVarGuard> {
-        use crate::utils::env_utils::EnvVarGuard;
+    fn clear_provider_and_pin_env() -> Vec<EnvVarGuard> {
         vec![
             EnvVarGuard::unset("CLAUDE_CODE_USE_BEDROCK"),
             EnvVarGuard::unset("CLAUDE_CODE_USE_VERTEX"),
@@ -273,7 +269,7 @@ mod tests {
 
     #[test]
     fn model_supports_thinking_matches_official_first_party_rule() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _env = clear_provider_and_pin_env();
         // 1P: everything that is not claude-3-, including Haiku 4.5 and
         // gateway-custom names.
@@ -285,9 +281,9 @@ mod tests {
 
     #[test]
     fn model_supports_thinking_matches_official_bedrock_rule_and_override() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _env = clear_provider_and_pin_env();
-        let _bedrock = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CODE_USE_BEDROCK", "1");
+        let _bedrock = EnvVarGuard::set("CLAUDE_CODE_USE_BEDROCK", "1");
         // 3P: only Opus 4+ / Sonnet 4+.
         assert!(model_supports_thinking(
             "us.anthropic.claude-sonnet-4-20250514-v1:0"
@@ -297,11 +293,8 @@ mod tests {
         ));
         assert!(!model_supports_thinking("custom-gateway-model"));
         // Pinned capability override wins in both directions.
-        let _pinned = crate::utils::env_utils::EnvVarGuard::set(
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
-            "custom-gateway-model",
-        );
-        let _caps = crate::utils::env_utils::EnvVarGuard::set(
+        let _pinned = EnvVarGuard::set("ANTHROPIC_DEFAULT_HAIKU_MODEL", "custom-gateway-model");
+        let _caps = EnvVarGuard::set(
             "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
             "thinking",
         );
@@ -310,7 +303,7 @@ mod tests {
 
     #[test]
     fn model_supports_adaptive_thinking_matches_official_defaults() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _env = clear_provider_and_pin_env();
         assert!(model_supports_adaptive_thinking("claude-opus-4-6"));
         assert!(model_supports_adaptive_thinking("claude-sonnet-4-6"));
@@ -321,13 +314,13 @@ mod tests {
         // Unknown strings default to true on 1P ...
         assert!(model_supports_adaptive_thinking("deepseek-v4-flash"));
         // ... and false on Bedrock/Vertex.
-        let _bedrock = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CODE_USE_BEDROCK", "1");
+        let _bedrock = EnvVarGuard::set("CLAUDE_CODE_USE_BEDROCK", "1");
         assert!(!model_supports_adaptive_thinking("deepseek-v4-flash"));
     }
 
     #[test]
     fn should_enable_thinking_by_default_matches_official() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("MAX_THINKING_TOKENS");
 
         assert!(should_enable_thinking_by_default(&SettingsJson::default()));
@@ -355,7 +348,7 @@ mod tests {
 
     #[test]
     fn production_thinking_config_from_settings_matches_main_without_thinking_flag() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("MAX_THINKING_TOKENS");
         crate::utils::process_env::remove("CLAUDE_CODE_THINKING");
         crate::utils::process_env::remove("COMETIX_THINKING");

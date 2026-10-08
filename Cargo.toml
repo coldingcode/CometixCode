@@ -44,15 +44,21 @@ strip-ansi-escapes = "0.2.1"
 # UAX #29 segmentation with compiled-in data, including the dictionary models
 # for Chinese, Japanese, Khmer, Lao, Myanmar and Thai. No system ICU.
 icu_segmenter = { version = "2.3.0", features = ["auto"] }
-# iocraft fork carrying the CC Ink parity primitives (row-level diff, event
-# propagation, SIGCONT self-healing, IME cursor, bracketed paste, grid layout).
+# iocraft fork with CC Ink parity primitives. This and the three other
+# sibling checkouts below are `path` here and `git` in the public mirror;
+# scripts/sync-public-cargo.sh derives the mirror's manifest and lock.
 iocraft = { git = "https://github.com/Haleclipse/CometixTUI", features = ["unstable-output-streams"] }
-# Rust port of chalk, a member of the same workspace as the iocraft fork; owns
-# color-level detection and string styling, matching the source's chalk import.
+# Rust port of chalk (same workspace as the iocraft fork); owns color-level
+# detection and string styling, matching the source's chalk import.
 chalk = { git = "https://github.com/Haleclipse/CometixTUI" }
 
 # Rust port of @anthropic-ai/sdk.
 anthropic-sdk = { git = "https://github.com/Haleclipse/anthropic-sdk-rs" }
+# CC's `@anthropic-ai/vertex-sdk`.
+anthropic-sdk-vertex = { git = "https://github.com/Haleclipse/anthropic-sdk-rs" }
+# CC's `@anthropic-ai/foundry-sdk`, with the crate's port of CC's
+# `@azure/identity` dependency (`DefaultAzureCredential`).
+anthropic-sdk-foundry = { git = "https://github.com/Haleclipse/anthropic-sdk-rs", features = ["azure-identity"] }
 
 # Async runtime: tokio for API/network/process I/O. iocraft's render loop is
 # runtime-agnostic (futures traits only); tokio drives it from main().
@@ -81,6 +87,9 @@ getrandom = "0.3.4"
 unicode-width = "0.2"
 unicode-segmentation = "1.12"
 unicode-normalization = "0.1"
+# Internal fs_operations::path implementation dependencies.
+memchr = "2"
+smallvec = "1.15"
 # CC Grep filename ordering uses JavaScript Intl/ICU `localeCompare`.
 icu_collator = "2.2.1"
 icu_locale = "2.2.0"
@@ -122,7 +131,22 @@ http = { version = "1", optional = true }
 # Shared features only — do not put native-tls / rustls here or both platforms
 # get a feature union and native-tls always wins.
 flate2 = "1.1.9"
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+# Cometix-specific deviation: `system-proxy`, as in Codex's reqwest default.
+# CC reads only the proxy environment variables (`utils/proxy.ts:64-66`), and
+# Node has no notion of the OS proxy. With this feature, a "set as system
+# proxy" tool works with no configuration. The feature changes reqwest's
+# automatic proxy detection, so it applies to every reqwest client in the
+# process that sets no explicit `.proxy()`/`.no_proxy()`. That includes the
+# anthropic-sdk and rmcp clients, through feature unification. When a client
+# is built, hyper-util fills each HTTP/HTTPS slot that `HTTP(S)_PROXY` left
+# empty from the macOS/Windows settings; `ALL_PROXY` does not fill a slot.
+# `NO_PROXY` still applies. On macOS it reads the HTTP and HTTPS entries only:
+# not the exceptions list, PAC or SOCKS.
+#
+# `socks`: CC's fetch path (undici) takes `socks5://` and `socks://` proxies;
+# `utils/proxy.rs` sends them as `socks5h`. It adds no crate: hyper-util's
+# SOCKS connector is already built.
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "system-proxy", "socks"] }
 sse-stream = { version = "0.2", optional = true }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect"], optional = true }
 
@@ -139,12 +163,6 @@ rmcp = { version = "2.1.0", default-features = false, optional = true, features 
     "transport-streamable-http-client-reqwest",
 ] }
 
-# ── Platform TLS backends ────────────────────────────────────────────────
-# Android/Termux: native-tls (OpenSSL). reqwest's rustls* features always
-# enable rustls-platform-verifier, which panics without JNI context.
-# Desktop: rustls-no-provider + ring (installed by utils/tls_provider.rs). Keep anthropic-sdk
-# on rustls-no-provider too — reqwest feature "rustls" would union aws-lc-sys.
-
 # CC `asciicast.ts:118-125` reads `process.stdout.columns/rows`, which Node
 # services with ioctl(TIOCGWINSZ) on Unix and GetConsoleScreenBufferInfo on
 # Windows. utils/asciicast.rs calls libc directly for the first; the second
@@ -154,28 +172,24 @@ rmcp = { version = "2.1.0", default-features = false, optional = true, features 
 [target.'cfg(not(unix))'.dependencies]
 crossterm = "0.29"
 
+# ── Platform TLS backends ────────────────────────────────────────────────
+# Android/Termux: native-tls (OpenSSL). reqwest's rustls* features always
+# enable rustls-platform-verifier, which panics without JNI context.
+# Desktop: rustls-no-provider + ring (installed by utils/tls_provider.rs). Keep anthropic-sdk
+# on rustls-no-provider too — reqwest feature "rustls" would union aws-lc-sys.
+# Target tables only add the TLS feature; shared features stay in [dependencies].
 [target.'cfg(target_os = "android")'.dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "native-tls"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "native-tls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["native-tls"], optional = true }
 rmcp = { version = "2.1.0", default-features = false, optional = true, features = [
-    "auth",
-    "client",
-    "elicitation",
     "reqwest-native-tls",
-    "transport-child-process",
-    "transport-streamable-http-client-reqwest",
 ] }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
-tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "rustls-tls-webpki-roots"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["rustls-tls-webpki-roots"], optional = true }
 rmcp = { version = "2.1.0", default-features = false, optional = true, features = [
-    "auth",
-    "client",
-    "elicitation",
     "reqwest-tls-no-provider",
-    "transport-child-process",
-    "transport-streamable-http-client-reqwest",
 ] }
 # ring crypto provider for rustls — tls_provider installs it before HTTPS.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
@@ -190,3 +204,29 @@ codegen-units = 16
 strip = true
 opt-level = "s"
 panic = "abort"
+
+# Release-shaped build that external sampling profilers can read: same
+# optimization level, but full debug info and symbols kept. Use for CPU
+# investigations (`cargo build --profile profiling`, then macOS `sample`
+# / samply / Instruments on the running process). `panic = "abort"` is
+# inherited; only symbol visibility differs from what ships.
+[profile.profiling]
+inherits = "release"
+strip = false
+debug = true
+
+# generational-box 0.5.6 backs iocraft's State. With debug assertions it
+# records borrow locations, and a failed `try_read` then builds its error by
+# unwrapping the recorded write location without the lock the read failed
+# on (sync.rs:115-118, lib.rs:357): when the writer releases in between, the
+# read panics instead of reporting the borrow. iocraft write-borrows every
+# State in each poll (use_state.rs poll_change), so a tokio task reading a
+# State — the plugin UI's async loads through PluginUiState — hits it under
+# load, where release builds, which keep no borrow locations, just retry.
+# Build the crate as release does in dev and tests; its generation checks
+# (the default `check_generation` feature) stay on.
+[profile.dev.package.generational-box]
+debug-assertions = false
+
+[profile.test.package.generational-box]
+debug-assertions = false

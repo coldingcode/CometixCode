@@ -9,6 +9,9 @@
 
 use std::path::{Path, PathBuf};
 
+use crate::memdir::paths::get_memory_base_dir;
+use crate::utils::process_env::JsTruthy;
+
 /// Maps to CC `agentMemory.ts#AgentMemoryScope`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum AgentMemoryScope {
@@ -70,7 +73,7 @@ pub fn is_agent_memory_path(absolute_path: &Path, cwd: &Path) -> bool {
         return true;
     }
     if let Some(remote_memory_dir) =
-        crate::utils::env_utils::truthy_env_var("CLAUDE_CODE_REMOTE_MEMORY_DIR")
+        crate::utils::process_env::var("CLAUDE_CODE_REMOTE_MEMORY_DIR").truthy()
     {
         let remote_projects = PathBuf::from(remote_memory_dir).join("projects");
         normalized.starts_with(&remote_projects)
@@ -124,11 +127,12 @@ pub fn load_agent_memory_prompt(agent_type: &str, scope: AgentMemoryScope, cwd: 
 
     let memory_dir = get_agent_memory_dir(agent_type, scope, cwd);
     let mut extra_guidelines = vec![scope_note.to_string()];
-    if let Ok(extra) = std::env::var("CLAUDE_COWORK_MEMORY_EXTRA_GUIDELINES") {
-        let trimmed = extra.trim();
-        if !trimmed.is_empty() {
-            extra_guidelines.push(trimmed.to_string());
-        }
+    // CC `agentMemory.ts:167-175`: `x && x.trim().length > 0 ? [x]` — tested
+    // trimmed, passed as is (as `memdir.rs` does).
+    if let Some(extra) = crate::utils::process_env::var("CLAUDE_COWORK_MEMORY_EXTRA_GUIDELINES")
+        .filter(|value| !value.trim().is_empty())
+    {
+        extra_guidelines.push(extra);
     }
 
     crate::memdir::memdir::build_memory_prompt(
@@ -140,7 +144,7 @@ pub fn load_agent_memory_prompt(agent_type: &str, scope: AgentMemoryScope, cwd: 
 
 fn get_local_agent_memory_dir(dir_name: &str, cwd: &Path) -> PathBuf {
     if let Some(remote_memory_dir) =
-        crate::utils::env_utils::truthy_env_var("CLAUDE_CODE_REMOTE_MEMORY_DIR")
+        crate::utils::process_env::var("CLAUDE_CODE_REMOTE_MEMORY_DIR").truthy()
     {
         // CC agentMemory.ts:35-36:
         // `sanitizePath(findCanonicalGitRoot(getProjectRoot()) ?? getProjectRoot())`
@@ -167,32 +171,15 @@ fn get_local_agent_memory_dir(dir_name: &str, cwd: &Path) -> PathBuf {
         .join(dir_name)
 }
 
-fn get_memory_base_dir() -> PathBuf {
-    crate::utils::env_utils::truthy_env_var("CLAUDE_CODE_REMOTE_MEMORY_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(crate::utils::config::get_config_home)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EnvRestore {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvRestore {
-        fn unset(key: &'static str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::unset(key),
-            }
-        }
-    }
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn agent_memory_paths_match_official_scopes_and_colon_sanitizing() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _remote_memory = EnvRestore::unset("CLAUDE_CODE_REMOTE_MEMORY_DIR");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _remote_memory = EnvVarGuard::unset("CLAUDE_CODE_REMOTE_MEMORY_DIR");
         let root = std::env::temp_dir().join(format!(
             "cometix-agent-memory-{}",
             uuid::Uuid::new_v4().simple()

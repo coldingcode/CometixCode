@@ -142,7 +142,11 @@ pub fn DiscoverPlugins(
                 #[cfg(test)] let counts=if load_test_imports.is_some(){None}else{get_install_counts().await};
                 #[cfg(not(test))] let counts=get_install_counts().await;
                 let sort_failed=std::cell::Cell::new(false);
-                uninstalled.sort_by(|a,b| {
+                // NaN reaches `partial_cmp().unwrap_or(Equal)` when to_number
+                // fails mid-sort (the Cell mimics the source's try/catch), so
+                // the comparator is not a total order; sorted through the
+                // non-validating JS-sort primitive (utils/js_sort.rs; PR #7).
+                crate::utils::js_sort::sort_by(&mut uninstalled,|a,b| {
                     let a_raw=counts.as_ref().and_then(|c|c.get(&a.plugin_id)).filter(|v|!v.is_null());
                     let b_raw=counts.as_ref().and_then(|c|c.get(&b.plugin_id)).filter(|v|!v.is_null());
                     let equal=match (a_raw,b_raw){
@@ -612,7 +616,7 @@ pub fn DiscoverPlugins(
         move || details_active,
     );
     let (terminal_width, _) = hooks.use_terminal_size();
-    let theme = crate::utils::theme::current();
+    let theme = *hooks.use_context::<crate::utils::theme::Theme>();
     let figures = crate::constants::figures::figures();
     if let ViewState::PluginOptions { plugin, plugin_id } = view {
         let name = plugin.name.clone();
@@ -658,7 +662,7 @@ pub fn DiscoverPlugins(
     let visible = pagination.get_visible_items(&filtered_plugins);
     element!{View(flex_direction:FlexDirection::Column){
         View{Text(content:"Discover plugins",weight:Weight::Bold) #(pagination.needs_pagination.then(||element!{Text(content:format!(" ({}/{})",pagination.scroll_position.current,pagination.scroll_position.total),dim:true)}))}
-        View(margin_bottom:1u32,width:terminal_width.saturating_sub(4),flex_direction:FlexDirection::Column){SearchBox(query:query.clone(),is_focused:search_active,is_terminal_focused:is_terminal_focused,cursor_offset:Some(search.offset()))}
+        View(margin_bottom:1u32){SearchBox(query:query.clone(),is_focused:search_active,is_terminal_focused:is_terminal_focused,width:Some(u32::from(terminal_width.saturating_sub(4))),cursor_offset:Some(search.offset()))}
         #(warning.read().as_ref().map(|w|element!{View(margin_bottom:1u32){Text(content:format!("{} {w}",figures.warning),color:theme.warning)}}))
         #((filtered_plugins.is_empty()&&!query.is_empty()).then(||element!{View(margin_bottom:1u32){Text(content:format!("No plugins match \"{query}\""),dim:true)}}))
         #(pagination.scroll_position.can_scroll_up.then(||element!{Text(content:format!(" {} more above",figures.arrow_up),dim:true)}))
@@ -913,7 +917,10 @@ pub(super) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mounted_discover_paste_entry_and_width_match_official_bun() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let oracle: Value = serde_json::from_str(include_str!("../../../tests/fixtures/oracles/plugin-ui-complete-0914/discover-entry-oracle.json")).unwrap();
+        let oracle: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/oracles/plugin-ui-complete-0914/discover-entry-oracle.json"
+        ))
+        .unwrap();
         for case in oracle.as_array().unwrap() {
             for pasted in [false, true] {
                 let input_text = case["input"].as_str().unwrap();
@@ -970,7 +977,7 @@ pub(super) mod tests {
                 };
                 keys.send(event).await.unwrap();
                 keys.send(TerminalEvent::Resize(119, 30)).await.unwrap();
-                let after = tokio::time::timeout(Duration::from_secs(3), async {
+                let mut after = tokio::time::timeout(Duration::from_secs(3), async {
                     loop {
                         let frame = frames.next().await.unwrap().to_string();
                         if border_width(&frame) == 115 {
@@ -980,6 +987,15 @@ pub(super) mod tests {
                 })
                 .await
                 .unwrap();
+                // The oracle records the settled end state. The resize and the
+                // key are independent changes that need not land in the same
+                // frame (a same-frame settled resize can precede the key's
+                // frame), so drain until the loop goes quiet before asserting.
+                while let Ok(Some(frame)) =
+                    tokio::time::timeout(Duration::from_millis(300), frames.next()).await
+                {
+                    after = frame.to_string();
+                }
                 let mut expected_events = case["events"]
                     .as_array()
                     .unwrap()
@@ -1016,7 +1032,10 @@ pub(super) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn mounted_discover_plugins_matches_official_bun_frames_and_install_callbacks() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let oracle:Value=serde_json::from_str(include_str!("../../../tests/fixtures/oracles/plugin-ui-complete-0914/panel-oracle.json")).unwrap();
+        let oracle: Value = serde_json::from_str(include_str!(
+            "../../../tests/fixtures/oracles/plugin-ui-complete-0914/panel-oracle.json"
+        ))
+        .unwrap();
         for name in [
             "discover-list",
             "discover-target",

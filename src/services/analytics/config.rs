@@ -4,15 +4,15 @@
 
 /// Maps to: CC `services/analytics/config.ts:16-27` `isAnalyticsDisabled`.
 pub fn is_analytics_disabled() -> bool {
-    std::env::var("NODE_ENV").ok().as_deref() == Some("test")
+    crate::utils::process_env::var("NODE_ENV").as_deref() == Some("test")
         || crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_USE_BEDROCK").ok().as_deref(),
+            crate::utils::process_env::var("CLAUDE_CODE_USE_BEDROCK").as_deref(),
         )
         || crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_USE_VERTEX").ok().as_deref(),
+            crate::utils::process_env::var("CLAUDE_CODE_USE_VERTEX").as_deref(),
         )
         || crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_USE_FOUNDRY").ok().as_deref(),
+            crate::utils::process_env::var("CLAUDE_CODE_USE_FOUNDRY").as_deref(),
         )
         || crate::utils::privacy_level::is_telemetry_disabled()
 }
@@ -20,10 +20,11 @@ pub fn is_analytics_disabled() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn analytics_disable_conditions_match_official_provider_and_privacy_gates() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let keys = [

@@ -404,7 +404,9 @@ async fn download_mcpb(
     let start = std::time::Instant::now();
     let mut fired = false;
     let result: anyhow::Result<Vec<u8>> = async {
-        let client = reqwest::Client::builder()
+        // CC `axios.get` (`mcpbHandler.ts:495-507`), through the global
+        // interceptor.
+        let client = crate::utils::proxy::create_axios_instance()?
             .timeout(std::time::Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()?;
@@ -1003,6 +1005,7 @@ async fn generate_mcp_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::io::Write;
 
     fn temp_dir(label: &str) -> std::path::PathBuf {
@@ -1016,9 +1019,9 @@ mod tests {
 
     #[test]
     fn mcp_server_user_config_merges_settings_and_secure_storage() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let config_home = temp_dir("config");
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
         std::fs::write(
             config_home.join("settings.json"),
             serde_json::json!({
@@ -1296,11 +1299,11 @@ mod tests {
 
     #[tokio::test]
     async fn valid_manifest_with_missing_configuration_reaches_dialog_result() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let dir = temp_dir("schema-dialog");
         let config = dir.join("config");
         std::fs::create_dir_all(&config).unwrap();
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config);
         std::fs::write(dir.join("probe.mcpb"), include_bytes!("../../../tests/fixtures/oracles/mcpb-schema-0915/needs-config.mcpb")).unwrap();
         for pass in 0..2 {
             let result = load_mcpb_file("probe.mcpb", &dir, "schema-probe@test", None, None, false)

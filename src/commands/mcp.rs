@@ -9,6 +9,7 @@
 use crate::components::mcp::MCPSettings;
 use crate::components::mcp::mcp_reconnect::MCPReconnect;
 use crate::services::mcp::types::{McpClientSnapshot, McpServerConnectionType};
+use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::constants::SettingSource;
 use crate::utils::settings::get_settings_file_path_for_source;
 use crate::utils::status::StartupDiagnosticsSnapshot;
@@ -176,9 +177,13 @@ fn run_xaa_setup(args: &[String]) -> anyhow::Result<()> {
     validate_setup_issuer(&issuer)?;
     let callback_port = parse_callback_port(args)?;
     let secret = if has_flag(args, "--client-secret") {
-        Some(std::env::var("MCP_XAA_IDP_CLIENT_SECRET").map_err(|_| {
-            cli_error("Error: --client-secret requires MCP_XAA_IDP_CLIENT_SECRET env var")
-        })?)
+        Some(
+            crate::utils::process_env::var("MCP_XAA_IDP_CLIENT_SECRET")
+                .truthy()
+                .ok_or_else(|| {
+                    cli_error("Error: --client-secret requires MCP_XAA_IDP_CLIENT_SECRET env var")
+                })?,
+        )
     } else {
         None
     };
@@ -544,6 +549,7 @@ pub fn McpCommandPanel<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use crate::utils::theme;
     use futures::{StreamExt, stream};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -552,20 +558,8 @@ mod tests {
 
     static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-    }
-
     fn with_temp_config_home(test: impl FnOnce(&std::path::Path)) {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "cometix-mcp-xaa-command-test-{}-{}",
             std::process::id(),
@@ -573,7 +567,7 @@ mod tests {
         ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
         test(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -776,7 +770,7 @@ mod tests {
 
     #[test]
     fn mcp_panel_unknown_args_falls_back_to_live_settings_state_like_official_call() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let temp_dir =
             std::env::temp_dir().join(format!("cometix-mcp-panel-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&temp_dir).unwrap();

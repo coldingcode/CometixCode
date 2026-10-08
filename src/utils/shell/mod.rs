@@ -14,6 +14,7 @@ pub mod read_only_command_validation;
 pub mod shell_provider;
 pub mod shell_tool_utils;
 
+use crate::utils::process_env::JsTruthy;
 use shell_provider::{ShellProvider, ShellType};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
@@ -46,7 +47,10 @@ fn is_executable(shell_path: &Path) -> bool {
     if shell_path.is_file() {
         return true;
     }
-    std::process::Command::new(shell_path)
+    let mut command = std::process::Command::new(shell_path);
+    // CC `Shell.ts` execFileSync inherits process.env; the carrier is its counterpart.
+    crate::utils::subprocess_env::apply_process_env_std(&mut command);
+    command
         .arg("--version")
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -69,8 +73,12 @@ fn is_executable(shell_path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// CC `Shell.ts:99` `which`: Bun.which reads the startup PATH, as
+/// `utils/which.rs` does.
 fn which(executable: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
+    let path = crate::utils::process_env::startup_snapshot()
+        .var_os("PATH")?
+        .to_os_string();
     std::env::split_paths(&path)
         .map(|directory| {
             if cfg!(windows) {
@@ -87,15 +95,18 @@ pub fn find_suitable_shell() -> Result<PathBuf, String> {
     if cfg!(windows) {
         return crate::utils::windows_paths::find_git_bash_path();
     }
-    if let Some(override_path) = std::env::var_os("CLAUDE_CODE_SHELL") {
-        let override_path = PathBuf::from(override_path);
+    if let Some(override_path) = crate::utils::process_env::var_os("CLAUDE_CODE_SHELL")
+        .as_deref()
+        .truthy()
+        .map(PathBuf::from)
+    {
         let text = override_path.display().to_string();
         if (text.contains("bash") || text.contains("zsh")) && is_executable(&override_path) {
             return Ok(override_path);
         }
     }
 
-    let env_shell = std::env::var_os("SHELL").map(PathBuf::from);
+    let env_shell = crate::utils::process_env::var_os("SHELL").map(PathBuf::from);
     let prefer_bash = env_shell
         .as_ref()
         .is_some_and(|path| path.display().to_string().contains("bash"));
@@ -192,7 +203,18 @@ pub fn exec(
     }
     let provider = get_shell_config()?;
     let id = &uuid::Uuid::new_v4().simple().to_string()[..4];
-    let sandbox_tmp_dir = crate::utils::permissions::filesystem::get_claude_temp_dir();
+    // `Shell.ts:204-207`: `posixJoin(CLAUDE_CODE_TMPDIR || '/tmp',
+    // getClaudeTempDirName())`, not `getClaudeTempDir()`: no symlink
+    // resolution, so on macOS this is `/tmp/claude-<uid>`. Sandboxing runs on
+    // macOS and Linux only, where `node:path.join` is the POSIX one.
+    let sandbox_tmp_dir = crate::utils::fs_operations::native::join_path(
+        &crate::utils::process_env::var_os("CLAUDE_CODE_TMPDIR")
+            .as_deref()
+            .truthy()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp")),
+        Path::new(&crate::utils::permissions::filesystem::get_claude_temp_dir_name()),
+    );
     let built = provider
         .build_exec_command(
             command,
@@ -225,13 +247,24 @@ pub fn exec(
     }
 
     let (program, args, sandbox_cleanup_paths) = if options.should_use_sandbox {
-        std::fs::create_dir_all(&sandbox_tmp_dir).map_err(|error| error.to_string())?;
-        #[cfg(unix)]
+        // `Shell.ts:266-272`: create sandbox temp directory for sandboxed
+        // processes with secure permissions; a failure is logged, not fatal.
+        // CC creates it after wrapping the command; here before, as bwrap
+        // binds only writable paths that exist.
+        if let Err(error) = crate::utils::fs_operations::get_fs_implementation()
+            .mkdir_sync(&sandbox_tmp_dir, Some(0o700))
         {
-            use std::os::unix::fs::PermissionsExt as _;
-            std::fs::set_permissions(&sandbox_tmp_dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|error| error.to_string())?;
+            crate::utils::debug::log_for_debugging(&format!(
+                "Failed to create {} directory: {error}",
+                sandbox_tmp_dir.display()
+            ));
         }
+        // Cometix forward-port of 2.1.285 (user, 10-03): its sandbox temp
+        // directory is the same per-uid root `/copy` uses, and is refused
+        // unless it is the user's own; 2.1.88 uses one another user created.
+        #[cfg(unix)]
+        crate::utils::permissions::filesystem::verify_owned_temp_dir(&sandbox_tmp_dir)
+            .map_err(|error| error.to_string())?;
         let settings = crate::utils::settings::get_initial_settings();
         let wrapped = crate::utils::sandbox::sandbox_adapter::wrap_shell_command(
             &provider.shell_path().display().to_string(),
@@ -398,6 +431,20 @@ pub fn run_command_streaming(
     if let Some(cwd) = cwd {
         process.current_dir(cwd);
     }
+    // The PowerShell branch of CC `Shell.ts:317-328`'s env. `SHELL: undefined`
+    // removes the key (Node skips undefined values). `envOverrides` would come
+    // from `powershellProvider.getEnvironmentOverrides`, which is not ported.
+    crate::utils::subprocess_env::apply_subprocess_env_std(&mut process);
+    process
+        .env_remove("SHELL")
+        .env("GIT_EDITOR", "true")
+        .env("CLAUDECODE", "1");
+    if crate::utils::build_profile::build_audience().is_internal() {
+        process.env(
+            "CLAUDE_CODE_SESSION_ID",
+            crate::bootstrap::state::get_session_id(),
+        );
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -525,6 +572,7 @@ pub fn shell_timeout_ms(input: &serde_json::Value) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[cfg(unix)]
     #[test]
@@ -545,7 +593,7 @@ mod tests {
 
     #[test]
     fn shell_override_and_provider_command_execute_with_raw_file_output() {
-        struct ShellRestore(Option<crate::utils::env_utils::EnvVarGuard>);
+        struct ShellRestore(Option<EnvVarGuard>);
         impl Drop for ShellRestore {
             fn drop(&mut self) {
                 drop(self.0.take());
@@ -553,11 +601,8 @@ mod tests {
             }
         }
 
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _restore = ShellRestore(Some(crate::utils::env_utils::EnvVarGuard::set(
-            "COMETIX_WRITE_ENABLED",
-            "1",
-        )));
+        let _env = TEST_ENV_LOCK.lock().unwrap();
+        let _restore = ShellRestore(Some(EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1")));
         reset_shell_config_for_test();
         let command = exec(
             "printf partial; printf err >&2",
@@ -599,28 +644,25 @@ mod tests {
                 let _ = std::fs::remove_dir_all(&self.0);
             }
         }
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-shell-stdin-{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("input.txt"), "provided").unwrap();
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root);
-        let _prefix = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SHELL_PREFIX");
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root);
+        let _prefix = EnvVarGuard::unset("CLAUDE_CODE_SHELL_PREFIX");
         let _restore = Restore(root.clone());
         reset_shell_config_for_test();
         for shell in ["/bin/bash", "/bin/zsh"] {
             if !Path::new(shell).is_file() {
                 continue;
             }
-            let _shell = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CODE_SHELL", shell);
+            let _shell = EnvVarGuard::set("CLAUDE_CODE_SHELL", shell);
             reset_shell_config_for_test();
             for write_enabled in ["1", "0"] {
-                let _writes = crate::utils::env_utils::EnvVarGuard::set(
-                    "COMETIX_WRITE_ENABLED",
-                    write_enabled,
-                );
+                let _writes = EnvVarGuard::set("COMETIX_WRITE_ENABLED", write_enabled);
                 for (input, expected) in [
                     ("printf before && /bin/cat && printf after", "beforeafter"),
                     ("printf before; /bin/cat; printf after", "beforeafter"),

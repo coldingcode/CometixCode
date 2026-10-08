@@ -12,6 +12,8 @@
 //! alternate global environment contract: pane teammates are identified through
 //! the official `--agent-id`, `--agent-name`, and `--team-name` CLI args.
 
+#[cfg(test)]
+use crate::utils::test_env::TestStateLock;
 use std::sync::{LazyLock, RwLock};
 
 /// Maps to: CC `utils/teammate.ts` `dynamicTeamContext` object.
@@ -29,8 +31,8 @@ static DYNAMIC_TEAM_CONTEXT: LazyLock<RwLock<Option<DynamicTeamContext>>> =
     LazyLock::new(|| RwLock::new(None));
 
 #[cfg(test)]
-pub(crate) static TEST_TEAMMATE_CONTEXT_LOCK: LazyLock<crate::utils::env_utils::TestStateLock> =
-    LazyLock::new(crate::utils::env_utils::TestStateLock::new);
+pub(crate) static TEST_TEAMMATE_CONTEXT_LOCK: LazyLock<TestStateLock> =
+    LazyLock::new(TestStateLock::new);
 
 /// Maps to: CC `utils/teammate.ts#setDynamicTeamContext`.
 pub fn set_dynamic_team_context(context: Option<DynamicTeamContext>) {
@@ -129,8 +131,7 @@ pub fn is_plan_mode_required() -> bool {
         return context.plan_mode_required;
     }
     crate::utils::env_utils::is_env_truthy(
-        std::env::var(crate::utils::swarm::constants::PLAN_MODE_REQUIRED_ENV_VAR)
-            .ok()
+        crate::utils::process_env::var(crate::utils::swarm::constants::PLAN_MODE_REQUIRED_ENV_VAR)
             .as_deref(),
     )
 }
@@ -151,6 +152,7 @@ pub fn is_team_lead(lead_agent_id: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     fn context() -> DynamicTeamContext {
         DynamicTeamContext {
@@ -190,7 +192,7 @@ mod tests {
     #[test]
     fn plan_mode_required_falls_back_to_official_env_when_not_dynamic_teammate() {
         let _lock = TEST_TEAMMATE_CONTEXT_LOCK.lock().unwrap();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         clear_dynamic_team_context();
         crate::utils::process_env::remove(
             crate::utils::swarm::constants::PLAN_MODE_REQUIRED_ENV_VAR,

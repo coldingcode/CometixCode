@@ -12,6 +12,7 @@ use crate::types::permissions::{
 };
 use crate::utils::feature_flags::{FeatureFlag, feature_enabled};
 use crate::utils::permissions::permission_result::{PermissionDecisionReason, PermissionResult};
+use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::constants::SettingSource;
 use ignore::Match;
 use ignore::gitignore::GitignoreBuilder;
@@ -68,12 +69,6 @@ pub enum FilePermissionType {
 pub type FilesystemPermissionType = FilePermissionType;
 pub type PathSafety = PathSafetyForAutoEdit;
 
-fn permission_home_dir() -> Option<String> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-}
-
 fn normalize_permission_path_buf(path: impl AsRef<Path>) -> PathBuf {
     let mut normalized = PathBuf::new();
     for component in path.as_ref().components() {
@@ -96,11 +91,12 @@ fn normalize_permission_path(path: &str) -> String {
 
 fn expand_permission_path(path: &str) -> String {
     let expanded = if path == "~" {
-        permission_home_dir().unwrap_or_else(|| path.to_string())
+        crate::utils::node_os::homedir().display().to_string()
     } else if let Some(rest) = path.strip_prefix("~/") {
-        permission_home_dir()
-            .map(|home| PathBuf::from(home).join(rest).display().to_string())
-            .unwrap_or_else(|| path.to_string())
+        crate::utils::node_os::homedir()
+            .join(rest)
+            .display()
+            .to_string()
     } else {
         path.to_string()
     };
@@ -227,7 +223,12 @@ fn pattern_with_root(pattern: &str, source: PermissionRuleSource) -> (String, Op
         if rest.starts_with('/') {
             return (
                 rest.to_string(),
-                permission_home_dir().map(|home| home.nfc().collect::<String>()),
+                Some(
+                    crate::utils::node_os::homedir()
+                        .to_string_lossy()
+                        .nfc()
+                        .collect::<String>(),
+                ),
             );
         }
     }
@@ -373,17 +374,7 @@ pub fn normalize_patterns_to_path(
 }
 
 /// Maps to CC `matchingRuleForInput(...)`, including npm `ignore` semantics.
-pub fn matching_rule_for_input(
-    path: &str,
-    context: &ToolPermissionContext,
-    tool_type: FilePermissionType,
-    behavior: PermissionBehavior,
-) -> Option<PermissionRule> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    matching_rule_for_input_at_cwd(path, context, tool_type, behavior, &cwd)
-}
-
-pub(crate) fn matching_rule_for_input_at_cwd(
+pub(crate) fn matching_rule_for_input(
     path: &str,
     context: &ToolPermissionContext,
     tool_type: FilePermissionType,
@@ -442,12 +433,12 @@ pub fn path_in_allowed_working_path(
     let paths = if let Some(paths) = precomputed_paths_to_check {
         paths
     } else {
-        owned_paths = paths_to_check(path);
+        owned_paths = paths_to_check(path, &host_cwd());
         &owned_paths
     };
     let working_paths = all_working_directories(context)
         .into_iter()
-        .flat_map(|working_directory| paths_to_check(&working_directory))
+        .flat_map(|working_directory| paths_to_check(&working_directory, &host_cwd()))
         .collect::<Vec<_>>();
     paths.iter().all(|candidate| {
         working_paths
@@ -461,7 +452,8 @@ fn contains_vulnerable_unc_path(path: &str) -> bool {
 }
 
 fn has_suspicious_windows_path_pattern(path: &str) -> bool {
-    if (cfg!(target_os = "windows") || crate::utils::env::is_wsl())
+    use crate::utils::platform::{Platform, get_platform};
+    if matches!(get_platform(), Platform::Windows | Platform::Wsl)
         && path.get(2..).is_some_and(|tail| tail.contains(':'))
     {
         return true;
@@ -478,7 +470,7 @@ fn has_suspicious_windows_path_pattern(path: &str) -> bool {
 }
 
 /// Maps to CC `isClaudeSettingsPath(filePath)`.
-pub fn is_claude_settings_path_at_cwd(file_path: &str, cwd: &Path) -> bool {
+pub fn is_claude_settings_path(file_path: &str, cwd: &Path) -> bool {
     let expanded = crate::utils::path::expand_path(file_path, Some(cwd))
         .unwrap_or_else(|_| PathBuf::from(file_path));
     let normalized = normalize_for_permission_comparison(&expanded.display().to_string());
@@ -495,13 +487,10 @@ pub fn is_claude_settings_path_at_cwd(file_path: &str, cwd: &Path) -> bool {
 }
 
 fn is_claude_config_file_path(file_path: &str) -> bool {
-    let expanded = normalize_for_permission_comparison(&expand_permission_path(file_path));
-    if expanded.ends_with("/.claude/settings.json")
-        || expanded.ends_with("/.claude/settings.local.json")
-    {
+    let cwd = crate::bootstrap::state::get_original_cwd();
+    if is_claude_settings_path(file_path, &cwd) {
         return true;
     }
-    let cwd = crate::bootstrap::state::get_original_cwd();
     ["commands", "agents", "skills"].iter().any(|directory| {
         path_in_working_path(
             file_path,
@@ -540,7 +529,7 @@ pub fn check_path_safety_for_auto_edit(
     let paths = if let Some(paths) = precomputed_paths_to_check {
         paths
     } else {
-        owned_paths = paths_to_check(path);
+        owned_paths = paths_to_check(path, &host_cwd());
         &owned_paths
     };
     if paths
@@ -580,12 +569,10 @@ pub fn check_path_safety_for_auto_edit(
 }
 
 /// Maps to CC `checkEditableInternalPath(...)`.
-pub(crate) fn check_editable_internal_path(path: &str) -> Option<PermissionDecisionReason> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    check_editable_internal_path_at_cwd(path, &cwd)
-}
-
-fn check_editable_internal_path_at_cwd(path: &str, cwd: &Path) -> Option<PermissionDecisionReason> {
+pub(crate) fn check_editable_internal_path(
+    path: &str,
+    cwd: &Path,
+) -> Option<PermissionDecisionReason> {
     let normalized = normalize_permission_path_buf(Path::new(path));
     if is_session_plan_file(&normalized) {
         return Some(PermissionDecisionReason::Other {
@@ -602,10 +589,14 @@ fn check_editable_internal_path_at_cwd(path: &str, cwd: &Path) -> Option<Permiss
     // compile-time `anthropic_internal` Cargo feature so the env key and
     // policy are absent from external binaries.
     #[cfg(feature = "anthropic_internal")]
-    if let Some(job_dir) = std::env::var_os("CLAUDE_JOB_DIR").map(PathBuf::from) {
+    if let Some(job_dir) = crate::utils::process_env::var_os("CLAUDE_JOB_DIR")
+        .as_deref()
+        .truthy()
+        .map(PathBuf::from)
+    {
         let jobs_root = crate::utils::env_utils::get_claude_config_home_dir().join("jobs");
-        let job_forms = paths_to_check(&job_dir.display().to_string());
-        let jobs_root_forms = paths_to_check(&jobs_root.display().to_string());
+        let job_forms = paths_to_check(&job_dir.display().to_string(), cwd);
+        let jobs_root_forms = paths_to_check(&jobs_root.display().to_string(), cwd);
         let job_dir_is_trusted = job_forms.iter().all(|job_form| {
             jobs_root_forms.iter().any(|root_form| {
                 normalize_for_permission_comparison(job_form)
@@ -614,7 +605,7 @@ fn check_editable_internal_path_at_cwd(path: &str, cwd: &Path) -> Option<Permiss
             })
         });
         if job_dir_is_trusted {
-            let target_forms = paths_to_check(&normalized.display().to_string());
+            let target_forms = paths_to_check(&normalized.display().to_string(), cwd);
             if target_forms.iter().all(|target| {
                 job_forms
                     .iter()
@@ -633,7 +624,7 @@ fn check_editable_internal_path_at_cwd(path: &str, cwd: &Path) -> Option<Permiss
         });
     }
     if !crate::memdir::paths::has_auto_mem_path_override()
-        && crate::memdir::paths::is_auto_mem_path_from_trusted_sources(&normalized)
+        && crate::memdir::paths::is_auto_mem_path(&normalized)
     {
         return Some(PermissionDecisionReason::Other {
             reason: "auto memory files are allowed for writing".to_string(),
@@ -656,14 +647,8 @@ fn check_editable_internal_path_at_cwd(path: &str, cwd: &Path) -> Option<Permiss
 }
 
 /// Maps to CC `checkReadableInternalPath(...)` (:1611-1777).
-pub(crate) fn check_readable_internal_path(path: &str) -> Option<PermissionDecisionReason> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    check_readable_internal_path_at_cwd(path, &cwd)
-}
-
-/// Async-context-cwd projection of CC `checkReadableInternalPath(...)`.
-/// Read/Glob/Grep callers must not consult the process cwd for subagents.
-pub(crate) fn check_readable_internal_path_at_cwd(
+/// Callers pass the async-context cwd; this does not consult the process cwd.
+pub(crate) fn check_readable_internal_path(
     path: &str,
     cwd: &Path,
 ) -> Option<PermissionDecisionReason> {
@@ -713,7 +698,7 @@ pub(crate) fn check_readable_internal_path_at_cwd(
             reason: "Agent memory files are allowed for reading".to_string(),
         });
     }
-    if crate::memdir::paths::is_auto_mem_path_from_trusted_sources(&normalized) {
+    if crate::memdir::paths::is_auto_mem_path(&normalized) {
         return Some(PermissionDecisionReason::Other {
             reason: "auto memory files are allowed for reading".to_string(),
         });
@@ -746,22 +731,135 @@ pub fn is_scratchpad_enabled() -> bool {
     feature_enabled(FeatureFlag::Scratchpad)
 }
 
-/// Maps to CC `getClaudeTempDirName()`.
+/// Maps to CC `getClaudeTempDirName()` (`filesystem.ts:307-315`).
 pub fn get_claude_temp_dir_name() -> String {
-    if cfg!(target_os = "windows") {
-        "claude".to_string()
-    } else {
-        format!("claude-{}", current_uid())
+    use crate::utils::platform::{Platform, get_platform};
+    if get_platform() == Platform::Windows {
+        return "claude".to_string();
     }
+    // Use UID to create per-user directories, preventing permission conflicts
+    // when multiple users share the same /tmp directory
+    format!("claude-{}", current_uid())
 }
 
-/// Maps to CC `getClaudeTempDir()`.
+/// Cometix forward-port of CC 2.1.285's check of its per-uid temp root
+/// (user, 10-03), used by `/copy` and the sandbox temp directory. Opens the
+/// directory without following a symlink and requires the user's own uid,
+/// fixing a mode other than 0700. A directory owned by someone else is
+/// accepted, with a warning, when running as root in a container
+/// (`CLAUDE_CODE_CONTAINER_ID`, trimmed as 2.1.285's environment reads are).
+#[cfg(unix)]
+pub(crate) fn verify_owned_temp_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    const HINT: &str =
+        "Set CLAUDE_CODE_TMPDIR to a directory you control, or ask an administrator to remove it.";
+    let uid = current_uid();
+    let shown = dir.display();
+    // `e.replace(/[\/]+$/, "") || e`
+    let bytes = dir.as_os_str().as_bytes();
+    let path = match bytes.iter().rposition(|byte| *byte != b'/') {
+        Some(last) => Path::new(std::ffi::OsStr::from_bytes(&bytes[..=last])),
+        None => dir,
+    };
+    let directory = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(directory) => directory,
+        Err(error) => {
+            return Err(match error.raw_os_error() {
+                Some(libc::ELOOP | libc::ENOTDIR) => std::io::Error::other(format!(
+                    "Temp directory {shown} is not a directory (may be an attacker-planted symlink). Refusing to use it. {HINT}"
+                )),
+                Some(libc::EACCES) => match std::fs::symlink_metadata(path)
+                    .ok()
+                    .map(|metadata| metadata.uid())
+                    .filter(|owner| *owner != uid)
+                {
+                    Some(owner) => std::io::Error::other(format!(
+                        "Temp directory {shown} is owned by uid {owner}, expected {uid}. Refusing to use it \u{2014} another user may have pre-created it. {HINT}"
+                    )),
+                    None => std::io::Error::other(format!(
+                        "Temp directory {shown} is not readable (its mode may have been altered, or a path component denies search). Refusing to use it \u{2014} restore its permissions (chmod 0700) or remove it. {HINT}"
+                    )),
+                },
+                _ => error,
+            });
+        }
+    };
+    let metadata = directory.metadata()?;
+    if metadata.uid() != uid {
+        if uid == 0
+            && crate::utils::process_env::var("CLAUDE_CODE_CONTAINER_ID")
+                .map(|value| value.trim().to_owned())
+                .truthy()
+                .is_some()
+        {
+            // `logForDiagnosticsNoPII('warn', 'tempdir_owner_mismatch', …)`;
+            // `diagLogs.ts` is not ported, so this goes to the debug log.
+            crate::utils::debug::log_for_debugging(&format!(
+                "tempdir_owner_mismatch: observed uid {}",
+                metadata.uid()
+            ));
+            return Ok(());
+        }
+        return Err(std::io::Error::other(format!(
+            "Temp directory {shown} is owned by uid {}, expected {uid}. Refusing to use it \u{2014} another user may have pre-created it. {HINT}",
+            metadata.uid()
+        )));
+    }
+    if metadata.mode() & 0o777 != 0o700 {
+        directory.set_permissions(std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// Maps to CC `getClaudeTempDir()` (`filesystem.ts:331-346`), memoized: the
+/// per-user temp directory under `CLAUDE_CODE_TMPDIR || (Windows ? tmpdir() :
+/// '/tmp')` with the base's symlinks resolved (`/tmp` is `/private/tmp` on
+/// macOS), with a trailing separator.
+///
+/// Test builds compute it on every call: under `cargo test` a directory fixed
+/// by the first test would take every later test's writes, into the real
+/// per-user temp directory.
 pub fn get_claude_temp_dir() -> PathBuf {
-    let base_tmp_dir = std::env::var_os("CLAUDE_CODE_TMPDIR")
+    #[cfg(not(test))]
+    {
+        static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        DIR.get_or_init(claude_temp_dir).clone()
+    }
+    #[cfg(test)]
+    claude_temp_dir()
+}
+
+/// The body of [`get_claude_temp_dir`].
+fn claude_temp_dir() -> PathBuf {
+    use crate::utils::platform::{Platform, get_platform};
+    let base_tmp_dir = crate::utils::process_env::var_os("CLAUDE_CODE_TMPDIR")
+        .as_deref()
+        .truthy()
         .map(PathBuf::from)
-        .unwrap_or_else(default_base_tmp_dir);
-    let resolved = base_tmp_dir.canonicalize().unwrap_or(base_tmp_dir);
-    resolved.join(get_claude_temp_dir_name())
+        .unwrap_or_else(|| {
+            if get_platform() == Platform::Windows {
+                crate::utils::node_os::tmpdir()
+            } else {
+                PathBuf::from("/tmp")
+            }
+        });
+    // Resolve symlinks in the base temp directory (e.g., /tmp -> /private/tmp
+    // on macOS) so the path matches resolved paths in permission checks.
+    let resolved = crate::utils::fs_operations::get_fs_implementation()
+        .realpath_sync(&base_tmp_dir)
+        .unwrap_or(base_tmp_dir);
+    let mut dir = crate::utils::fs_operations::native::join_path(
+        &resolved,
+        Path::new(&get_claude_temp_dir_name()),
+    )
+    .into_os_string();
+    dir.push(std::path::MAIN_SEPARATOR_STR);
+    PathBuf::from(dir)
 }
 
 /// Maps to CC `getBundledSkillsRoot()` (:365-369). The process-random nonce
@@ -776,11 +874,18 @@ pub fn get_bundled_skills_root() -> PathBuf {
     ROOT.clone()
 }
 
-/// Maps to CC `getProjectTempDir()`.
+/// Maps to CC `getProjectTempDir()` (`filesystem.ts:376-378`):
+/// `join(getClaudeTempDir(), sanitizePath(getOriginalCwd())) + sep`.
 pub fn get_project_temp_dir() -> PathBuf {
-    get_claude_temp_dir().join(sanitize_path_for_temp_component(
-        &crate::bootstrap::state::get_original_cwd(),
-    ))
+    let mut dir = crate::utils::fs_operations::native::join_path(
+        &get_claude_temp_dir(),
+        Path::new(&crate::utils::session_storage::sanitize_path(
+            &crate::bootstrap::state::get_original_cwd().to_string_lossy(),
+        )),
+    )
+    .into_os_string();
+    dir.push(std::path::MAIN_SEPARATOR_STR);
+    PathBuf::from(dir)
 }
 
 /// Maps to CC `getScratchpadDir()`.
@@ -796,8 +901,9 @@ pub fn ensure_scratchpad_dir() -> anyhow::Result<PathBuf> {
         anyhow::bail!("Scratchpad directory feature is not enabled");
     }
     let scratchpad_dir = get_scratchpad_dir();
-    std::fs::create_dir_all(&scratchpad_dir)?;
-    set_owner_only_permissions(&scratchpad_dir)?;
+    futures::executor::block_on(
+        crate::utils::fs_operations::get_fs_implementation().mkdir(&scratchpad_dir, Some(0o700)),
+    )?;
     Ok(scratchpad_dir)
 }
 
@@ -856,33 +962,6 @@ pub fn is_project_dir_path(path: impl AsRef<Path>) -> bool {
     path == directory || path.starts_with(directory)
 }
 
-fn default_base_tmp_dir() -> PathBuf {
-    if cfg!(target_os = "windows") {
-        std::env::temp_dir()
-    } else {
-        PathBuf::from("/tmp")
-    }
-}
-
-fn sanitize_path_for_temp_component(path: &Path) -> String {
-    let mut sanitized = path
-        .display()
-        .to_string()
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    if sanitized.is_empty() {
-        sanitized.push('-');
-    }
-    sanitized
-}
-
 fn normalize_internal_path(path: impl AsRef<Path>) -> PathBuf {
     path.as_ref().canonicalize().unwrap_or_else(|_| {
         let mut normalized = PathBuf::new();
@@ -899,8 +978,9 @@ fn normalize_internal_path(path: impl AsRef<Path>) -> PathBuf {
     })
 }
 
+/// `process.getuid?.() ?? 0`.
 #[cfg(unix)]
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     unsafe extern "C" {
         fn getuid() -> u32;
     }
@@ -909,7 +989,7 @@ fn current_uid() -> u32 {
 }
 
 #[cfg(not(unix))]
-fn current_uid() -> u32 {
+pub(crate) fn current_uid() -> u32 {
     0
 }
 
@@ -926,12 +1006,11 @@ fn set_owner_only_permissions(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-fn paths_to_check(path: &str) -> Vec<String> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    paths_to_check_at_cwd(path, &cwd)
+fn host_cwd() -> PathBuf {
+    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-pub(crate) fn paths_to_check_at_cwd(path: &str, cwd: &Path) -> Vec<String> {
+pub(crate) fn paths_to_check(path: &str, cwd: &Path) -> Vec<String> {
     let expanded = crate::utils::path::expand_path(path, Some(cwd))
         .unwrap_or_else(|_| std::path::PathBuf::from(path));
     crate::utils::fs_operations::get_paths_for_permission_check(&expanded)
@@ -949,7 +1028,7 @@ fn claude_folder_session_allow_rule(
     session_context
         .always_allow_rules
         .retain(|source, _| *source == PermissionRuleSource::Session);
-    let rule = matching_rule_for_input_at_cwd(
+    let rule = matching_rule_for_input(
         path,
         &session_context,
         FilePermissionType::Edit,
@@ -977,9 +1056,7 @@ pub fn get_claude_skill_scope(file_path: &str) -> Option<(String, String)> {
             "/.claude/skills/",
         ),
         (
-            std::env::var_os("HOME")
-                .or_else(|| std::env::var_os("USERPROFILE"))
-                .map(PathBuf::from)?
+            crate::utils::node_os::homedir()
                 .join(".claude")
                 .join("skills"),
             "~/.claude/skills/",
@@ -1026,7 +1103,7 @@ pub fn generate_suggestions(
 
     if operation_type == FilesystemOperationType::Read && is_outside_working_dir {
         let directory = crate::utils::path::get_directory_for_path(file_path);
-        return paths_to_check(&directory)
+        return paths_to_check(&directory, &host_cwd())
             .into_iter()
             .filter_map(|directory| {
                 crate::utils::permissions::permission_update::create_read_rule_suggestion(
@@ -1055,7 +1132,7 @@ pub fn generate_suggestions(
             let directory = crate::utils::path::get_directory_for_path(file_path);
             updates.push(PermissionUpdate::AddDirectories {
                 destination: PermissionUpdateDestination::Session,
-                directories: paths_to_check(&directory),
+                directories: paths_to_check(&directory, &host_cwd()),
             });
         }
         return updates;
@@ -1075,7 +1152,7 @@ pub fn generate_suggestions(
 ///
 /// Rust adaptation: callers pass the path already derived from the Tool's
 /// `getPath(input)` together with the exact async-context cwd.
-pub fn check_read_permission_for_tool_at_cwd(
+pub fn check_read_permission_for_tool(
     path: &str,
     input: &serde_json::Value,
     context: &ToolPermissionContext,
@@ -1087,7 +1164,7 @@ pub fn check_read_permission_for_tool_at_cwd(
     let expanded =
         crate::utils::path::expand_path(path, Some(cwd)).unwrap_or_else(|_| PathBuf::from(path));
     let expanded_path = expanded.display().to_string();
-    let paths_to_check = paths_to_check_at_cwd(&expanded_path, cwd);
+    let paths_to_check = paths_to_check(&expanded_path, cwd);
 
     for candidate in &paths_to_check {
         if contains_vulnerable_unc_path(candidate) {
@@ -1129,7 +1206,7 @@ pub fn check_read_permission_for_tool_at_cwd(
     }
 
     for candidate in &paths_to_check {
-        if let Some(rule) = matching_rule_for_input_at_cwd(
+        if let Some(rule) = matching_rule_for_input(
             candidate,
             context,
             FilePermissionType::Read,
@@ -1144,7 +1221,7 @@ pub fn check_read_permission_for_tool_at_cwd(
         }
     }
     for candidate in &paths_to_check {
-        if let Some(rule) = matching_rule_for_input_at_cwd(
+        if let Some(rule) = matching_rule_for_input(
             candidate,
             context,
             FilePermissionType::Read,
@@ -1167,7 +1244,7 @@ pub fn check_read_permission_for_tool_at_cwd(
         }
     }
 
-    let edit_result = check_write_permission_for_tool_at_cwd(&expanded_path, input, context, cwd);
+    let edit_result = check_write_permission_for_tool(&expanded_path, input, context, cwd);
     if matches!(edit_result, PermissionResult::Allow { .. }) {
         return edit_result;
     }
@@ -1185,7 +1262,7 @@ pub fn check_read_permission_for_tool_at_cwd(
         };
     }
 
-    if let Some(decision_reason) = check_readable_internal_path_at_cwd(&expanded_path, cwd) {
+    if let Some(decision_reason) = check_readable_internal_path(&expanded_path, cwd) {
         return PermissionResult::Allow {
             updated_input: Some(input.clone()),
             user_modified: None,
@@ -1196,7 +1273,7 @@ pub fn check_read_permission_for_tool_at_cwd(
         };
     }
 
-    if let Some(rule) = matching_rule_for_input_at_cwd(
+    if let Some(rule) = matching_rule_for_input(
         &expanded_path,
         context,
         FilePermissionType::Read,
@@ -1244,21 +1321,12 @@ pub fn check_write_permission_for_tool(
     path: &str,
     input: &serde_json::Value,
     context: &ToolPermissionContext,
-) -> PermissionResult {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    check_write_permission_for_tool_at_cwd(path, input, context, &cwd)
-}
-
-pub fn check_write_permission_for_tool_at_cwd(
-    path: &str,
-    input: &serde_json::Value,
-    context: &ToolPermissionContext,
     cwd: &Path,
 ) -> PermissionResult {
-    let paths_to_check = paths_to_check(path);
+    let paths_to_check = paths_to_check(path, cwd);
 
     for path_to_check in &paths_to_check {
-        if let Some(rule) = matching_rule_for_input_at_cwd(
+        if let Some(rule) = matching_rule_for_input(
             path_to_check,
             context,
             FilePermissionType::Edit,
@@ -1273,7 +1341,7 @@ pub fn check_write_permission_for_tool_at_cwd(
         }
     }
 
-    if let Some(decision_reason) = check_editable_internal_path_at_cwd(
+    if let Some(decision_reason) = check_editable_internal_path(
         &crate::utils::path::expand_path(path, Some(cwd))
             .unwrap_or_else(|_| PathBuf::from(path))
             .display()
@@ -1344,7 +1412,7 @@ pub fn check_write_permission_for_tool_at_cwd(
     }
 
     for path_to_check in &paths_to_check {
-        if let Some(rule) = matching_rule_for_input_at_cwd(
+        if let Some(rule) = matching_rule_for_input(
             path_to_check,
             context,
             FilePermissionType::Edit,
@@ -1379,7 +1447,7 @@ pub fn check_write_permission_for_tool_at_cwd(
         };
     }
 
-    if let Some(rule) = matching_rule_for_input_at_cwd(
+    if let Some(rule) = matching_rule_for_input(
         path,
         context,
         FilePermissionType::Edit,
@@ -1450,6 +1518,32 @@ fn is_session_plan_file_for_session_with_settings(
 mod tests {
     use super::*;
     use crate::types::permissions::PermissionRuleValue;
+    use crate::utils::test_env::{EnvVarGuard, PinnedProjectDir, TEST_ENV_LOCK};
+
+    /// CC `filesystem.ts:331-346` and `:376-378`: the per-user directory
+    /// under the resolved `CLAUDE_CODE_TMPDIR`, and the project directory
+    /// under it named by `sanitizePath`, each with a trailing separator.
+    #[cfg(unix)]
+    #[test]
+    fn claude_temp_dirs_match_official_shape() {
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let root =
+            std::env::temp_dir().join(format!("cometix-temp-shape-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let resolved = root.canonicalize().unwrap();
+        let _tmp = EnvVarGuard::set("CLAUDE_CODE_TMPDIR", &root);
+        let expected = format!("{}/claude-{}/", resolved.display(), current_uid());
+        assert_eq!(get_claude_temp_dir().to_string_lossy(), expected);
+        let cwd = crate::bootstrap::state::get_original_cwd();
+        assert_eq!(
+            get_project_temp_dir().to_string_lossy(),
+            format!(
+                "{expected}{}/",
+                crate::utils::session_storage::sanitize_path(&cwd.to_string_lossy())
+            )
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     #[cfg(unix)]
@@ -1478,30 +1572,16 @@ mod tests {
         assert!(!path_in_working_path("/private/tmp-other/child", "/tmp"));
     }
 
-    struct EnvRestore {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvRestore {
-        fn set(key: &'static str, value: &Path) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-    }
-
+    /// CC `filesystem.ts:546`: the NTFS alternate-data-stream check applies
+    /// on Windows and WSL. WSL is what `/proc/version` says, which a test
+    /// cannot set, so this checks the current platform's answer.
     #[test]
-    fn wsl_requires_manual_review_for_ntfs_alternate_data_stream_paths() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        let _restore = [
-            crate::utils::env_utils::EnvVarGuard::set("WSL_DISTRO_NAME", "Ubuntu"),
-            crate::utils::env_utils::EnvVarGuard::unset("WSL_INTEROP"),
-        ];
-        assert!(has_suspicious_windows_path_pattern(
-            "/mnt/c/project/file.txt:stream"
-        ));
+    fn ntfs_alternate_data_stream_check_follows_the_platform() {
+        use crate::utils::platform::{Platform, get_platform};
+        assert_eq!(
+            has_suspicious_windows_path_pattern("/mnt/c/project/file.txt:stream"),
+            matches!(get_platform(), Platform::Windows | Platform::Wsl)
+        );
         assert!(!has_suspicious_windows_path_pattern(
             "/mnt/c/project/file.txt"
         ));
@@ -1548,7 +1628,7 @@ mod tests {
         );
         let input = serde_json::json!({"pattern": "*.rs", "path": inside});
         assert!(matches!(
-            check_read_permission_for_tool_at_cwd(
+            check_read_permission_for_tool(
                 input["path"].as_str().unwrap(),
                 &input,
                 &context,
@@ -1566,7 +1646,7 @@ mod tests {
         );
         let blocked_input = serde_json::json!({"pattern": "*", "path": blocked});
         assert!(matches!(
-            check_read_permission_for_tool_at_cwd(
+            check_read_permission_for_tool(
                 blocked_input["path"].as_str().unwrap(),
                 &blocked_input,
                 &context,
@@ -1580,7 +1660,7 @@ mod tests {
 
         context.always_deny_rules.clear();
         let outside_input = serde_json::json!({"pattern": "*", "path": outside});
-        let result = check_read_permission_for_tool_at_cwd(
+        let result = check_read_permission_for_tool(
             outside_input["path"].as_str().unwrap(),
             &outside_input,
             &context,
@@ -1608,7 +1688,7 @@ mod tests {
     #[test]
     fn readable_internal_task_carve_out_uses_requested_path_like_official() {
         use std::os::unix::fs::symlink;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let root = std::env::temp_dir().join(format!(
@@ -1623,10 +1703,10 @@ mod tests {
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(outside.join("secret.txt"), "secret").unwrap();
         symlink(&outside, config.join("tasks/escape")).unwrap();
-        let _config = EnvRestore::set("CLAUDE_CONFIG_DIR", &config);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config);
         let escaped = config.join("tasks/escape/secret.txt");
         assert!(matches!(
-            check_read_permission_for_tool_at_cwd(
+            check_read_permission_for_tool(
                 &escaped.display().to_string(),
                 &serde_json::json!({"file_path": escaped}),
                 &ToolPermissionContext::default(),
@@ -1657,7 +1737,7 @@ mod tests {
         let escaped = workspace.join("escape/secret.txt");
 
         assert!(matches!(
-            check_read_permission_for_tool_at_cwd(
+            check_read_permission_for_tool(
                 &escaped.display().to_string(),
                 &serde_json::json!({"file_path": escaped}),
                 &ToolPermissionContext::default(),
@@ -1677,7 +1757,7 @@ mod tests {
             )],
         );
         assert!(matches!(
-            check_read_permission_for_tool_at_cwd(
+            check_read_permission_for_tool(
                 &escaped.display().to_string(),
                 &serde_json::json!({"file_path": escaped}),
                 &lexical_only,
@@ -1695,7 +1775,7 @@ mod tests {
             )],
         );
         assert!(matches!(
-            check_read_permission_for_tool_at_cwd(
+            check_read_permission_for_tool(
                 &escaped.display().to_string(),
                 &serde_json::json!({"file_path": escaped}),
                 &edit_lexical_only,
@@ -1710,17 +1790,17 @@ mod tests {
     #[test]
     fn claude_settings_path_detection_normalizes_structure_and_case() {
         let cwd = std::env::temp_dir().join("cometix-settings-path-detection");
-        assert!(is_claude_settings_path_at_cwd(
+        assert!(is_claude_settings_path(
             &cwd.join(".claude/./settings.json").display().to_string(),
             &cwd,
         ));
-        assert!(is_claude_settings_path_at_cwd(
+        assert!(is_claude_settings_path(
             &cwd.join(".cLaUdE/settings.local.json")
                 .display()
                 .to_string(),
             &cwd,
         ));
-        assert!(!is_claude_settings_path_at_cwd(
+        assert!(!is_claude_settings_path(
             &cwd.join("settings.json").display().to_string(),
             &cwd,
         ));
@@ -1759,6 +1839,7 @@ mod tests {
                 &path.display().to_string(),
                 &serde_json::json!({"file_path": path}),
                 &context,
+                &root,
             ),
             PermissionResult::Deny { .. }
         ));
@@ -1793,6 +1874,7 @@ mod tests {
             &candidate,
             &serde_json::json!({"file_path": &candidate}),
             &context,
+            &std::env::current_dir().unwrap(),
         );
         assert!(
             matches!(result, PermissionResult::Deny { .. }),
@@ -1806,7 +1888,7 @@ mod tests {
     #[test]
     fn internal_template_job_carve_out_rejects_hijack_and_symlink_escape() {
         use std::os::unix::fs::symlink;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-template-job-permission-{}",
             uuid::Uuid::new_v4().simple()
@@ -1816,12 +1898,12 @@ mod tests {
         let outside = root.join("outside");
         std::fs::create_dir_all(&job).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
-        let _config = EnvRestore::set("CLAUDE_CONFIG_DIR", &config);
-        let _job = EnvRestore::set("CLAUDE_JOB_DIR", &job);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config);
+        let _job = EnvVarGuard::set("CLAUDE_JOB_DIR", &job);
         let context = ToolPermissionContext::default();
         let inside = job.join("result.txt");
         assert!(matches!(
-            check_write_permission_for_tool_at_cwd(
+            check_write_permission_for_tool(
                 &inside.display().to_string(),
                 &serde_json::json!({"file_path": inside}),
                 &context,
@@ -1834,10 +1916,10 @@ mod tests {
         ));
 
         {
-            let _hijacked_job = EnvRestore::set("CLAUDE_JOB_DIR", &outside);
+            let _hijacked_job = EnvVarGuard::set("CLAUDE_JOB_DIR", &outside);
             let hijacked = outside.join("result.txt");
             assert!(!matches!(
-                check_write_permission_for_tool_at_cwd(
+                check_write_permission_for_tool(
                     &hijacked.display().to_string(),
                     &serde_json::json!({"file_path": hijacked}),
                     &context,
@@ -1853,7 +1935,7 @@ mod tests {
         symlink(&outside, job.join("escape")).unwrap();
         let escaped = job.join("escape/result.txt");
         assert!(!matches!(
-            check_write_permission_for_tool_at_cwd(
+            check_write_permission_for_tool(
                 &escaped.display().to_string(),
                 &serde_json::json!({"file_path": escaped}),
                 &context,
@@ -1875,7 +1957,7 @@ mod tests {
         ));
         let path = cwd.join(".claude/agent-memory/reviewer/MEMORY.md");
         assert!(matches!(
-            check_write_permission_for_tool_at_cwd(
+            check_write_permission_for_tool(
                 &path.display().to_string(),
                 &serde_json::json!({"file_path": path}),
                 &ToolPermissionContext::default(),
@@ -1891,7 +1973,7 @@ mod tests {
     #[test]
     fn matcher_uses_ignore_negation_double_star_and_source_precedence() {
         // Matcher roots resolve against the project dir.
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let cwd = crate::bootstrap::state::get_original_cwd();
         let mut context = ToolPermissionContext::default();
         context.always_deny_rules.insert(
@@ -1915,6 +1997,7 @@ mod tests {
             &context,
             FilePermissionType::Edit,
             PermissionBehavior::Deny,
+            &cwd,
         )
         .expect("double-star pattern matches nested path");
         assert_eq!(matched.source, PermissionRuleSource::Session);
@@ -1924,6 +2007,7 @@ mod tests {
                 &context,
                 FilePermissionType::Edit,
                 PermissionBehavior::Deny,
+                &cwd,
             )
             .is_none()
         );
@@ -1943,6 +2027,7 @@ mod tests {
                 &context,
                 FilePermissionType::Edit,
                 PermissionBehavior::Deny,
+                &cwd,
             )
             .is_some()
         );
@@ -1952,6 +2037,7 @@ mod tests {
                 &context,
                 FilePermissionType::Edit,
                 PermissionBehavior::Deny,
+                &cwd,
             )
             .is_none()
         );
@@ -1995,7 +2081,7 @@ mod tests {
             }
         }
 
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-permission-root-matrix-{}",
             uuid::Uuid::new_v4().simple()
@@ -2006,7 +2092,7 @@ mod tests {
         std::fs::create_dir_all(&config_home).unwrap();
         std::fs::create_dir_all(&original_cwd).unwrap();
         std::fs::create_dir_all(&flag_dir).unwrap();
-        let _config = EnvRestore::set("CLAUDE_CONFIG_DIR", &config_home);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
         let _restore = RootRestore {
             original_cwd: crate::bootstrap::state::get_original_cwd(),
             flag_path: crate::utils::settings::get_flag_settings_path(),
@@ -2068,11 +2154,13 @@ mod tests {
 
     #[test]
     fn default_write_asks_with_accept_edits_suggestion() {
-        let path = std::env::current_dir().unwrap().join("new-write.txt");
+        let cwd = std::env::current_dir().unwrap();
+        let path = cwd.join("new-write.txt");
         let result = check_write_permission_for_tool(
             &path.display().to_string(),
             &serde_json::json!({"file_path": path}),
             &ToolPermissionContext::default(),
+            &cwd,
         );
         let PermissionResult::Ask { suggestions, .. } = result else {
             panic!("default write should ask")
@@ -2090,7 +2178,7 @@ mod tests {
     /// async cwd only determines how the relative path resolves.
     #[test]
     fn read_permission_matches_official_async_cwd_without_implicit_grant() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         struct Restore {
             original: PathBuf,
             root: PathBuf,
@@ -2114,7 +2202,7 @@ mod tests {
         crate::bootstrap::state::set_original_cwd(&original);
         let mut context = ToolPermissionContext::default();
         let input = serde_json::json!({"file_path":"a.txt"});
-        let result = check_read_permission_for_tool_at_cwd("a.txt", &input, &context, &outside);
+        let result = check_read_permission_for_tool("a.txt", &input, &context, &outside);
         assert!(matches!(
             result,
             PermissionResult::Ask {
@@ -2131,12 +2219,12 @@ mod tests {
             },
         );
         assert!(
-            matches!(check_read_permission_for_tool_at_cwd("a.txt",&input,&context,&outside),
+            matches!(check_read_permission_for_tool("a.txt",&input,&context,&outside),
             PermissionResult::Allow { updated_input:Some(value), .. } if value == input)
         );
         context.additional_working_directories.clear();
         assert!(matches!(
-            check_read_permission_for_tool_at_cwd("a.txt", &input, &context, &original),
+            check_read_permission_for_tool("a.txt", &input, &context, &original),
             PermissionResult::Allow { .. }
         ));
     }

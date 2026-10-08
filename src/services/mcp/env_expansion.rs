@@ -22,7 +22,7 @@ pub fn expand_env_vars_in_string(value: &str) -> (String, Vec<String>) {
             .split_once(":-")
             .map(|(name, default_value)| (name, Some(default_value)))
             .unwrap_or((var_content, None));
-        if let Ok(env_value) = std::env::var(name) {
+        if let Some(env_value) = crate::utils::process_env::var(name) {
             out.push_str(&env_value);
         } else if let Some(default_value) = default_value {
             out.push_str(default_value);
@@ -40,10 +40,11 @@ pub fn expand_env_vars_in_string(value: &str) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn expand_env_vars_handles_values_defaults_and_missing_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("COMETIX_MCP_ENV_PRESENT", "value");
         crate::utils::process_env::remove("COMETIX_MCP_ENV_MISSING");
         let (expanded, missing) = expand_env_vars_in_string(

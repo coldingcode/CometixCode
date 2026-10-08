@@ -86,11 +86,11 @@ pub fn resize_shell_image_output(
         if output_file_size.is_some_and(|size| size > MAX_IMAGE_FILE_SIZE) {
             return None;
         }
-        let result = crate::utils::fs_operations::read_file_range(
+        let result = futures::executor::block_on(crate::utils::fs_operations::read_file_range(
             std::path::Path::new(path),
             0,
             (MAX_IMAGE_FILE_SIZE + 1) as usize,
-        )
+        ))
         .ok()??;
         if result.bytes_total > MAX_IMAGE_FILE_SIZE {
             return None;
@@ -170,11 +170,7 @@ pub(crate) fn reset_cwd_if_outside_project(
         return (None, false);
     };
     let original = crate::bootstrap::state::get_original_cwd();
-    let maintain = crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR")
-            .ok()
-            .as_deref(),
-    );
+    let maintain = crate::utils::env_utils::should_maintain_project_working_dir();
     let outside = cwd_after != original
         && !crate::utils::permissions::filesystem::path_in_allowed_working_path(
             &cwd_after.display().to_string(),
@@ -264,7 +260,7 @@ fn split_at_utf16_units(value: &str, max_units: usize) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::TEST_ENV_LOCK;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn strip_empty_lines_preserves_internal_whitespace() {
@@ -329,7 +325,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn resize_shell_image_output_rejects_swapped_artifact_symlink() {
+    fn resize_shell_image_output_follows_artifact_symlink_like_official() {
         use std::os::unix::fs::symlink;
 
         let root = std::env::temp_dir().join(format!(
@@ -347,7 +343,7 @@ mod tests {
                 Some(&output.display().to_string()),
                 Some(26),
             )
-            .is_none()
+            .is_some()
         );
         let _ = std::fs::remove_dir_all(root);
     }
@@ -374,7 +370,7 @@ mod tests {
     #[test]
     fn format_output_truncates_with_official_suffix() {
         let _lock = TEST_ENV_LOCK.lock().unwrap();
-        let _env = crate::utils::env_utils::EnvVarGuard::set("BASH_MAX_OUTPUT_LENGTH", "5");
+        let _env = EnvVarGuard::set("BASH_MAX_OUTPUT_LENGTH", "5");
         let formatted = format_output("12345\n678\n9");
         assert_eq!(formatted.total_lines, 3);
         assert_eq!(

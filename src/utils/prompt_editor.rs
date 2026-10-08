@@ -7,6 +7,7 @@
 //! prompt temp files, launch the editor inside the handoff closure, and read
 //! the result back after the user-triggered child exits.
 
+use crate::utils::process_env::JsTruthy;
 use iocraft::hooks::AppHandle;
 use std::path::{Path, PathBuf};
 
@@ -40,8 +41,12 @@ impl ExternalEditorRuntime {
         // loop blocks until it returns, then reacquires raw mode and repaints.
         let mut app = self.app;
         let program_for_err = program.clone();
-        let receiver =
-            app.suspend_terminal(move || std::process::Command::new(&program).args(&args).status());
+        let receiver = app.suspend_terminal(move || {
+            let mut command = std::process::Command::new(&program);
+            // CC `promptEditor.ts` execSync_DEPRECATED inherits process.env; the carrier is its counterpart.
+            crate::utils::subprocess_env::apply_process_env_std(&mut command);
+            command.args(&args).status()
+        });
 
         let status = match receiver.await {
             Ok(Ok(Ok(status))) => status,
@@ -131,7 +136,9 @@ fn unique_prompt_path() -> PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    std::env::temp_dir().join(format!("cometix-prompt-{}-{nanos}.md", std::process::id()))
+    // CC `promptEditor.ts:143` `generateTempFilePath()`: `join(tmpdir(), …)`.
+    crate::utils::node_os::tmpdir()
+        .join(format!("cometix-prompt-{}-{nanos}.md", std::process::id()))
 }
 
 fn editor_display_name(program: &str) -> String {
@@ -147,21 +154,39 @@ fn command_exists(command: &str) -> bool {
     if candidate.components().count() > 1 {
         return candidate.is_file();
     }
-    std::env::var_os("PATH").is_some_and(|path| {
-        std::env::split_paths(&path).any(|directory| directory.join(command).is_file())
-    })
+    // CC `editor.ts:14` resolves through `which`, which reads the startup
+    // PATH (Bun.which), as `utils/which.rs` does.
+    crate::utils::process_env::startup_snapshot()
+        .var_os("PATH")
+        .is_some_and(|path| {
+            std::env::split_paths(path).any(|directory| directory.join(command).is_file())
+        })
 }
 
 /// Resolves `$VISUAL`, `$EDITOR`, then the official `code`, `vi`, `nano`
 /// fallback order. The returned argv is executed directly, never by a shell.
+///
+/// Maps to: CC `utils/editor.ts:164` `getExternalEditor = memoize(...)` —
+/// resolved once per process. The fallback probe stats every `PATH`
+/// directory, and `PromptInput` asks on every render (to decide whether the
+/// external-editor keybinding is live); unmemoized, that probe was about a
+/// fifth of each keystroke's update. Tests that vary `$VISUAL`/`$EDITOR`
+/// rely on nextest's per-test process, exactly as CC's tests do on a fresh
+/// module instance.
 pub fn external_editor_command() -> Option<(String, Vec<String>)> {
-    let configured = std::env::var("VISUAL")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+    static RESOLVED: std::sync::OnceLock<Option<(String, Vec<String>)>> =
+        std::sync::OnceLock::new();
+    RESOLVED.get_or_init(resolve_external_editor_command).clone()
+}
+
+fn resolve_external_editor_command() -> Option<(String, Vec<String>)> {
+    let configured = crate::utils::process_env::var("VISUAL")
+        .map(|value| value.trim().to_string())
+        .truthy()
         .or_else(|| {
-            std::env::var("EDITOR")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
+            crate::utils::process_env::var("EDITOR")
+                .map(|value| value.trim().to_string())
+                .truthy()
         });
     let editor = configured.or_else(|| {
         ["code", "vi", "nano"]
@@ -193,6 +218,7 @@ pub fn external_editor_command() -> Option<(String, Vec<String>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn editor_display_name_uses_executable_basename() {
@@ -235,7 +261,7 @@ mod tests {
         use iocraft::prelude::*;
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let script = std::env::temp_dir().join(format!(
             "cometix-fake-editor-{}-{}",
             std::process::id(),
@@ -249,7 +275,7 @@ mod tests {
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o700);
         std::fs::set_permissions(&script, permissions).unwrap();
-        let _visual = crate::utils::env_utils::EnvVarGuard::set("VISUAL", &script);
+        let _visual = EnvVarGuard::set("VISUAL", &script);
 
         let canvases = futures::executor::block_on(
             element!(PromptEditorHarness)

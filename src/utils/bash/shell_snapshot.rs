@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 const SNAPSHOT_CREATION_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Maps to CC `utils/bash/ShellSnapshot.ts:181-192` `getConfigFile`.
-fn get_config_file(shell_path: &str, env: &crate::utils::process_env::EnvSnapshot) -> PathBuf {
+fn get_config_file(shell_path: &str) -> PathBuf {
     let file = if shell_path.contains("zsh") {
         ".zshrc"
     } else if shell_path.contains("bash") {
@@ -16,11 +16,7 @@ fn get_config_file(shell_path: &str, env: &crate::utils::process_env::EnvSnapsho
     } else {
         ".profile"
     };
-    env.var_os("HOME")
-        .or_else(|| env.var_os("USERPROFILE"))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(file)
+    crate::utils::node_os::homedir().join(file)
 }
 
 fn create_argv0_shell_function(
@@ -186,7 +182,7 @@ fn get_snapshot_script(
     config_exists: bool,
     env: &crate::utils::process_env::EnvSnapshot,
 ) -> String {
-    let config = get_config_file(shell_path, env);
+    let config = get_config_file(shell_path);
     let is_zsh = config.ends_with(".zshrc");
     let user = if config_exists {
         get_user_snapshot_content(&config)
@@ -238,7 +234,10 @@ fn run_snapshot_command(
             }
             #[cfg(windows)]
             {
-                let _ = std::process::Command::new("taskkill")
+                let mut taskkill = std::process::Command::new("taskkill");
+                // Rust-only tree kill; every child takes the carrier (process.env) as its base.
+                crate::utils::subprocess_env::apply_process_env_std(&mut taskkill);
+                let _ = taskkill
                     .args(["/PID", &child.id().to_string(), "/T", "/F"])
                     .status();
             }
@@ -262,10 +261,9 @@ pub fn create_and_save_snapshot(bin_shell: &str) -> Option<PathBuf> {
     } else {
         "sh"
     };
-    let config = get_config_file(bin_shell, &process_env);
+    let config = get_config_file(bin_shell);
     let snapshots_dir =
-        crate::utils::env_utils::get_claude_config_home_dir_from_snapshot(&process_env)
-            .join("shell-snapshots");
+        crate::utils::env_utils::get_claude_config_home_dir().join("shell-snapshots");
     if std::fs::create_dir_all(&snapshots_dir).is_err() {
         return None;
     }
@@ -317,16 +315,14 @@ pub fn create_and_save_snapshot(bin_shell: &str) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     /// CC `utils/bash/ShellSnapshot.ts:269-340` captures the current
     /// `process.env.PATH` in the generated snapshot script.
     #[test]
     fn shell_integrations_match_official_snapshot_shape_and_path_capture() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _path = crate::utils::env_utils::EnvVarGuard::set(
-            "PATH",
-            "/cometix/carrier-only-snapshot-path",
-        );
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _path = EnvVarGuard::set("PATH", "/cometix/carrier-only-snapshot-path");
         let env = crate::utils::process_env::snapshot();
         let (kind, snippet) = create_ripgrep_shell_integration();
         assert!(matches!(kind.as_str(), "alias" | "function"));

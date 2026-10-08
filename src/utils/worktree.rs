@@ -169,18 +169,19 @@ fn command_output(mut command: Command) -> anyhow::Result<(i32, String, String)>
     ))
 }
 
-fn git_no_prompt(cwd: &Path, args: &[&str]) -> anyhow::Result<(i32, String, String)> {
-    let mut command = Command::new("git");
-    command
-        .args(args)
-        .current_dir(cwd)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_ASKPASS", "");
+/// Runs git the way CC worktree.ts does outside its fetches
+/// (`execFileNoThrowWithCwd(gitExe(), args, { cwd })`): process.env with
+/// nothing added. CC sets `GIT_TERMINAL_PROMPT`/`GIT_ASKPASS` only on the
+/// fetch env (`worktree.ts:199-201,260`), and this port does not fetch.
+fn git_command_output(cwd: &Path, args: &[&str]) -> anyhow::Result<(i32, String, String)> {
+    let mut command = Command::new(crate::utils::git::git_exe());
+    crate::utils::subprocess_env::apply_process_env_std(&mut command);
+    command.args(args).current_dir(cwd);
     command_output(command)
 }
 
 fn git_stdout(cwd: &Path, args: &[&str]) -> anyhow::Result<String> {
-    let (code, stdout, stderr) = git_no_prompt(cwd, args)?;
+    let (code, stdout, stderr) = git_command_output(cwd, args)?;
     if code != 0 {
         anyhow::bail!("git {} failed: {}", args.join(" "), stderr.trim());
     }
@@ -209,7 +210,7 @@ fn get_or_create_worktree(repo_root: &Path, slug: &str) -> anyhow::Result<Worktr
     std::fs::create_dir_all(worktrees_dir(repo_root))?;
     let head_commit = git_stdout(repo_root, &["rev-parse", "HEAD"])?;
     let worktree_path_arg = worktree_path.to_string_lossy().to_string();
-    let (code, _stdout, stderr) = git_no_prompt(
+    let (code, _stdout, stderr) = git_command_output(
         repo_root,
         &[
             "worktree",
@@ -258,12 +259,10 @@ fn load_worktree_hooks_config_and_context(
         .collect();
     let cwd = cwd.display().to_string();
     let hook_context = crate::services::hooks::HookContext {
-        cwd: cwd.clone(),
-        project_dir: cwd,
+        cwd,
         ..Default::default()
     };
-    let base_env = crate::services::hooks::build_hook_env_vars(&hook_context);
-    Some((config, hook_context, base_env))
+    Some((config, hook_context, Vec::new()))
 }
 
 /// Maps to: CC `utils/worktree.ts` `createAgentWorktree(...)`.
@@ -339,7 +338,7 @@ pub fn remove_agent_worktree(
     };
     let root = Path::new(git_root);
     let Ok((remove_code, _stdout, _stderr)) =
-        git_no_prompt(root, &["worktree", "remove", "--force", worktree_path])
+        git_command_output(root, &["worktree", "remove", "--force", worktree_path])
     else {
         return false;
     };
@@ -347,7 +346,7 @@ pub fn remove_agent_worktree(
         return false;
     }
     if let Some(branch) = worktree_branch {
-        let _ = git_no_prompt(root, &["branch", "-D", branch]);
+        let _ = git_command_output(root, &["branch", "-D", branch]);
     }
     true
 }
@@ -355,7 +354,8 @@ pub fn remove_agent_worktree(
 /// Maps to: CC `utils/worktree.ts` `hasWorktreeChanges(...)`.
 pub fn has_worktree_changes(worktree_path: &str, head_commit: &str) -> bool {
     let path = Path::new(worktree_path);
-    let Ok((status_code, status_stdout, _stderr)) = git_no_prompt(path, &["status", "--porcelain"])
+    let Ok((status_code, status_stdout, _stderr)) =
+        git_command_output(path, &["status", "--porcelain"])
     else {
         return true;
     };
@@ -363,7 +363,8 @@ pub fn has_worktree_changes(worktree_path: &str, head_commit: &str) -> bool {
         return true;
     }
     let range = format!("{head_commit}..HEAD");
-    let Ok((rev_code, rev_stdout, _stderr)) = git_no_prompt(path, &["rev-list", "--count", &range])
+    let Ok((rev_code, rev_stdout, _stderr)) =
+        git_command_output(path, &["rev-list", "--count", &range])
     else {
         return true;
     };
@@ -388,7 +389,7 @@ pub fn count_worktree_changes(
 ) -> Option<WorktreeChangeSummary> {
     let path = Path::new(worktree_path);
     let (status_code, status_stdout, _stderr) =
-        git_no_prompt(path, &["status", "--porcelain"]).ok()?;
+        git_command_output(path, &["status", "--porcelain"]).ok()?;
     if status_code != 0 {
         return None;
     }
@@ -402,7 +403,7 @@ pub fn count_worktree_changes(
     };
     let range = format!("{original_head_commit}..HEAD");
     let (rev_code, rev_stdout, _stderr) =
-        git_no_prompt(path, &["rev-list", "--count", &range]).ok()?;
+        git_command_output(path, &["rev-list", "--count", &range]).ok()?;
     if rev_code != 0 {
         return None;
     }
@@ -420,6 +421,8 @@ fn get_branch(cwd: &Path) -> anyhow::Result<String> {
 /// Maps to: CC `utils/worktree.ts` `killTmuxSession(...)`.
 pub fn kill_tmux_session(session_name: &str) -> bool {
     let mut command = Command::new("tmux");
+    // CC killTmuxSession: execFileNoThrow, so process.env.
+    crate::utils::subprocess_env::apply_process_env_std(&mut command);
     command.args(["kill-session", "-t", session_name]);
     match command_output(command) {
         Ok((code, _, _)) => code == 0,
@@ -758,6 +761,7 @@ pub fn worktree_exit_clean_result_message() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     fn session(tmux: bool) -> WorktreeSession {
         WorktreeSession {
@@ -852,17 +856,14 @@ mod tests {
     /// createWorktreeForSession populated (:772-775).
     #[test]
     fn keep_and_cleanup_clear_the_persisted_worktree_session_slot() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         // Without COMETIX_WRITE_ENABLED the config saves are DRY_RUN no-ops
         // and every `is_none()` below passes vacuously.
-        let _write_enabled =
-            crate::utils::env_utils::EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let config_dir = temp_root("worktree-session-slot-config");
         std::fs::create_dir_all(&config_dir).unwrap();
-        let _config_dir = crate::utils::env_utils::EnvVarGuard::set(
-            "CLAUDE_CONFIG_DIR",
-            config_dir.to_string_lossy().as_ref(),
-        );
+        let _config_dir =
+            EnvVarGuard::set("CLAUDE_CONFIG_DIR", config_dir.to_string_lossy().as_ref());
 
         // keep/cleanup now mirror CC's try/catch: a failing chdir aborts the
         // teardown, so the session must point at a real directory.
@@ -941,15 +942,12 @@ mod tests {
     /// subset).
     #[tokio::test(flavor = "current_thread")]
     async fn create_worktree_for_session_persists_the_whole_session_object() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write_enabled =
-            crate::utils::env_utils::EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _write_enabled = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let config_dir = temp_root("worktree-create-slot-config");
         std::fs::create_dir_all(&config_dir).unwrap();
-        let _config_dir = crate::utils::env_utils::EnvVarGuard::set(
-            "CLAUDE_CONFIG_DIR",
-            config_dir.to_string_lossy().as_ref(),
-        );
+        let _config_dir =
+            EnvVarGuard::set("CLAUDE_CONFIG_DIR", config_dir.to_string_lossy().as_ref());
         // The scratch root above also relocates `~/.claude.json`
         // (`utils/config.rs:119-120`), leaving the workspace UNTRUSTED — and CC
         // runs no hooks at all in that state (`utils/hooks.ts:1994-1999`,
@@ -992,7 +990,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn create_agent_worktree_git_path_detects_changes_and_removes_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_flag_settings = crate::bootstrap::state::get_flag_settings_inline();
         crate::bootstrap::state::set_flag_settings_inline(None);
         if !git_available() {
@@ -1046,7 +1044,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn create_agent_worktree_prefers_worktree_create_hook_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let previous_flag_settings = crate::bootstrap::state::get_flag_settings_inline();
         let root = temp_root("agent-worktree-hook");
         std::fs::create_dir_all(&root).unwrap();

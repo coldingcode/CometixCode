@@ -1,15 +1,13 @@
-/// Maps to: CC `utils/file.ts` `MAX_OUTPUT_SIZE` — 0.25 MiB default text-read gate.
-pub const MAX_OUTPUT_SIZE: u64 = 262_144;
+use crate::utils::fs_operations::{get_fs_implementation, safe_resolve_path};
 
 pub use crate::utils::file_read::{FileEncoding, LineEndingType};
 
+/// Maps to: CC `utils/file.ts` `MAX_OUTPUT_SIZE` — 0.25 MiB default text-read gate.
+pub const MAX_OUTPUT_SIZE: u64 = 262_144;
+
 /// Maps to CC `getFileModificationTime(filePath)` floor-to-milliseconds rule.
 pub fn get_file_modification_time_result(path: &std::path::Path) -> std::io::Result<i64> {
-    let modified = std::fs::metadata(path)?.modified()?;
-    modified
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_millis() as i64)
-        .map_err(|error| std::io::Error::other(format!("file mtime predates Unix epoch: {error}")))
+    Ok(get_fs_implementation().stat_sync(path)?.mtime_ms.floor() as i64)
 }
 
 pub fn get_file_modification_time(path: &std::path::Path) -> Option<i64> {
@@ -18,33 +16,52 @@ pub fn get_file_modification_time(path: &std::path::Path) -> Option<i64> {
 
 /// Maps to CC `detectFileEncoding(filePath)`.
 pub fn detect_file_encoding(path: &std::path::Path) -> FileEncoding {
-    crate::utils::file_read::detect_encoding_for_resolved_path(path).unwrap_or(FileEncoding::Utf8)
-}
-
-pub fn read_text_with_encoding(
-    path: &std::path::Path,
-    encoding: FileEncoding,
-) -> std::io::Result<String> {
-    let bytes = std::fs::read(path)?;
-    Ok(match encoding {
-        FileEncoding::Utf8 => String::from_utf8_lossy(&bytes).into_owned(),
-        FileEncoding::Utf16Le => {
-            let units = bytes
-                .chunks_exact(2)
-                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
-                .collect::<Vec<_>>();
-            String::from_utf16_lossy(&units)
+    let fs = get_fs_implementation();
+    let resolved = safe_resolve_path(fs.as_ref(), path);
+    match crate::utils::file_read::detect_encoding_for_resolved_path(&resolved.resolved_path) {
+        Ok(encoding) => encoding,
+        Err(error) => {
+            if crate::utils::errors::is_fs_inaccessible(&error) {
+                crate::utils::debug::log_for_debugging_with_level(
+                    &format!(
+                        "detectFileEncoding failed for expected reason: {}",
+                        crate::utils::errors::io_errno_code(&error).unwrap_or("undefined")
+                    ),
+                    crate::utils::debug::DebugLogLevel::Debug,
+                );
+            } else {
+                crate::utils::log::log_error(crate::utils::log::LogError::new(error.to_string()));
+            }
+            FileEncoding::Utf8
         }
-    })
+    }
 }
 
 /// Maps to CC `detectLineEndings(filePath, encoding)` (first 4096 bytes;
 /// CRLF wins only when its count is strictly greater than bare LF).
 pub fn detect_line_endings(path: &std::path::Path, encoding: FileEncoding) -> LineEndingType {
-    let content = read_text_with_encoding(path, encoding).unwrap_or_default();
-    crate::utils::file_read::detect_line_endings_for_string(
-        &content.chars().take(4096).collect::<String>(),
-    )
+    let fs = get_fs_implementation();
+    let resolved = safe_resolve_path(fs.as_ref(), path);
+    let sample = fs.read_sync(&resolved.resolved_path, 4096);
+    match sample {
+        Ok(sample) => {
+            let bytes = &sample.buffer[..sample.bytes_read];
+            let content = match encoding {
+                FileEncoding::Utf8 => String::from_utf8_lossy(bytes).into_owned(),
+                FileEncoding::Utf16Le => String::from_utf16_lossy(
+                    &bytes
+                        .chunks_exact(2)
+                        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                        .collect::<Vec<_>>(),
+                ),
+            };
+            crate::utils::file_read::detect_line_endings_for_string(&content)
+        }
+        Err(error) => {
+            crate::utils::log::log_error(crate::utils::log::LogError::new(error.to_string()));
+            LineEndingType::Lf
+        }
+    }
 }
 
 fn encode_text_content(content: &str, encoding: FileEncoding) -> Vec<u8> {
@@ -97,17 +114,27 @@ pub fn write_file_sync_and_flush_deprecated(
     file_path: &std::path::Path,
     bytes: &[u8],
 ) -> std::io::Result<()> {
-    let target_path = std::fs::read_link(file_path)
+    let fs = get_fs_implementation();
+    let target_path = fs
+        .readlink_sync(file_path)
         .ok()
-        .map(|target| {
-            if target.is_absolute() {
-                target
+        .and_then(|target| {
+            if crate::utils::fs_operations::native::is_absolute(&target) {
+                Some(target)
             } else {
-                file_path
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new("."))
-                    .join(target)
+                crate::utils::fs_operations::native::resolve_path(
+                    &crate::utils::fs_operations::native::dirname(file_path),
+                    &target,
+                )
+                .ok()
             }
+        })
+        .inspect(|target| {
+            crate::utils::debug::log_for_debugging(&format!(
+                "Writing through symlink: {} -> {}",
+                file_path.display(),
+                target.display()
+            ));
         })
         .unwrap_or_else(|| file_path.to_path_buf());
     write_file_sync_and_flush_to_target(&target_path, bytes)
@@ -120,6 +147,7 @@ pub fn write_file_sync_and_flush_to_target(
     target_path: &std::path::Path,
     bytes: &[u8],
 ) -> std::io::Result<()> {
+    let fs = get_fs_implementation();
     // SECURITY DEVIATION: CC uses a predictable pid/timestamp name and opens
     // it with truncation. A pre-created symlink could redirect that write.
     // Use an unguessable adjacent name plus `create_new` so no existing path
@@ -131,24 +159,37 @@ pub fn write_file_sync_and_flush_to_target(
         uuid::Uuid::new_v4().simple()
     ));
 
-    let existing_permissions = match std::fs::metadata(target_path) {
-        Ok(metadata) => Some(metadata.permissions()),
+    let existing_permissions = match fs.stat_sync(target_path) {
+        Ok(metadata) => Some(metadata.mode),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error),
     };
     let atomic_result = (|| {
         sync_write_new(&temporary_path, bytes)?;
         if let Some(permissions) = existing_permissions.clone() {
-            std::fs::set_permissions(&temporary_path, permissions)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(
+                    &temporary_path,
+                    std::fs::Permissions::from_mode(permissions),
+                )?;
+            }
+            #[cfg(windows)]
+            {
+                let mut attributes = std::fs::metadata(&temporary_path)?.permissions();
+                attributes.set_readonly(permissions & 0o200 == 0);
+                std::fs::set_permissions(&temporary_path, attributes)?;
+            }
         }
-        crate::utils::fs_operations::replace_file_atomic(&temporary_path, target_path)
+        fs.rename_sync(&temporary_path, target_path)
     })();
 
     if let Err(error) = atomic_result {
         crate::utils::debug::log_for_debugging(&format!(
             "Atomic file write failed, falling back to direct write: {error}"
         ));
-        let _ = std::fs::remove_file(&temporary_path);
+        let _ = fs.unlink_sync(&temporary_path);
         return sync_write_no_follow(target_path, bytes);
     }
     Ok(())
@@ -183,26 +224,50 @@ fn text_with_line_endings(content: &str, endings: LineEndingType) -> String {
     }
 }
 
+/// Maps to CC `utils/file.ts:335-343#isDirEmpty`.
+pub fn is_dir_empty(path: &std::path::Path) -> bool {
+    match get_fs_implementation().is_dir_empty_sync(path) {
+        Ok(empty) => empty,
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
 /// Maps to CC `utils/file.ts#findSimilarFile`.
 pub fn find_similar_file(file_path: &std::path::Path) -> Option<String> {
-    let directory = file_path.parent()?;
-    let requested_stem = file_path.file_stem()?;
-    let entries = match std::fs::read_dir(directory) {
+    use crate::utils::fs_operations::native;
+    let fs = get_fs_implementation();
+    let directory = native::dirname(file_path);
+    let requested_stem = filename_without_extension(file_path);
+    let entries = match fs.readdir_sync(&directory) {
         Ok(entries) => entries,
         Err(error) => {
             if error.kind() != std::io::ErrorKind::NotFound {
-                crate::utils::debug::log_for_debugging(&format!(
-                    "Unable to scan for a similarly named file: {error}"
-                ));
+                crate::utils::log::log_error(crate::utils::log::LogError::new(error.to_string()));
             }
             return None;
         }
     };
-    entries.filter_map(Result::ok).find_map(|entry| {
-        let candidate = entry.path();
-        (candidate.file_stem() == Some(requested_stem) && candidate != file_path)
-            .then(|| entry.file_name().to_string_lossy().to_string())
+    entries.into_iter().find_map(|entry| {
+        let name = entry.file_name();
+        let candidate = native::join_path(&directory, std::path::Path::new(&name));
+        (filename_without_extension(std::path::Path::new(&name)) == requested_stem
+            && candidate.as_os_str() != file_path.as_os_str())
+        .then(|| name.to_string_lossy().into_owned())
     })
+}
+
+fn filename_without_extension(path: &std::path::Path) -> std::ffi::OsString {
+    use crate::utils::fs_operations::native;
+    let name = native::basename(path);
+    let extension = native::extname(path);
+    let bytes = name.as_encoded_bytes();
+    // Both boundaries come from ASCII Node path delimiters in the same native
+    // string. No UTF-8/WTF-8 code point is split by removing the extension.
+    unsafe {
+        std::ffi::OsString::from_encoded_bytes_unchecked(
+            bytes[..bytes.len() - extension.as_encoded_bytes().len()].to_vec(),
+        )
+    }
 }
 
 /// Maps to CC `utils/file.ts#suggestPathUnderCwd`.
@@ -350,19 +415,20 @@ pub fn get_display_path(path: &str) -> String {
         }
     }
 
-    if let Some(home) = home_dir() {
-        let home_prefix = format!("{home}{}", std::path::MAIN_SEPARATOR);
-        if absolute.starts_with(&home_prefix) || path.starts_with(&home_prefix) {
-            let source = if absolute.starts_with(&home_prefix) {
-                absolute.as_str()
-            } else {
-                path
-            };
-            return format!("~{}", &source[home.len()..].replace('\\', "/"));
-        }
-        if absolute == home || path == home {
-            return "~".to_string();
-        }
+    let home = crate::utils::node_os::homedir()
+        .to_string_lossy()
+        .into_owned();
+    let home_prefix = format!("{home}{}", std::path::MAIN_SEPARATOR);
+    if absolute.starts_with(&home_prefix) || path.starts_with(&home_prefix) {
+        let source = if absolute.starts_with(&home_prefix) {
+            absolute.as_str()
+        } else {
+            path
+        };
+        return format!("~{}", &source[home.len()..].replace('\\', "/"));
+    }
+    if absolute == home || path == home {
+        return "~".to_string();
     }
     path.to_string()
 }
@@ -373,19 +439,20 @@ fn expand_path_for_display(path: &str, cwd: &std::path::Path) -> String {
     if trimmed.is_empty() {
         return cwd.to_string_lossy().replace('\\', "/");
     }
+    let home = || {
+        crate::utils::node_os::homedir()
+            .to_string_lossy()
+            .into_owned()
+    };
     if trimmed == "~" {
-        return home_dir().unwrap_or_else(|| trimmed.to_string());
+        return home();
     }
     if let Some(rest) = trimmed.strip_prefix("~/") {
-        if let Some(home) = home_dir() {
-            return format!("{home}/{rest}").replace('\\', "/");
-        }
+        return format!("{}/{rest}", home()).replace('\\', "/");
     }
     if cfg!(windows) {
         if let Some(rest) = trimmed.strip_prefix("~\\") {
-            if let Some(home) = home_dir() {
-                return format!("{home}\\{rest}");
-            }
+            return format!("{}\\{rest}", home());
         }
     }
     let candidate = std::path::Path::new(trimmed);
@@ -395,15 +462,31 @@ fn expand_path_for_display(path: &str, cwd: &std::path::Path) -> String {
     cwd.join(candidate).to_string_lossy().replace('\\', "/")
 }
 
-fn home_dir() -> Option<String> {
-    std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .ok()
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn filename_without_extension_matches_official_node_literal_names() {
+        for (input, expected) in [
+            ("a.ts", "a"),
+            ("a.", "a"),
+            (".env", ".env"),
+            ("..foo", "."),
+            ("...", ".."),
+            ("..", ".."),
+            (".", "."),
+            ("dir/a.ts/", "a"),
+            ("dir/.env.local", ".env"),
+        ] {
+            assert_eq!(
+                super::filename_without_extension(std::path::Path::new(input)),
+                std::ffi::OsString::from(expected),
+                "{input}"
+            );
+        }
+    }
+
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, HOME_VAR, TEST_ENV_LOCK};
 
     #[cfg(unix)]
     #[test]
@@ -472,7 +555,7 @@ mod tests {
     #[test]
     fn exclusive_temp_and_no_follow_fallback_reject_precreated_symlinks() {
         use std::os::unix::fs::symlink;
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-file-atomic-hostile-links-{}",
             uuid::Uuid::new_v4().simple()
@@ -500,7 +583,7 @@ mod tests {
 
     #[test]
     fn atomic_replace_failure_falls_back_to_flushed_direct_write() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-file-atomic-fallback-{}",
             uuid::Uuid::new_v4().simple()
@@ -566,7 +649,7 @@ mod tests {
 
     #[test]
     fn failed_atomic_and_direct_write_cleans_temporary_file() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-file-atomic-cleanup-{}",
             uuid::Uuid::new_v4().simple()
@@ -618,7 +701,7 @@ mod tests {
                 crate::bootstrap::state::set_original_cwd(&self.0);
             }
         }
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _restore = OriginalCwdRestore(crate::bootstrap::state::get_original_cwd());
         let cwd = std::env::temp_dir().join("cometix-display-path-cwd");
         let _ = std::fs::create_dir_all(cwd.join("src"));
@@ -626,10 +709,11 @@ mod tests {
 
         assert_eq!(get_display_path("src"), "src");
         assert_eq!(get_display_path(&cwd.join("src").to_string_lossy()), "src");
-        if let Some(home) = home_dir() {
-            let under_home = format!("{home}/outside-project/file.rs");
-            assert_eq!(get_display_path(&under_home), "~/outside-project/file.rs");
-        }
+        let _home = EnvVarGuard::set(HOME_VAR, "/home/someone");
+        assert_eq!(
+            get_display_path("/home/someone/outside-project/file.rs"),
+            "~/outside-project/file.rs"
+        );
 
         let _ = std::fs::remove_dir_all(&cwd);
     }

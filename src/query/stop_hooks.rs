@@ -139,14 +139,9 @@ fn stop_hooks_config(tool_use_context: &ToolUseContext) -> RegisteredHooks {
 #[cfg(not(test))]
 pub async fn handle_stop_hooks(params: StopHookParams) -> StopHookResult {
     let cache_safe_params = maybe_save_cache_safe_params(&params);
-    let prompt_suggestion_env_disabled = std::env::var("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION")
-        .ok()
-        .is_some_and(|value| {
-            matches!(
-                value.trim().to_ascii_lowercase().as_str(),
-                "" | "0" | "false" | "no" | "off"
-            )
-        });
+    let prompt_suggestion_env_disabled = crate::utils::env_utils::is_env_defined_falsy(
+        crate::utils::process_env::var("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION").as_deref(),
+    );
     if matches!(params.query_source, QuerySource::Prompt)
         && !prompt_suggestion_env_disabled
         && !crate::utils::env_utils::is_bare_mode()
@@ -172,23 +167,7 @@ pub async fn handle_stop_hooks(params: StopHookParams) -> StopHookResult {
         return StopHookResult::default();
     }
 
-    let cwd = std::env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string())
-        .unwrap_or_default();
-    let hook_context = crate::services::hooks::HookContext {
-        cwd: cwd.clone(),
-        project_dir: cwd,
-        permission_mode: Some(
-            crate::utils::permissions::permission_mode::to_external_permission_mode(
-                params.tool_use_context.tool_permission_context.mode,
-            )
-            .to_string(),
-        ),
-        ..Default::default()
-    };
-    let base_env = crate::services::hooks::build_hook_env_vars(&hook_context);
-    handle_stop_hooks_with_config(params, &config, base_env).await
+    handle_stop_hooks_with_config(params, &config, Vec::new()).await
 }
 
 /// Tests keep `handle_stop_hooks(...)` side-effect free so unit tests never run
@@ -486,6 +465,7 @@ pub fn stop_hook_result_from_hook_results(
 mod tests {
     use super::*;
     use crate::services::hooks::{HooksConfig, test_support::registered_config};
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn stop_hook_result_from_hook_results_keeps_nonblocking_messages_out_of_continuation() {
@@ -779,7 +759,7 @@ mod tests {
         use crate::services::hooks::{HookCommand, HookEvent};
         use crate::utils::hooks::session_hooks;
 
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         let _managed = crate::services::hooks::test_support::ManagedSettingsGuard::install(None);
         let hook = |command: &str| HookCommand {
             command: command.to_string(),

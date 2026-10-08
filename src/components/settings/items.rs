@@ -77,18 +77,14 @@ impl SettingItem {
 fn auto_updates_are_disabled(config: &GlobalConfig) -> bool {
     config.auto_updates == Some(false)
         || crate::utils::env_utils::is_env_truthy(
-            std::env::var("DISABLE_AUTOUPDATER").ok().as_deref(),
+            crate::utils::process_env::var("DISABLE_AUTOUPDATER").as_deref(),
         )
         || crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_DISABLE_AUTOUPDATER")
-                .ok()
+            crate::utils::process_env::var("CLAUDE_CODE_DISABLE_AUTOUPDATER")
                 .as_deref(),
         )
-        || crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
-                .ok()
-                .as_deref(),
-        )
+        // CC `config.ts:1742` `getEssentialTrafficOnlyReason()`.
+        || crate::utils::privacy_level::get_essential_traffic_only_reason().is_some()
 }
 
 fn auto_updates_channel_display(config: &GlobalConfig, settings: &SettingsJson) -> String {
@@ -143,6 +139,24 @@ pub fn build_items(config: &GlobalConfig, settings: &SettingsJson) -> Vec<Settin
             label: "Reduce motion",
             value: SettingValue::Bool(settings.prefers_reduced_motion.unwrap_or(false)),
             search_text: "animation motion reduce accessibility",
+            visible: true,
+        },
+        // @cometix offset: not an official setting. CC previews only completed
+        // lines while streaming; Cometix also offers character streaming.
+        // Reduce motion hides the preview regardless (CC REPL.tsx:1987).
+        SettingItem {
+            id: "streamingTextDisplay",
+            label: "Streaming text",
+            value: {
+                let options = vec!["character".to_string(), "line".to_string()];
+                let current = settings
+                    .streaming_text_display
+                    .as_deref()
+                    .and_then(|mode| options.iter().position(|o| o == mode))
+                    .unwrap_or(0);
+                SettingValue::Enum { options, current }
+            },
+            search_text: "streaming text character line typewriter preview",
             visible: true,
         },
         SettingItem {
@@ -346,14 +360,17 @@ pub fn build_items(config: &GlobalConfig, settings: &SettingsJson) -> Vec<Settin
         SettingItem {
             id: "outputStyle",
             label: "Output style",
-            value: SettingValue::Display({
-                let style = settings.output_style.as_deref().unwrap_or("default");
-                if style.eq_ignore_ascii_case("default") {
-                    "Default".to_string()
-                } else {
-                    style.to_string()
-                }
-            }),
+            // CC `Config.tsx:186-188` `settingsData?.outputStyle ||
+            // DEFAULT_OUTPUT_STYLE_NAME`, shown as is (:846).
+            value: SettingValue::Display(
+                settings
+                    .output_style
+                    .clone()
+                    .filter(|style| !style.is_empty())
+                    .unwrap_or_else(|| {
+                        crate::constants::output_styles::DEFAULT_OUTPUT_STYLE_NAME.to_string()
+                    }),
+            ),
             search_text: "output style format",
             visible: true,
         },
@@ -523,6 +540,7 @@ pub fn default_items() -> Vec<SettingItem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn notification_channel_display_matches_official_config_values() {
@@ -561,27 +579,15 @@ mod tests {
         assert_eq!(current, 0);
     }
 
-    struct EnvUnsetGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvUnsetGuard {
-        fn unset(key: &'static str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::unset(key),
-            }
-        }
-    }
-
     #[test]
     fn auto_updates_channel_display_tracks_official_disabled_value() {
         // `auto_updates_are_disabled` consults machine-level env
         // kill-switches; neutralize them so the config/settings inputs
         // under test decide the outcome on every host.
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _disable_guard = EnvUnsetGuard::unset("DISABLE_AUTOUPDATER");
-        let _claude_disable_guard = EnvUnsetGuard::unset("CLAUDE_CODE_DISABLE_AUTOUPDATER");
-        let _traffic_guard = EnvUnsetGuard::unset("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _disable_guard = EnvVarGuard::unset("DISABLE_AUTOUPDATER");
+        let _claude_disable_guard = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_AUTOUPDATER");
+        let _traffic_guard = EnvVarGuard::unset("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC");
         let mut config = GlobalConfig::default();
         let mut settings = SettingsJson::default();
         settings.auto_updates_channel = Some("stable".to_string());
@@ -596,5 +602,29 @@ mod tests {
             .find(|item| item.id == "autoUpdatesChannel")
             .expect("auto-update channel row should exist");
         assert_eq!(row.display_value(), "disabled");
+    }
+
+    #[test]
+    fn streaming_text_display_row_reads_the_setting_and_defaults_to_character() {
+        let config = GlobalConfig::default();
+        let mut settings = SettingsJson::default();
+        let row = |settings: &SettingsJson| {
+            build_items(&config, settings)
+                .into_iter()
+                .find(|item| item.id == "streamingTextDisplay")
+                .expect("streaming text row should exist")
+        };
+        assert_eq!(row(&settings).display_value(), "character");
+        settings.streaming_text_display = Some("line".to_string());
+        assert_eq!(row(&settings).display_value(), "line");
+        // Unknown values fall back to the default rather than hiding the row.
+        settings.streaming_text_display = Some("words".to_string());
+        assert_eq!(row(&settings).display_value(), "character");
+        // Enter cycles through both modes.
+        let mut item = row(&settings);
+        item.toggle();
+        assert_eq!(item.display_value(), "line");
+        item.toggle();
+        assert_eq!(item.display_value(), "character");
     }
 }

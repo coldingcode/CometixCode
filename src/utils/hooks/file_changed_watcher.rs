@@ -288,8 +288,7 @@ pub async fn on_cwd_changed_for_hooks(old_cwd: &str, new_cwd: &str) -> EnvHookEx
         .display()
         .to_string();
     let context = crate::services::hooks::HookContext {
-        cwd: cwd.clone(),
-        project_dir: cwd,
+        cwd,
         ..Default::default()
     };
     on_cwd_changed_for_hooks_with_config(
@@ -297,7 +296,7 @@ pub async fn on_cwd_changed_for_hooks(old_cwd: &str, new_cwd: &str) -> EnvHookEx
         new_cwd,
         &config,
         crate::services::hooks::create_base_hook_input(&context),
-        crate::services::hooks::build_hook_env_vars(&context),
+        Vec::new(),
     )
     .await
 }
@@ -337,10 +336,10 @@ pub fn file_changed_watcher_snapshot() -> FileChangedWatcherSnapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TestStateLock;
     use serde_json::Map;
 
-    static TEST_LOCK: LazyLock<crate::utils::env_utils::TestStateLock> =
-        LazyLock::new(crate::utils::env_utils::TestStateLock::new);
+    static TEST_LOCK: LazyLock<TestStateLock> = LazyLock::new(TestStateLock::new);
 
     fn config(value: Value) -> RegisteredHooks {
         let config: crate::services::hooks::HooksConfig = serde_json::from_value(value).unwrap();

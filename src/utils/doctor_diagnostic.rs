@@ -7,7 +7,7 @@
 //! mutating checks (npm config, package-manager command execution, PID cleanup)
 //! remain deferred to their dedicated service slices.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Maps to CC `InstallationType`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -107,7 +107,7 @@ pub fn get_normalized_paths() -> (String, String) {
 
 /// Maps to CC `getCurrentInstallationType()`.
 pub fn get_current_installation_type() -> InstallationType {
-    if std::env::var("NODE_ENV").ok().as_deref() == Some("development") {
+    if crate::utils::process_env::var("NODE_ENV").as_deref() == Some("development") {
         return InstallationType::Development;
     }
 
@@ -126,11 +126,10 @@ pub fn get_current_installation_type() -> InstallationType {
     {
         return InstallationType::NpmGlobal;
     }
-    if std::env::var("COMETIX_INSTALLATION_TYPE").ok().as_deref() == Some("package-manager") {
+    if crate::utils::process_env::var("COMETIX_INSTALLATION_TYPE").as_deref() == Some("package-manager") {
         return InstallationType::PackageManager;
     }
-    if std::env::var("COMETIX_BUNDLED")
-        .ok()
+    if crate::utils::process_env::var("COMETIX_BUNDLED")
         .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"))
     {
         return InstallationType::Native;
@@ -141,7 +140,7 @@ pub fn get_current_installation_type() -> InstallationType {
 
 /// Maps to CC local `getInstallationPath()`.
 pub fn get_installation_path() -> String {
-    if std::env::var("NODE_ENV").ok().as_deref() == Some("development") {
+    if crate::utils::process_env::var("NODE_ENV").as_deref() == Some("development") {
         return std::env::current_dir()
             .map(|path| path.display().to_string())
             .unwrap_or_else(|_| "unknown".to_string());
@@ -163,9 +162,7 @@ pub fn get_invoked_binary() -> String {
 /// Maps to CC local `detectMultipleInstallations()` safe filesystem subset.
 pub fn detect_multiple_installations() -> Vec<InstallationRecord> {
     let mut installations = Vec::new();
-    let Some(home) = home_dir() else {
-        return installations;
-    };
+    let home = crate::utils::node_os::homedir();
 
     let local_path = home.join(".claude").join("local");
     if local_path.exists() {
@@ -226,9 +223,9 @@ pub fn detect_configuration_issues(installation_type: &InstallationType) -> Vec<
         });
     }
 
-    let installation_checks_disabled = std::env::var("DISABLE_INSTALLATION_CHECKS")
-        .ok()
-        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes"));
+    let installation_checks_disabled = crate::utils::env_utils::is_env_truthy(
+        crate::utils::process_env::var("DISABLE_INSTALLATION_CHECKS").as_deref(),
+    );
     if !installation_checks_disabled {
         if *installation_type == InstallationType::NpmLocal && install_method != "local" {
             warnings.push(DiagnosticWarning {
@@ -261,7 +258,7 @@ pub fn detect_configuration_issues(installation_type: &InstallationType) -> Vec<
 
 /// Maps to CC `detectLinuxGlobPatternWarnings()`.
 pub fn detect_linux_glob_pattern_warnings() -> Vec<DiagnosticWarning> {
-    if !cfg!(target_os = "linux") {
+    if crate::utils::platform::get_platform() != crate::utils::platform::Platform::Linux {
         return Vec::new();
     }
 
@@ -317,7 +314,7 @@ pub fn get_doctor_diagnostic() -> DiagnosticInfo {
         .unwrap_or_else(|| "not set".to_string());
     let ripgrep_status = get_ripgrep_status();
     let package_manager = (installation_type == InstallationType::PackageManager).then(|| {
-        std::env::var("COMETIX_PACKAGE_MANAGER").unwrap_or_else(|_| "unknown".to_string())
+        crate::utils::process_env::var("COMETIX_PACKAGE_MANAGER").unwrap_or_else(|| "unknown".to_string())
     });
 
     DiagnosticInfo {
@@ -434,17 +431,15 @@ fn json_type_name(value: &serde_json::Value) -> &'static str {
 }
 
 fn local_installation_exists() -> bool {
-    home_dir()
-        .map(|home| home.join(".claude").join("local").exists())
-        .unwrap_or(false)
+    crate::utils::node_os::homedir()
+        .join(".claude")
+        .join("local")
+        .exists()
 }
 
 fn path_contains_local_bin() -> bool {
-    let Some(home) = home_dir() else {
-        return false;
-    };
-    let local_bin = home.join(".local").join("bin");
-    let Some(path) = std::env::var_os("PATH") else {
+    let local_bin = crate::utils::node_os::homedir().join(".local").join("bin");
+    let Some(path) = crate::utils::process_env::var_os("PATH") else {
         return false;
     };
     std::env::split_paths(&path).any(|entry| same_path_text(&entry, &local_bin))
@@ -462,7 +457,7 @@ fn normalize_path_text(path: &Path) -> String {
 }
 
 fn which_in_path(binary: &str) -> Option<String> {
-    let path = std::env::var_os("PATH")?;
+    let path = crate::utils::process_env::var_os("PATH")?;
     for dir in std::env::split_paths(&path) {
         let candidate = dir.join(binary);
         if candidate.is_file() {
@@ -478,17 +473,12 @@ fn which_in_path(binary: &str) -> Option<String> {
     None
 }
 
-fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::fs;
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT_ID: AtomicU64 = AtomicU64::new(0);
@@ -503,7 +493,7 @@ mod tests {
 
     #[test]
     fn installation_type_detection_matches_official_path_categories() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _node_env = EnvVarGuard::set("NODE_ENV", "development");
         assert_eq!(
             get_current_installation_type(),
@@ -541,7 +531,7 @@ mod tests {
 
     #[test]
     fn managed_strict_plugin_only_warning_matches_official_forward_compat_copy() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root = temp_dir("managed");
         let config_home = temp_dir("config");
         let _managed = EnvVarGuard::set("CLAUDE_CODE_MANAGED_SETTINGS_PATH", &root);
@@ -562,7 +552,7 @@ mod tests {
 
     #[test]
     fn doctor_diagnostic_preserves_official_top_level_shape() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _node_env = EnvVarGuard::unset("NODE_ENV");
         let diagnostic = get_doctor_diagnostic();
         assert!(!diagnostic.version.is_empty());

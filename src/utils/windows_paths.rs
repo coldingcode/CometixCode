@@ -2,6 +2,7 @@
 //!
 //! Maps to: CC `utils/windowsPaths.ts:84-179` for the Bash execution path.
 
+use crate::utils::process_env::JsTruthy;
 use std::path::{Path, PathBuf};
 
 /// Maps to CC `windowsPathToPosixPath`.
@@ -61,7 +62,10 @@ fn executable_exists(path: &Path) -> bool {
 /// Maps to CC `findGitBashPath()` without process exit: callers surface the
 /// official installation message as an execution error.
 pub fn find_git_bash_path() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("CLAUDE_CODE_GIT_BASH_PATH") {
+    if let Some(path) = crate::utils::process_env::var_os("CLAUDE_CODE_GIT_BASH_PATH")
+        .as_deref()
+        .truthy()
+    {
         let path = PathBuf::from(path);
         if executable_exists(&path) {
             return Ok(path);
@@ -87,7 +91,11 @@ pub fn find_git_bash_path() -> Result<PathBuf, String> {
         }
     }
 
-    if let Ok(output) = std::process::Command::new("where.exe").arg("git").output() {
+    let mut where_exe = std::process::Command::new("where.exe");
+    // CC `execSync_DEPRECATED('where.exe ...')` inherits process.env; the carrier
+    // is its counterpart (where.exe searches the carrier PATH).
+    crate::utils::subprocess_env::apply_process_env_std(&mut where_exe);
+    if let Ok(output) = where_exe.arg("git").output() {
         let cwd = std::env::current_dir().ok();
         for candidate in String::from_utf8_lossy(&output.stdout)
             .lines()

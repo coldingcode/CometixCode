@@ -6,7 +6,6 @@
 use crate::hooks::use_double_press::{DoublePressState, use_double_press};
 use crate::hooks::use_exit::{ExitState, use_exit};
 use crate::keybindings::types::{ChordResolveResult, ContextName};
-use crate::keybindings::use_keybinding::use_keybinding;
 use crate::utils::cursor::{Cursor, RenderedLine, clamp_cursor};
 use crate::utils::kill_ring::{reset_kill_accumulation, reset_yank_state};
 use iocraft::prelude::*;
@@ -30,16 +29,25 @@ pub struct UseTextInputOptions {
     pub disable_cursor_movement_for_up_down_keys: bool,
     pub disable_escape_double_press: bool,
     /// Maps to: CC event-order parity for `useCancelRequest`. Ink delivers
-    /// events parents-first, so CC's CancelRequestHandler wins Escape and
-    /// active-task Ctrl+C. iocraft bubbles children-first, so when set,
-    /// `chat:cancel` / `app:interrupt` are left unconsumed for the ancestor
-    /// cancel handler; idle Ctrl+C still uses text-level double-press exit.
+    /// events parents-first, so CC's CancelRequestHandler wins Escape and an
+    /// interrupting Ctrl+C. iocraft bubbles children-first, so when set,
+    /// Escape — and Ctrl+C while it resolves to `app:interrupt`, which Cometix
+    /// only does under a user binding — is left unconsumed for the ancestor.
     pub cancel_passthrough: bool,
     /// Native BaseTextInput event transport: retain text-level Escape processing
     /// but let the same event continue to a source parent cancel listener.
     pub escape_event_passthrough: bool,
     /// L1 Ink parent-before-input dispatch for CustomSelect navigation.
     pub select_navigation_passthrough: bool,
+    /// Native transport for CC listener registration order. Ink dispatches
+    /// input to listeners in the order they registered and stops at
+    /// `stopImmediatePropagation` (`ink/events/emitter.ts:29-34`); handlers in
+    /// these keybinding contexts registered before this input mounted — e.g.
+    /// useHistorySearch's, registered with PromptInput, ahead of the
+    /// HistorySearchInput TextInput that mounts when a search starts — so a
+    /// key one of them takes never reaches the input. iocraft polls children
+    /// first, so the input leaves such a key for them.
+    pub preceding_keybinding_contexts: Vec<ContextName>,
 }
 
 pub struct TextInputState {
@@ -110,22 +118,17 @@ pub fn use_text_input(hooks: &mut Hooks, mut options: UseTextInputOptions) -> Te
     let _ = cursor_from_options(options.clone(), retained_cursor);
     let current_text = options.value.read().clone();
 
-    // Maps to: CC useExitOnCtrlCD's `app:exit` handler for additional user
-    // bindings while preserving useTextInput's hardcoded Ctrl-D editing rule.
-    // Non-empty input keeps Ctrl-D as delete-forward; idle/empty input routes
-    // both the default key and any remap through the same double-press owner.
-    let app_exit_active = options.focus && current_text.is_empty();
-    use_keybinding(
-        hooks,
-        keybinding_runtime.clone(),
-        "app:exit",
-        ContextName::Global,
-        move || app_exit_active,
-        move || {
-            exit.ctrl_d.press();
-            true
-        },
-    );
+    // No `app:exit` registration here. CC's useTextInput registers no
+    // keybinding: empty-input Ctrl-D is its hardcoded `handleEmptyCtrlD`
+    // (useTextInput.ts:155-175, below), and `app:exit` belongs to the screen
+    // that mounts useExitOnCtrlCD (Settings, dialogs, pickers). While such a
+    // handler is active the registered-handler check below leaves the key to
+    // it, whatever the mount order. In CC that is exact when the screen's
+    // listener registered first (/config's language field mounts after the
+    // pane). When both mount in one commit, Ink's child-first effects put the
+    // input's listener first; it never stops propagation, so the screen's hook
+    // still takes the key, and only the input's own onExit/onExitMessage also
+    // fire there — which this port does not reproduce.
 
     // CC useTextInput.ts:126-153 owns only clear-input double Escape.
     // Preserve the render's originalValue in the event callback, as Ink does.
@@ -180,6 +183,31 @@ pub fn use_text_input(hooks: &mut Hooks, mut options: UseTextInputOptions) -> Te
                         if let Some(keystroke) =
                             crate::keybindings::matcher::key_event_to_keystroke(key_event)
                         {
+                            // A listener that registered before this input
+                            // resolves the key in its own context, as its
+                            // `useKeybinding` does (`[...activeContexts,
+                            // context, 'Global']`, useKeybinding.ts:54-62).
+                            for preceding in &options.preceding_keybinding_contexts {
+                                let mut contexts: HashSet<ContextName> = runtime.active_contexts();
+                                contexts.insert(preceding.clone());
+                                contexts.insert(ContextName::Global);
+                                if let ChordResolveResult::Match { action } =
+                                    crate::keybindings::resolver::resolve_key_with_chord_state(
+                                        Some(&keystroke),
+                                        keystroke.key == "escape",
+                                        &contexts,
+                                        runtime.bindings().as_slice(),
+                                        None,
+                                    )
+                                {
+                                    if runtime.has_registered_handler(
+                                        &action,
+                                        &HashSet::from([preceding.clone()]),
+                                    ) {
+                                        return;
+                                    }
+                                }
+                            }
                             let mut contexts: HashSet<ContextName> = runtime.active_contexts();
                             contexts.insert(ContextName::Chat);
                             contexts.insert(ContextName::Global);
@@ -209,11 +237,34 @@ pub fn use_text_input(hooks: &mut Hooks, mut options: UseTextInputOptions) -> Te
                     let shift = modifiers.contains(KeyModifiers::SHIFT);
                     let is_plain_ctrl = *modifiers == KeyModifiers::CONTROL;
 
-                    // Ctrl-C — active tasks first resolve current CC's
-                    // `app:interrupt`; when idle, useTextInput retains the
-                    // text-level clear/double-press exit behavior.
+                    // Ctrl-C — CC useTextInput `handleCtrlC` (:108-120): clear
+                    // the input, then double-press exit. With Ctrl+C bound to
+                    // `app:exit` (default_bindings.rs, 2.0.x semantics) that
+                    // holds in a running turn too; a screen's exit hook that
+                    // owns `app:exit` was left the key above. Only when a user
+                    // binds Ctrl+C back to `app:interrupt` does
+                    // `cancel_passthrough` leave it to the interrupt's owner,
+                    // which may sit in a context the check above does not see
+                    // (PermissionRequest's Confirmation).
                     if is_plain_ctrl && matches!(code, KeyCode::Char('c') | KeyCode::Char('C')) {
-                        if options.cancel_passthrough {
+                        let interrupt_bound = keybinding_runtime.as_ref().is_some_and(|runtime| {
+                            crate::keybindings::matcher::key_event_to_keystroke(key_event)
+                                .is_some_and(|keystroke| {
+                                    let mut contexts = runtime.active_contexts();
+                                    contexts.insert(ContextName::Global);
+                                    matches!(
+                                        crate::keybindings::resolver::resolve_key_with_chord_state(
+                                            Some(&keystroke),
+                                            false,
+                                            &contexts,
+                                            runtime.bindings().as_slice(),
+                                            None,
+                                        ),
+                                        ChordResolveResult::Match { action } if action == "app:interrupt"
+                                    )
+                                })
+                        });
+                        if options.cancel_passthrough && interrupt_bound {
                             return;
                         }
                         reset_kill_accumulation();
@@ -535,11 +586,13 @@ fn set_from_cursor(
     mut retained: Ref<Option<(String, usize, Cursor)>>,
     cursor: Cursor,
 ) {
+    // Cursor first: `on_change` observers report the edit's full state (text
+    // and caret) to their owner, and must not see the previous caret.
+    options.cursor_offset.set(cursor.offset());
     if options.value.read().as_str() != cursor.text() {
         options.value.set(cursor.text().to_string());
         (options.on_change)(cursor.text().to_string());
     }
-    options.cursor_offset.set(cursor.offset());
     *retained.write() = Some((cursor.text().to_string(), cursor.offset(), cursor));
 }
 
@@ -685,6 +738,7 @@ mod tests {
                 cancel_passthrough: false,
                 escape_event_passthrough: props.escape_event_passthrough,
                 select_navigation_passthrough: false,
+                preceding_keybinding_contexts: Vec::new(),
             },
         );
         element! { Text(content: format!("ready={} value={:?} cleared={:?}", ready.get(), value.read().as_str(), cleared.read().as_slice())) }
@@ -761,10 +815,109 @@ mod tests {
         }
     }
 
+    #[derive(Default, Props)]
+    struct CtrlCProbeProps {
+        cancel_passthrough: bool,
+    }
+
+    #[component]
+    fn CtrlCProbe(props: &CtrlCProbeProps, mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let value = hooks.use_state(|| "x".to_string());
+        let cursor_offset = hooks.use_state(|| 1usize);
+        let input = use_text_input(
+            &mut hooks,
+            UseTextInputOptions {
+                on_change: Handler::default(),
+                on_clear_input: Handler::default(),
+                on_history_reset: Handler::default(),
+                value,
+                cursor_offset,
+                inline_ghost_text: None,
+                focus: true,
+                multiline: true,
+                columns: 80,
+                max_visible_lines: None,
+                disable_cursor_movement_for_up_down_keys: false,
+                disable_escape_double_press: false,
+                cancel_passthrough: props.cancel_passthrough,
+                escape_event_passthrough: false,
+                select_navigation_passthrough: false,
+                preceding_keybinding_contexts: Vec::new(),
+            },
+        );
+        element! {
+            Text(content: format!(
+                "value={:?} hint={}",
+                value.read().as_str(),
+                input.exit_hint().unwrap_or("none"),
+            ))
+        }
+    }
+
+    #[test]
+    fn ctrl_c_is_the_inputs_while_a_turn_runs() {
+        // Cometix binds Ctrl+C to app:exit (2.0.x semantics), which nothing
+        // above a bare input owns, so even with `cancel_passthrough` (a
+        // running turn, a Select's input) the key is CC's handleCtrlC
+        // (useTextInput.ts:108-120): clear, then arm the double press.
+        let press = |code, modifiers| {
+            let mut key = KeyEvent::new(KeyEventKind::Press, code);
+            key.modifiers = modifiers;
+            TerminalEvent::Key(key)
+        };
+        for cancel_passthrough in [false, true] {
+            // No end marker: any further key would clear the pending hint.
+            let events = vec![press(KeyCode::Char('c'), KeyModifiers::CONTROL)];
+            let text = futures::executor::block_on(async {
+                let mut app = element! {
+                    ContextProvider(value: Context::owned(input_test_store())) {
+                        ContextProvider(value: Context::owned(crate::keybindings::keybinding_context::KeybindingRuntime::with_default_bindings())) {
+                            FocusScope(handle_keys: false) { CtrlCProbe(cancel_passthrough) }
+                        }
+                    }
+                };
+                let events = stream::iter(events).chain(stream::pending());
+                let mut frames = Box::pin(app.mock_terminal_render_loop(
+                    MockTerminalConfig::with_events(events)
+                        .with_size(90, 3)
+                        .with_ignore_ctrl_c(true),
+                ));
+                let mut last = String::new();
+                for _ in 0..10 {
+                    let Some(frame) = crate::utils::race(frames.next(), async {
+                        futures_timer::Delay::new(Duration::from_millis(200)).await;
+                        None
+                    })
+                    .await
+                    else {
+                        break;
+                    };
+                    last = frame.to_string();
+                    if last.contains("value=\"\"") {
+                        break;
+                    }
+                }
+                last
+            });
+            assert!(
+                text.contains("value=\"\" hint=Press Ctrl-C again to exit"),
+                "cancel_passthrough={cancel_passthrough}; frame={text}"
+            );
+        }
+    }
+
     #[component]
     fn IdleExitActionChild(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
         let value = hooks.use_state(String::new);
         let cursor_offset = hooks.use_state(|| 0usize);
+        // F24 marks the end of a key batch: it always changes the canvas, so
+        // the test gets a frame after each batch whatever the input did.
+        let mut marks = hooks.use_state(|| 0usize);
+        hooks.use_propagated_terminal_events(move |event| {
+            if matches!(event.event(), TerminalEvent::Key(key) if key.code == KeyCode::F(24)) {
+                marks.set(marks.get() + 1);
+            }
+        });
         let input = use_text_input(
             &mut hooks,
             UseTextInputOptions {
@@ -783,15 +936,15 @@ mod tests {
                 cancel_passthrough: false,
                 escape_event_passthrough: false,
                 select_navigation_passthrough: false,
+                preceding_keybinding_contexts: Vec::new(),
             },
         );
-        element! {
-            Text(content: if input.exit.should_exit() {
-                "exited".to_string()
-            } else {
-                input.exit_hint().unwrap_or("waiting").to_string()
-            })
-        }
+        let status = if input.exit.should_exit() {
+            "exited"
+        } else {
+            input.exit_hint().unwrap_or("waiting")
+        };
+        element! { Text(content: format!("{status} mark={}", marks.get())) }
     }
 
     #[component]
@@ -833,39 +986,60 @@ mod tests {
     }
 
     #[test]
-    fn idle_text_input_additional_app_exit_binding_uses_double_press_owner() {
-        let text = futures::executor::block_on(async move {
-            let events = vec![
-                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::F(6))),
-                TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, KeyCode::F(6))),
-            ];
-            let paced = stream::unfold(events.into_iter(), |mut events| async move {
-                let event = events.next()?;
-                futures_timer::Delay::new(Duration::from_millis(25)).await;
-                Some((event, events))
-            });
+    fn idle_text_input_exits_on_hardcoded_ctrl_d_not_on_an_app_exit_remap() {
+        // CC useTextInput registers no keybinding: an `app:exit` remap (F6
+        // here) reaches only a screen that mounts useExitOnCtrlCD, and a bare
+        // input has none, while empty-input Ctrl-D is its hardcoded
+        // `handleEmptyCtrlD` double press (useTextInput.ts:155-175).
+        // Frame-driven and hang-free: each batch ends with the F24 mark, whose
+        // frame is awaited whether or not the batch changed anything else.
+        crate::utils::process_runtime::initialize_test_process_runtime();
+        let (after_remap, after_ctrl_d) = futures::executor::block_on(async move {
+            let (keys, events) = async_channel::unbounded();
             let mut app = element! { ContextProvider(value: Context::owned(input_test_store())) { FocusScope(handle_keys: false) { IdleExitActionHarness } } };
             let mut render_loop = Box::pin(app.mock_terminal_render_loop(
-                MockTerminalConfig::with_events(paced).with_size(40, 5),
+                MockTerminalConfig::with_events(events).with_size(40, 5),
             ));
+            let press = |code| TerminalEvent::Key(KeyEvent::new(KeyEventKind::Press, code));
+            let mut ctrl_d = KeyEvent::new(KeyEventKind::Press, KeyCode::Char('d'));
+            ctrl_d.modifiers = KeyModifiers::CONTROL;
+            let mut stage = 0;
+            let mut after_remap = String::new();
             let mut last = String::new();
-            for _ in 0..24 {
-                let next = crate::utils::race(render_loop.next(), async {
-                    futures_timer::Delay::new(Duration::from_millis(120)).await;
-                    None
-                })
-                .await;
-                let Some(canvas) = next else {
-                    break;
-                };
+            while let Some(canvas) = render_loop.next().await {
                 last = canvas.to_string();
-                if last.contains("exited") {
-                    break;
+                match stage {
+                    0 if last.contains("mark=0") => {
+                        for event in [press(KeyCode::F(6)), press(KeyCode::F(6)), press(KeyCode::F(24))] {
+                            keys.send(event).await.unwrap();
+                        }
+                        stage = 1;
+                    }
+                    1 if last.contains("mark=1") => {
+                        after_remap = last.clone();
+                        for event in [
+                            TerminalEvent::Key(ctrl_d.clone()),
+                            TerminalEvent::Key(ctrl_d.clone()),
+                            press(KeyCode::F(24)),
+                        ] {
+                            keys.send(event).await.unwrap();
+                        }
+                        stage = 2;
+                    }
+                    2 if last.contains("mark=2") => break,
+                    _ => {}
                 }
             }
-            last
+            (after_remap, last)
         });
 
-        assert!(text.contains("exited"), "canvas=\n{text}");
+        assert!(
+            !after_remap.contains("exited"),
+            "two F6 presses must not exit a bare input; frame=\n{after_remap}"
+        );
+        assert!(
+            after_ctrl_d.contains("exited"),
+            "a double Ctrl-D in the empty input exits; canvas=\n{after_ctrl_d}"
+        );
     }
 }

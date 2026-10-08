@@ -751,24 +751,39 @@ pub(crate) async fn generate_file_attachment(
     let display_path = attachment_display_path(path, &cwd);
 
     if mode == FileAttachmentMode::AtMention {
-        if let Ok(metadata) = std::fs::metadata(path) {
-            let extension = path
-                .extension()
-                .and_then(std::ffi::OsStr::to_str)
-                .unwrap_or_default();
-            let is_pdf = crate::utils::pdf_utils::is_pdf_extension(extension);
-            if !is_pdf && metadata.len() as f64 > limits.max_size_bytes {
-                return None;
-            }
-            if is_pdf {
-                let page_count_path = path.to_path_buf();
-                let page_count = tokio::task::spawn_blocking(move || {
-                    crate::utils::pdf::get_pdf_page_count(&page_count_path)
-                })
+        // CC keeps the synchronous size gate separate from the subsequent
+        // async stat calls: injected implementations may differ by endpoint.
+        let within_limit = crate::utils::fs_operations::get_fs_implementation()
+            .stat_sync(path)
+            .is_ok_and(|metadata| metadata.len() as f64 <= limits.max_size_bytes);
+        let extension = path
+            .extension()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let is_pdf = crate::utils::pdf_utils::is_pdf_extension(&extension);
+        if !within_limit
+            && !is_pdf
+            && crate::utils::fs_operations::get_fs_implementation()
+                .stat(path)
                 .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| metadata.len().div_ceil(100 * 1024));
+                .is_ok()
+        {
+            return None;
+        }
+        if is_pdf {
+            let pending_stats = crate::utils::fs_operations::get_fs_implementation().stat(path);
+            let page_count_path = path.to_path_buf();
+            let pending_pages = tokio::task::spawn_blocking(move || {
+                crate::utils::pdf::get_pdf_page_count(&page_count_path)
+            });
+            // Promise.all rejects as soon as stat fails; the independently
+            // started pdfinfo task continues without delaying normal reading.
+            let settled = futures::try_join!(pending_stats, async {
+                Ok::<_, std::io::Error>(pending_pages.await.ok().flatten())
+            });
+            if let Ok((metadata, page_count)) = settled {
+                let page_count = page_count.unwrap_or_else(|| metadata.len().div_ceil(100 * 1024));
                 if page_count > crate::constants::api_limits::PDF_AT_MENTION_INLINE_THRESHOLD {
                     return Some(AttachmentMessage::new(serde_json::json!({
                         "type": "pdf_reference",
@@ -779,14 +794,14 @@ pub(crate) async fn generate_file_attachment(
                     })));
                 }
             }
-
-            if let Some(existing) = tool_use_context.read_file_state.get(path) {
-                let current_mtime = metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|duration| i64::try_from(duration.as_millis()).ok());
-                if existing.timestamp_ms.is_some() && existing.timestamp_ms == current_mtime {
+        }
+        if let Some(existing) = tool_use_context.read_file_state.get(path) {
+            if let Ok(metadata) = crate::utils::fs_operations::get_fs_implementation()
+                .stat(path)
+                .await
+            {
+                let current_mtime = metadata.mtime_ms.floor() as i64;
+                if existing.timestamp_ms == Some(current_mtime) {
                     let existing_content = existing.content.as_deref().unwrap_or_default();
                     let total_lines = existing_content.matches('\n').count().saturating_add(1);
                     return Some(AttachmentMessage::new(serde_json::json!({
@@ -1007,7 +1022,7 @@ fn is_file_read_denied(
     context: &crate::tool::ToolPermissionContext,
     cwd: &std::path::Path,
 ) -> bool {
-    crate::utils::permissions::filesystem::matching_rule_for_input_at_cwd(
+    crate::utils::permissions::filesystem::matching_rule_for_input(
         file_path,
         context,
         crate::utils::permissions::filesystem::FilePermissionType::Read,
@@ -1475,9 +1490,10 @@ pub(crate) fn get_mcp_instructions_delta_attachment(
         .collect::<std::collections::BTreeSet<_>>();
     let mut instructions =
         crate::services::mcp::client::connected_mcp_server_instructions(&context.mcp_state);
-    let model = context.main_loop_model.clone().unwrap_or_else(
-        crate::utils::model::model::get_main_loop_model,
-    );
+    let model = context
+        .main_loop_model
+        .clone()
+        .unwrap_or_else(crate::utils::model::model::get_main_loop_model);
     let chrome_name = crate::utils::claude_in_chrome::common::CLAUDE_IN_CHROME_MCP_SERVER_NAME;
     if connected_names.contains(chrome_name)
         && crate::tools::tool_search_tool::prompt::is_tool_search_enabled_optimistic()
@@ -1520,46 +1536,49 @@ fn attachment_continuation(attachment: AttachmentMessage) -> AttachmentContinuat
 
 /// Maps to CC `getChangedFiles(...)` (`utils/attachments.ts:2063-2148`).
 /// Maps to: CC `utils/attachments.ts:2063-2166` `getChangedFiles`.
-async fn get_changed_files(context: &mut ToolUseContext) -> Vec<AttachmentContinuation> {
+pub(crate) async fn get_changed_files(context: &mut ToolUseContext) -> Vec<AttachmentContinuation> {
     let file_paths = context.read_file_state.keys();
     let cwd = context.effective_cwd();
-    let mut attachments = Vec::new();
-    for file_path in file_paths {
-        // Maps to CC `cacheKeys(readFileState)` followed by the promoting
-        // `readFileState.get(filePath)` inside each changed-file worker.
-        let path = std::path::PathBuf::from(&file_path);
-        let Some(prior) = context.read_file_state.get(&path) else {
-            continue;
-        };
-        // Canonical currently watches only complete Edit/Write cache entries;
-        // ranged/default-offset Read entries are skipped by its TODO guard.
-        if prior.offset.is_some() || prior.limit.is_some() {
-            continue;
-        }
-        if is_file_read_denied(&prior.path, &context.tool_permission_context, &cwd) {
-            continue;
-        }
-        let metadata = match std::fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                context.read_file_state.delete(&path);
-                continue;
+    let context: &ToolUseContext = context;
+    let pending = file_paths.into_iter().map(|file_path| {
+        let cwd = &cwd;
+        async move {
+            // Maps to CC `cacheKeys(readFileState)` followed by the promoting
+            // `readFileState.get(filePath)` inside each changed-file worker.
+            let cache_path = std::path::PathBuf::from(&file_path);
+            let Some(prior) = context.read_file_state.get(&cache_path) else {
+                return None;
+            };
+            // Canonical currently watches only complete Edit/Write cache entries;
+            // ranged/default-offset Read entries are skipped by its TODO guard.
+            if prior.offset.is_some() || prior.limit.is_some() {
+                return None;
             }
-            Err(_) => continue,
-        };
-        let current_mtime = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .and_then(|duration| i64::try_from(duration.as_millis()).ok());
-        if current_mtime
-            .zip(prior.timestamp_ms)
-            .is_none_or(|(now, then)| now <= then)
-        {
-            continue;
-        }
-        let args = serde_json::json!({"file_path": prior.path.clone()});
-        if !matches!(
+            let path = crate::utils::path::expand_path(&file_path, Some(cwd)).ok()?;
+            let normalized_path = path.to_string_lossy().into_owned();
+            if is_file_read_denied(&normalized_path, &context.tool_permission_context, cwd) {
+                return None;
+            }
+            let metadata = match crate::utils::fs_operations::get_fs_implementation()
+                .stat(&path)
+                .await
+            {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    context.read_file_state.delete(&cache_path);
+                    return None;
+                }
+                Err(_) => return None,
+            };
+            let current_mtime = metadata.mtime_ms.floor() as i64;
+            if prior
+                .timestamp_ms
+                .is_none_or(|timestamp| current_mtime <= timestamp)
+            {
+                return None;
+            }
+            let args = serde_json::json!({"file_path": normalized_path.clone()});
+            if !matches!(
             <crate::tools::file_read_tool::FileReadTool as crate::tool::ToolCall>::validate_input(
                 &crate::tools::file_read_tool::FileReadTool,
                 &args,
@@ -1567,73 +1586,80 @@ async fn get_changed_files(context: &mut ToolUseContext) -> Vec<AttachmentContin
             ),
             crate::tool::ValidationResult::Ok
         ) {
-            continue;
-        }
-        let output = match crate::tools::file_read_tool::FileReadTool
-            .call(&args, context, None)
-            .await
-        {
-            Ok(output) => output,
-            Err(error) if error.is_enoent() => {
-                context.read_file_state.delete(&path);
-                continue;
+                return None;
             }
-            Err(_) => continue,
-        };
-        match output.data {
-            crate::tools::file_read_tool::ReadOutput::Text(output) => {
-                let Some(previous_content) = prior.content.as_deref() else {
-                    continue;
-                };
-                let snippet = crate::tools::file_edit_tool::utils::get_snippet_for_two_file_diff(
-                    previous_content,
-                    &output.content,
-                );
-                if snippet.is_empty() {
-                    continue;
+            let output = match crate::tools::file_read_tool::FileReadTool
+                .call(&args, context, None)
+                .await
+            {
+                Ok(output) => output,
+                Err(error) if error.is_enoent() => {
+                    context.read_file_state.delete(&cache_path);
+                    return None;
                 }
-                attachments.push(attachment_continuation(AttachmentMessage::new(
-                    serde_json::json!({
-                        "type": "edited_text_file",
-                        "filename": prior.path,
-                        "snippet": snippet,
-                    }),
-                )));
+                Err(_) => return None,
+            };
+            match output.data {
+                crate::tools::file_read_tool::ReadOutput::Text(output) => {
+                    let Some(previous_content) = prior.content.as_deref() else {
+                        return None;
+                    };
+                    let snippet =
+                        crate::tools::file_edit_tool::utils::get_snippet_for_two_file_diff(
+                            previous_content,
+                            &output.content,
+                        );
+                    if snippet.is_empty() {
+                        return None;
+                    }
+                    return Some(attachment_continuation(AttachmentMessage::new(
+                        serde_json::json!({
+                            "type": "edited_text_file",
+                            "filename": normalized_path,
+                            "snippet": snippet,
+                        }),
+                    )));
+                }
+                crate::tools::file_read_tool::ReadOutput::Image(_) => {
+                    // CC deliberately performs a second helper-only image read here.
+                    // It observes a replacement that lands after FileReadTool.call,
+                    // but repeats none of Read's cache/skill/nested/listener effects.
+                    let limits =
+                        crate::tools::file_read_tool::limits::get_default_file_reading_limits();
+                    let Ok(output) = crate::tools::file_read_tool::read_image_with_token_budget(
+                        &path,
+                        limits.max_tokens,
+                        None,
+                    ) else {
+                        return None;
+                    };
+                    return Some(attachment_continuation(AttachmentMessage::new(
+                        serde_json::json!({
+                            "type": "edited_image_file",
+                            "filename": normalized_path,
+                            "content": {
+                                "type": "image",
+                                "file": {
+                                    "base64": output.base64,
+                                    "type": output.media_type,
+                                    "originalSize": output.original_size,
+                                    "dimensions": output.dimensions,
+                                }
+                            },
+                        }),
+                    )));
+                }
+                // notebook / pdf / parts have no canonical changed-file diff.
+                _ => {}
             }
-            crate::tools::file_read_tool::ReadOutput::Image(_) => {
-                // CC deliberately performs a second helper-only image read here.
-                // It observes a replacement that lands after FileReadTool.call,
-                // but repeats none of Read's cache/skill/nested/listener effects.
-                let limits =
-                    crate::tools::file_read_tool::limits::get_default_file_reading_limits();
-                let Ok(output) = crate::tools::file_read_tool::read_image_with_token_budget(
-                    &path,
-                    limits.max_tokens,
-                    None,
-                ) else {
-                    continue;
-                };
-                attachments.push(attachment_continuation(AttachmentMessage::new(
-                    serde_json::json!({
-                        "type": "edited_image_file",
-                        "filename": prior.path,
-                        "content": {
-                            "type": "image",
-                            "file": {
-                                "base64": output.base64,
-                                "type": output.media_type,
-                                "originalSize": output.original_size,
-                                "dimensions": output.dimensions,
-                            }
-                        },
-                    }),
-                )));
-            }
-            // notebook / pdf / parts have no canonical changed-file diff.
-            _ => {}
+            None
         }
-    }
-    attachments
+    });
+    futures::future::join_all(pending)
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 fn attachment_payload_type(message: &Message) -> Option<&str> {
@@ -1763,11 +1789,10 @@ pub async fn get_attachments(
     // silently drop them (Coworker runs with --bare and depends on
     // task-notification for mid-tool-call notifications).
     if crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_ATTACHMENTS")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_DISABLE_ATTACHMENTS")
             .as_deref(),
     ) || crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_SIMPLE").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_SIMPLE").as_deref(),
     ) {
         return get_queued_command_attachments(&queued_commands);
     }
@@ -1847,9 +1872,10 @@ pub async fn get_attachments(
 
     let mut attachments = Vec::new();
     attachments.extend(get_queued_command_attachments(&queued_commands));
-    let model = tool_use_context.main_loop_model.clone().unwrap_or_else(
-        crate::utils::model::model::get_main_loop_model,
-    );
+    let model = tool_use_context
+        .main_loop_model
+        .clone()
+        .unwrap_or_else(crate::utils::model::model::get_main_loop_model);
     if let Some(attachment) =
         get_deferred_tools_delta_attachment(&tool_use_context.tools, &model, messages)
     {
@@ -2369,7 +2395,7 @@ fn filter_to_bundled_and_mcp(
 fn get_skill_listing_attachments(
     tool_use_context: &mut ToolUseContext,
 ) -> Vec<AttachmentContinuation> {
-    if std::env::var("NODE_ENV").as_deref() == Ok("test") {
+    if crate::utils::process_env::var("NODE_ENV").as_deref() == Some("test") {
         return Vec::new();
     }
     if !tool_use_context
@@ -2430,9 +2456,10 @@ fn get_skill_listing_attachments(
     let is_initial = sent.is_empty();
     sent.extend(new_commands.iter().map(|command| command.name.to_string()));
     drop(sent_by_agent);
-    let model = tool_use_context.main_loop_model.clone().unwrap_or_else(
-        crate::utils::model::model::get_main_loop_model,
-    );
+    let model = tool_use_context
+        .main_loop_model
+        .clone()
+        .unwrap_or_else(crate::utils::model::model::get_main_loop_model);
     let context_window = crate::utils::context::get_context_window_for_model(&model, &[]);
     let content = crate::tools::skill_tool::prompt::format_commands_within_budget(
         &new_commands,
@@ -2552,6 +2579,7 @@ mod tests {
         get_pending_lsp_diagnostic_count, register_pending_lsp_diagnostic,
         reset_all_lsp_diagnostic_state,
     };
+    use crate::utils::test_env::{EnvVarGuard, PinnedProjectDir, TEST_ENV_LOCK};
 
     #[test]
     fn memory_header_matches_official_fresh_and_stale_text() {
@@ -2629,24 +2657,6 @@ mod tests {
     use crate::services::lsp::types::{
         Diagnostic, DiagnosticFile, DiagnosticPosition, DiagnosticRange,
     };
-
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::unset(key),
-            }
-        }
-    }
 
     struct McpInstructionGuard(&'static str);
 
@@ -3142,7 +3152,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn at_mention_read_discovers_nested_dynamic_skill_directory() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         crate::skills::load_skills_dir::clear_dynamic_skills();
         struct DynamicSkillsRestore;
         impl Drop for DynamicSkillsRestore {
@@ -3189,7 +3199,7 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn missing_at_mention_still_discovers_nested_dynamic_skill_directory() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         crate::skills::load_skills_dir::clear_dynamic_skills();
         struct DynamicSkillsRestore;
         impl Drop for DynamicSkillsRestore {
@@ -3226,7 +3236,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn nested_live_iteration_accepts_insertion_during_source_await() {
         // At-mention reads resolve against the project dir.
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let cwd = std::env::current_dir().unwrap();
         let root = cwd.join(format!(
             ".cometix-nested-race-{}",
@@ -3415,10 +3425,10 @@ mod tests {
 
     #[test]
     fn skill_listing_is_agent_scoped_and_announces_dynamic_deltas() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let _node_env = EnvGuard::remove("NODE_ENV");
+        let _node_env = EnvVarGuard::unset("NODE_ENV");
         struct SentSkillNamesRestore(
             std::collections::HashMap<String, std::collections::HashSet<String>>,
         );
@@ -3481,7 +3491,7 @@ mod tests {
 
     #[test]
     fn skill_listing_prefers_live_app_state_mcp_commands_over_snapshot() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         struct SentSkillNamesRestore(
             std::collections::HashMap<String, std::collections::HashSet<String>>,
         );
@@ -3736,7 +3746,7 @@ mod tests {
 
     #[test]
     fn plan_mode_attachments_follow_official_turn_throttle_and_cycle() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let old_exited = crate::bootstrap::state::has_exited_plan_mode_in_session();
@@ -3996,7 +4006,7 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_diagnostic_attachments_require_bash_without_draining_registry() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         reset_all_lsp_diagnostic_state();
         register_pending_lsp_diagnostic("rust", vec![file("/tmp/a.rs", vec![diag("broken")])]);
 
@@ -4020,7 +4030,7 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_diagnostic_attachments_emit_renderable_and_model_messages() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         reset_all_lsp_diagnostic_state();
         register_pending_lsp_diagnostic(
             "rust",
@@ -4074,8 +4084,8 @@ mod tests {
     /// for the turn — this consumer never re-derives it from the agent files.
     #[test]
     fn agent_listing_delta_applies_selected_agent_type_restrictions() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _gate = EnvGuard::set("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _gate = EnvVarGuard::set("CLAUDE_CODE_AGENT_LIST_IN_MESSAGES", "true");
         let mut selected = crate::tools::agent_tool::load_agents_dir::AgentDefinition::new(
             "reviewer",
             "Reviews changes",
@@ -4133,11 +4143,11 @@ mod tests {
 
     #[test]
     fn mcp_instruction_delta_uses_live_initialize_instructions() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _instructions_lock = crate::services::mcp::client::TEST_MCP_INSTRUCTIONS_LOCK
             .lock()
             .unwrap();
-        let _gate = EnvGuard::set("CLAUDE_CODE_MCP_INSTR_DELTA", "true");
+        let _gate = EnvVarGuard::set("CLAUDE_CODE_MCP_INSTR_DELTA", "true");
         let _instructions =
             McpInstructionGuard::set("docs", "Use resource templates before tools.");
         let state = crate::state::app_state_store::McpState {
@@ -4173,12 +4183,12 @@ mod tests {
 
     #[test]
     fn mcp_instruction_delta_appends_chrome_tool_search_instructions() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _instructions_lock = crate::services::mcp::client::TEST_MCP_INSTRUCTIONS_LOCK
             .lock()
             .unwrap();
-        let _gate = EnvGuard::set("CLAUDE_CODE_MCP_INSTR_DELTA", "true");
-        let _tool_search = EnvGuard::set("ENABLE_TOOL_SEARCH", "true");
+        let _gate = EnvVarGuard::set("CLAUDE_CODE_MCP_INSTR_DELTA", "true");
+        let _tool_search = EnvVarGuard::set("ENABLE_TOOL_SEARCH", "true");
         let _instructions = McpInstructionGuard::set("claude-in-chrome", "Server guidance.");
         let state = crate::state::app_state_store::McpState {
             clients: vec![crate::services::mcp::types::McpServerSnapshot {
@@ -4218,7 +4228,7 @@ mod tests {
 
     #[tokio::test]
     async fn lsp_diagnostic_attachments_skip_agent_source_without_draining_registry() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         reset_all_lsp_diagnostic_state();
         register_pending_lsp_diagnostic("rust", vec![file("/tmp/a.rs", vec![diag("broken")])]);
 

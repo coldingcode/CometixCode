@@ -5,6 +5,8 @@
 
 #![allow(dead_code)]
 
+use crate::utils::process_env::JsTruthy;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FigureSet {
     /// Upstream `figures.circleQuestionMark`.
@@ -929,12 +931,12 @@ pub const FALLBACK_SYMBOLS: FigureSet = FigureSet {
 
 /// Mirrors `is-unicode-supported`, the dependency used by npm `figures`.
 pub fn is_unicode_supported() -> bool {
-    let term = std::env::var("TERM").ok();
-    let term_program = std::env::var("TERM_PROGRAM").ok();
-    let wt_session = std::env::var("WT_SESSION").ok();
-    let terminus_sublime = std::env::var("TERMINUS_SUBLIME").ok();
-    let con_emu_task = std::env::var("ConEmuTask").ok();
-    let terminal_emulator = std::env::var("TERMINAL_EMULATOR").ok();
+    let term = crate::utils::process_env::var("TERM");
+    let term_program = crate::utils::process_env::var("TERM_PROGRAM");
+    let wt_session = crate::utils::process_env::var("WT_SESSION");
+    let terminus_sublime = crate::utils::process_env::var("TERMINUS_SUBLIME");
+    let con_emu_task = crate::utils::process_env::var("ConEmuTask");
+    let terminal_emulator = crate::utils::process_env::var("TERMINAL_EMULATOR");
 
     is_unicode_supported_with_env(
         cfg!(windows),
@@ -960,8 +962,8 @@ pub fn is_unicode_supported_with_env(
         return term != Some("linux");
     }
 
-    wt_session.is_some_and(|value| !value.is_empty())
-        || terminus_sublime.is_some_and(|value| !value.is_empty())
+    wt_session.truthy().is_some()
+        || terminus_sublime.truthy().is_some()
         || con_emu_task == Some("{cmd::Cmder}")
         || term_program == Some("Terminus-Sublime")
         || term_program == Some("vscode")
@@ -972,9 +974,15 @@ pub fn is_unicode_supported_with_env(
         || terminal_emulator == Some("JetBrains-JediTerm")
 }
 
+/// Mirrors npm `figures`' module-level `const shouldUseMain =
+/// isUnicodeSupported()`: computed at import, before settings env applies.
+/// `entrypoints/cli.rs` forces it in the startup window.
+pub(crate) static SHOULD_USE_MAIN: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(is_unicode_supported);
+
 /// Returns the active figures set for the current terminal.
 pub fn figures() -> &'static FigureSet {
-    if is_unicode_supported() {
+    if *SHOULD_USE_MAIN {
         &MAIN_SYMBOLS
     } else {
         &FALLBACK_SYMBOLS
@@ -988,7 +996,7 @@ pub fn get() -> &'static FigureSet {
 
 /// Mirrors upstream `replaceSymbols(string, {useFallback})`.
 pub fn replace_symbols(input: &str, use_fallback: Option<bool>) -> String {
-    let use_fallback = use_fallback.unwrap_or_else(|| !is_unicode_supported());
+    let use_fallback = use_fallback.unwrap_or(!*SHOULD_USE_MAIN);
     if !use_fallback {
         return input.to_string();
     }

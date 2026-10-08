@@ -688,7 +688,11 @@ fn fuse_like_score(text: &str, query_lower: &str) -> Option<f64> {
 }
 
 fn sort_deep_search_matches(matches: &mut [DeepSearchMatch]) {
-    matches.sort_by(|a, b| {
+    // CC `LogSelector.tsx:439-447` — the `> DATE_TIE_THRESHOLD_MS` gate is not
+    // a total order (a≈b, b≈c but a̸≈c across the window). Kept verbatim, so
+    // the sort goes through the non-validating JS-sort primitive; `sort_by`
+    // panics on comparators like this (see `utils/js_sort.rs`; mirror PR #7).
+    crate::utils::js_sort::sort_by(matches, |a, b| {
         let date_diff_ms = if a.modified >= b.modified {
             a.modified
                 .duration_since(b.modified)
@@ -1016,6 +1020,8 @@ pub fn LogSelector<'a>(
     let mut focused_index = hooks.use_state(|| 0usize);
     let mut visible_from_index = hooks.use_state(|| 0usize);
     let mut view_mode = hooks.use_state(|| ViewMode::List);
+    // Maps to: CC LogSelector.tsx:192 `useTerminalFocus()` → SearchBox.
+    let is_terminal_focused = hooks.use_terminal_focus();
     let search = use_search_input(
         &mut hooks,
         props.initial_search_query.as_deref().unwrap_or_default(),
@@ -1044,16 +1050,53 @@ pub fn LogSelector<'a>(
             .display()
             .to_string()
     });
-    let current_branch = hooks.use_const(|| {
-        let branch = crate::utils::git::get_branch();
-        (!branch.is_empty()).then_some(branch)
+    // Maps to: CC LogSelector.tsx:203,206,277-282 — `currentBranch` starts
+    // null and `hasMultipleWorktrees` false; a mount effect fills them from two
+    // independent `getBranch().then(...)` / `getWorktreePaths(currentCwd)
+    // .then(...)` promises. Both Rust projections spawn git synchronously, so
+    // each runs on its own worker thread and lands through `use_future` on the
+    // render thread (Contract C: no cross-thread `State::set`). A sync call
+    // inside the async block would still block rendering, since `use_future`
+    // is polled in the render loop. Calling them from the render body froze
+    // the picker for the whole git round-trip on mount.
+    let mut current_branch_state = hooks.use_state(|| Option::<String>::None);
+    let mut has_multiple_worktrees_state = hooks.use_state(|| false);
+    let branch_receiver = hooks.use_const(|| {
+        let (sender, receiver) = async_channel::bounded(1);
+        let _ = std::thread::Builder::new()
+            .name("log-selector-branch".to_string())
+            .spawn(move || {
+                let branch = crate::utils::git::get_branch();
+                let _ = sender.send_blocking((!branch.is_empty()).then_some(branch));
+            });
+        std::sync::Arc::new(receiver)
     });
-    let has_multiple_worktrees = hooks.use_const({
-        let current_project_path = current_project_path.clone();
-        move || {
-            crate::utils::get_worktree_paths::get_worktree_paths(&current_project_path).len() > 1
+    hooks.use_future(async move {
+        if let Ok(branch) = branch_receiver.recv().await {
+            current_branch_state.set(branch);
         }
     });
+    let worktrees_receiver = hooks.use_const({
+        let current_project_path = current_project_path.clone();
+        move || {
+            let (sender, receiver) = async_channel::bounded(1);
+            let _ = std::thread::Builder::new()
+                .name("log-selector-worktrees".to_string())
+                .spawn(move || {
+                    let paths =
+                        crate::utils::get_worktree_paths::get_worktree_paths(&current_project_path);
+                    let _ = sender.send_blocking(paths.len() > 1);
+                });
+            std::sync::Arc::new(receiver)
+        }
+    });
+    hooks.use_future(async move {
+        if let Ok(multiple) = worktrees_receiver.recv().await {
+            has_multiple_worktrees_state.set(multiple);
+        }
+    });
+    let current_branch = current_branch_state.read().clone();
+    let has_multiple_worktrees = has_multiple_worktrees_state.get();
 
     let (terminal_width, terminal_rows) = hooks.use_terminal_size();
     let theme = hooks.use_context::<Theme>();
@@ -1720,7 +1763,7 @@ pub fn LogSelector<'a>(
             SearchBox(
                 query: query.clone(),
                 is_focused: is_search,
-                is_terminal_focused: true,
+                is_terminal_focused: is_terminal_focused,
                 cursor_offset: Some(search.offset()),
             )
             #(if show_additional_filter_line {
@@ -1821,6 +1864,7 @@ pub fn LogSelector<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use futures::{StreamExt, stream};
     use serde_json::json;
     use std::path::PathBuf;
@@ -2174,6 +2218,46 @@ mod tests {
         assert_eq!(same_minute[0].log_key, "older-exact");
     }
 
+    /// Regression for the release SIGABRT (mirror PR #7): the verbatim
+    /// `> DATE_TIE_THRESHOLD_MS` gate admits ordering cycles when scores rise
+    /// while timestamps cross the window (x≈y, y≈z within 60s, x̸≈z beyond),
+    /// which `slice::sort_by` rejects as not a total order. The sort routes
+    /// through `js_sort::sort_by`; this test drives the former-cycle triple
+    /// through it. The asserted order is the deterministic merge outcome of
+    /// the OFFICIAL comparator: x/y are within the window (score decides,
+    /// x first), z is over the window against both (newest first).
+    #[test]
+    fn deep_search_ranking_survives_a_cycle_across_the_date_tie_window() {
+        let mut matches = vec![
+            DeepSearchMatch {
+                log_key: "x".to_string(),
+                score: 0.0,
+                modified: SystemTime::UNIX_EPOCH + Duration::from_secs(0),
+                snippet: None,
+            },
+            DeepSearchMatch {
+                log_key: "y".to_string(),
+                score: 0.1,
+                modified: SystemTime::UNIX_EPOCH + Duration::from_secs(50),
+                snippet: None,
+            },
+            DeepSearchMatch {
+                log_key: "z".to_string(),
+                score: 0.2,
+                modified: SystemTime::UNIX_EPOCH + Duration::from_secs(110),
+                snippet: None,
+            },
+        ];
+        sort_deep_search_matches(&mut matches);
+        assert_eq!(
+            matches
+                .iter()
+                .map(|entry| entry.log_key.as_str())
+                .collect::<Vec<_>>(),
+            ["z", "x", "y"]
+        );
+    }
+
     #[test]
     fn merge_title_and_deep_search_logs_appends_transcript_only_matches_by_rank() {
         let mut title = summary("title", None, None, "/repo");
@@ -2294,8 +2378,8 @@ mod tests {
 
     #[test]
     fn rename_submit_persists_selected_full_path_and_notifies_parent() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write = crate::utils::env_utils::EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let path = std::env::temp_dir().join(format!(
             "cometix-log-selector-rename-{}.jsonl",
             uuid::Uuid::new_v4()
@@ -2840,7 +2924,7 @@ mod tests {
         // complete hook are executed in consumer-search-peer-oracle.json.
         // Alt+Backspace on empty remains in search; a paste inserts the entire
         // chunk; Ctrl+C without onCancel is swallowed without clearing query.
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
         // The list footer is intentionally a single NoWrap line. At 100
         // columns the real branch hint clips the final "Type to search" text;
         // use enough terminal width to observe the entire source footer while

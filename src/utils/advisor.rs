@@ -27,8 +27,7 @@ fn get_advisor_config() -> AdvisorConfig {
 /// Maps to CC `isAdvisorEnabled()` (`utils/advisor.ts:60-69`).
 pub fn is_advisor_enabled() -> bool {
     if crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_DISABLE_ADVISOR_TOOL")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_DISABLE_ADVISOR_TOOL")
             .as_deref(),
     ) {
         return false;
@@ -59,7 +58,7 @@ pub fn model_supports_advisor(model: &str) -> bool {
     let model = model.to_ascii_lowercase();
     model.contains("opus-4-6")
         || model.contains("sonnet-4-6")
-        || std::env::var("USER_TYPE").ok().as_deref() == Some("ant")
+        || crate::utils::process_env::var("USER_TYPE").as_deref() == Some("ant")
 }
 
 /// Maps to CC `isValidAdvisorModel()` (`utils/advisor.ts:98-106`).
@@ -77,7 +76,7 @@ pub fn get_initial_advisor_setting() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::{EnvVarGuard, TEST_ENV_LOCK};
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn advisor_model_predicates_match_official_launch_allowlist() {

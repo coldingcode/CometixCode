@@ -404,9 +404,15 @@ async fn load_mcp_servers_from_file(
     relative_path: &str,
 ) -> Option<indexmap::IndexMap<String, McpServerConfig>> {
     let file_path = super::plugin_loader::node_path_join(plugin_path, relative_path);
-    let content = match tokio::fs::read(&file_path).await {
+    let content = match crate::utils::fs_operations::get_fs_implementation()
+        .read_file(
+            &file_path,
+            crate::utils::fs_operations::BufferEncoding::Utf8,
+        )
+        .await
+    {
         // Node fs.readFile(..., {encoding:'utf-8'}) replaces malformed UTF-8.
-        Ok(content) => String::from_utf8_lossy(&content).into_owned(),
+        Ok(content) => content.to_string_lossy(),
         Err(error) => {
             if error.kind() != std::io::ErrorKind::NotFound {
                 crate::utils::debug::log_for_debugging_with_level(
@@ -626,6 +632,7 @@ mod tests {
     use super::*;
     use crate::types::plugin::get_plugin_error_message;
     use crate::utils::plugins::plugin_loader::create_plugin_from_path_for_test as create_plugin_from_path;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::io::Write;
 
     fn temp_dir(label: &str) -> PathBuf {
@@ -652,11 +659,11 @@ mod tests {
     /// (`settings_cache.rs:10-12`). Moving `CLAUDE_CONFIG_DIR` alone leaves the
     /// previous test's snapshot in place, so each of these tests reads a
     /// sibling's `pluginConfigs` and reports its own options as missing.
-    struct ConfigHomeGuard(Option<crate::utils::env_utils::EnvVarGuard>);
+    struct ConfigHomeGuard(Option<EnvVarGuard>);
 
     impl ConfigHomeGuard {
         fn pin(config_home: &Path) -> Self {
-            let guard = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", config_home);
+            let guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", config_home);
             crate::utils::settings::settings_cache::reset_settings_cache();
             Self(Some(guard))
         }
@@ -718,7 +725,7 @@ mod tests {
 
     #[test]
     fn plugin_mcp_user_config_variables_are_substituted_and_missing_refs_are_reported() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let root = temp_dir("user-config");
         let config_home = temp_dir("user-config-settings");
         let plugin_name = format!("toolbox-{}", uuid::Uuid::new_v4().simple());
@@ -788,7 +795,7 @@ mod tests {
 
     #[test]
     fn plugin_mcp_channel_user_config_overrides_top_level_options() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let root = temp_dir("channel-user-config");
         let config_home = temp_dir("channel-user-config-settings");
         let plugin_name = format!("toolbox-{}", uuid::Uuid::new_v4().simple());
@@ -872,7 +879,7 @@ mod tests {
 
     #[test]
     fn plugin_mcp_env_variables_expand_defaults_and_report_missing_without_dropping_server() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("COMETIX_PLUGIN_MCP_URL");
         crate::utils::process_env::remove("COMETIX_PLUGIN_MCP_TOKEN");
         let root = temp_dir("env-expansion");
@@ -923,7 +930,11 @@ mod tests {
             &root.join(".claude-plugin/plugin.json"),
             r#"{"name":"toolbox","mcpServers":"./server.mcpb"}"#,
         );
-        fs::write(root.join("server.mcpb"), include_bytes!("../../../tests/fixtures/oracles/mcpb-schema-0915/invalid.mcpb")).unwrap();
+        fs::write(
+            root.join("server.mcpb"),
+            include_bytes!("../../../tests/fixtures/oracles/mcpb-schema-0915/invalid.mcpb"),
+        )
+        .unwrap();
         let (plugin, plugin_errors) =
             create_plugin_from_path(&root, "toolbox@inline", true, "toolbox");
         assert!(plugin_errors.is_empty(), "errors={plugin_errors:?}");
@@ -939,12 +950,20 @@ mod tests {
 
     #[test]
     fn plugin_mcpb_real_bundle_load_needs_config_and_last_wins_match_source() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let root = temp_dir("mcpb-pipeline");
         let config_home = temp_dir("mcpb-pipeline-settings");
         let _config_home_guard = ConfigHomeGuard::pin(&config_home);
-        fs::write(root.join("valid.mcpb"), include_bytes!("../../../tests/fixtures/oracles/mcpb-schema-0915/valid.mcpb")).unwrap();
-        fs::write(root.join("needs.mcpb"), include_bytes!("../../../tests/fixtures/oracles/mcpb-schema-0915/needs-config.mcpb")).unwrap();
+        fs::write(
+            root.join("valid.mcpb"),
+            include_bytes!("../../../tests/fixtures/oracles/mcpb-schema-0915/valid.mcpb"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("needs.mcpb"),
+            include_bytes!("../../../tests/fixtures/oracles/mcpb-schema-0915/needs-config.mcpb"),
+        )
+        .unwrap();
         write_file(
             &root.join(".claude-plugin/plugin.json"),
             r#"{"name":"toolbox","mcpServers":"./valid.mcpb"}"#,
@@ -995,7 +1014,8 @@ mod tests {
         let cases: Value = serde_json::from_str(include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/tests/fixtures/oracles/mcpb-schema-0915/file-source-oracle.json"
-        ))).unwrap();
+        )))
+        .unwrap();
         let root = temp_dir("file-object-entries");
         for case in cases.as_array().unwrap() {
             if let Some(hex) = case["input_hex"].as_str() {
@@ -1032,8 +1052,8 @@ mod tests {
 
         // Match main's startup prerequisite before reqwest builds its client.
         crate::utils::tls_provider::install_crypto_provider();
-        let _proxy = crate::utils::env_utils::EnvVarGuard::set("NO_PROXY", "127.0.0.1");
-        let _proxy_lower = crate::utils::env_utils::EnvVarGuard::set("no_proxy", "127.0.0.1");
+        let _proxy = EnvVarGuard::set("NO_PROXY", "127.0.0.1");
+        let _proxy_lower = EnvVarGuard::set("no_proxy", "127.0.0.1");
         let root = temp_dir("nested-error-order");
         let mut servers = tokio::task::JoinSet::new();
         let (started_tx, mut started_rx) = tokio::sync::mpsc::channel(3);
@@ -1164,7 +1184,8 @@ mod tests {
     async fn plugin_activation_and_extraction_match_bun_cache_semantics() {
         let oracle: Value = serde_json::from_str(include_str!(
             "../../../tests/fixtures/oracles/mcp-lifecycle-0915/plugin-oracle.json"
-        )).unwrap();
+        ))
+        .unwrap();
         let root = temp_dir("activation-cache");
         fs::write(
             root.join(".mcp.json"),

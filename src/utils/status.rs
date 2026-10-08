@@ -2,6 +2,7 @@
 
 use crate::services::mcp::types::{McpClientSnapshot, McpServerConnectionType};
 use crate::utils::config::{GlobalConfig, ProjectConfig};
+use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::constants::get_setting_source_display_name_capitalized;
 use crate::utils::settings::{
     SettingSource, SettingsJson, get_enabled_setting_sources, get_managed_file_settings_presence,
@@ -198,7 +199,7 @@ pub fn build_account_properties() -> Vec<Property> {
     {
         properties.push(property("API key", api_key_source));
     }
-    if std::env::var_os("IS_DEMO").is_none() {
+    if crate::utils::process_env::var_os("IS_DEMO").as_deref().truthy().is_none() {
         if let Some(organization) = account_info.organization {
             properties.push(property("Organization", organization));
         }
@@ -210,12 +211,12 @@ pub fn build_account_properties() -> Vec<Property> {
 }
 
 fn push_env_property(properties: &mut Vec<Property>, label: &'static str, key: &str) {
-    if let Some(value) = std::env::var(key).ok().filter(|value| !value.is_empty()) {
+    if let Some(value) = crate::utils::process_env::var(key).truthy() {
         properties.push(property(label, value));
     }
 }
 
-/// Maps to: CC `utils/status.tsx:332-445` `buildAPIProviderProperties`.
+/// Maps to: CC `utils/status.tsx:332-460` `buildAPIProviderProperties`.
 pub fn build_api_provider_properties() -> Vec<Property> {
     use crate::utils::model::providers::ApiProvider;
 
@@ -233,8 +234,7 @@ pub fn build_api_provider_properties() -> Vec<Property> {
                 crate::utils::env_utils::get_aws_region(),
             ));
             if crate::utils::env_utils::is_env_truthy(
-                std::env::var("CLAUDE_CODE_SKIP_BEDROCK_AUTH")
-                    .ok()
+                crate::utils::process_env::var("CLAUDE_CODE_SKIP_BEDROCK_AUTH")
                     .as_deref(),
             ) {
                 properties.push(unlabeled_property("AWS auth skipped"));
@@ -253,8 +253,7 @@ pub fn build_api_provider_properties() -> Vec<Property> {
                 crate::utils::env_utils::get_default_vertex_region(),
             ));
             if crate::utils::env_utils::is_env_truthy(
-                std::env::var("CLAUDE_CODE_SKIP_VERTEX_AUTH")
-                    .ok()
+                crate::utils::process_env::var("CLAUDE_CODE_SKIP_VERTEX_AUTH")
                     .as_deref(),
             ) {
                 properties.push(unlabeled_property("GCP auth skipped"));
@@ -273,8 +272,7 @@ pub fn build_api_provider_properties() -> Vec<Property> {
                 "ANTHROPIC_FOUNDRY_RESOURCE",
             );
             if crate::utils::env_utils::is_env_truthy(
-                std::env::var("CLAUDE_CODE_SKIP_FOUNDRY_AUTH")
-                    .ok()
+                crate::utils::process_env::var("CLAUDE_CODE_SKIP_FOUNDRY_AUTH")
                     .as_deref(),
             ) {
                 properties.push(unlabeled_property("Microsoft Foundry auth skipped"));
@@ -282,25 +280,25 @@ pub fn build_api_provider_properties() -> Vec<Property> {
         }
     }
 
-    for key in ["https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY"] {
-        if let Some(proxy) = std::env::var(key).ok().filter(|value| !value.is_empty()) {
-            properties.push(property("Proxy", proxy));
-            break;
-        }
+    // Maps to CC `status.tsx:428-457`.
+    let env = crate::utils::process_env::snapshot();
+    if let Some(proxy_url) = crate::utils::proxy::get_proxy_url(&env) {
+        properties.push(property("Proxy", proxy_url));
     }
-    push_env_property(
-        &mut properties,
-        "Additional CA cert(s)",
-        "NODE_EXTRA_CA_CERTS",
-    );
-    for (label, key) in [
-        ("mTLS client cert", "CLAUDE_CODE_CLIENT_CERT"),
-        ("mTLS client key", "CLAUDE_CODE_CLIENT_KEY"),
-    ] {
-        if let Some(path) = std::env::var(key).ok().filter(|value| !value.is_empty()) {
-            if std::fs::read_to_string(&path).is_ok() {
-                properties.push(property(label, path));
-            }
+
+    let mtls_config = crate::utils::mtls::get_mtls_config();
+    let truthy = |key: &str| env.var(key).truthy().map(str::to_owned);
+    if let Some(extra_certs) = truthy("NODE_EXTRA_CA_CERTS") {
+        properties.push(property("Additional CA cert(s)", extra_certs));
+    }
+    if let Some(mtls_config) = mtls_config {
+        // `mtlsConfig.cert && ...`: an empty file's contents are falsy.
+        let loaded = |contents: &Option<String>| contents.as_deref().is_some_and(|c| !c.is_empty());
+        if let Some(cert_path) = truthy("CLAUDE_CODE_CLIENT_CERT").filter(|_| loaded(&mtls_config.cert)) {
+            properties.push(property("mTLS client cert", cert_path));
+        }
+        if let Some(key_path) = truthy("CLAUDE_CODE_CLIENT_KEY").filter(|_| loaded(&mtls_config.key)) {
+            properties.push(property("mTLS client key", key_path));
         }
     }
     properties
@@ -309,6 +307,7 @@ pub fn build_api_provider_properties() -> Vec<Property> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn mcp_client_snapshots_from_project_config_builds_readonly_pending_snapshots() {
@@ -361,27 +360,9 @@ mod tests {
         );
     }
 
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::unset(key),
-            }
-        }
-    }
-
     #[test]
     fn build_api_provider_properties_matches_official_process_rows() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let cert = std::env::temp_dir().join(format!(
@@ -390,20 +371,22 @@ mod tests {
         ));
         std::fs::write(&cert, "certificate").unwrap();
         let guards = vec![
-            EnvGuard::set("CLAUDE_CODE_USE_BEDROCK", "1"),
-            EnvGuard::unset("CLAUDE_CODE_USE_VERTEX"),
-            EnvGuard::unset("CLAUDE_CODE_USE_FOUNDRY"),
-            EnvGuard::set("BEDROCK_BASE_URL", "https://bedrock.example"),
-            EnvGuard::set("AWS_DEFAULT_REGION", "us-west-2"),
-            EnvGuard::set("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "true"),
-            EnvGuard::set("https_proxy", "http://lowercase-proxy"),
-            EnvGuard::unset("HTTPS_PROXY"),
-            EnvGuard::unset("http_proxy"),
-            EnvGuard::unset("HTTP_PROXY"),
-            EnvGuard::set("NODE_EXTRA_CA_CERTS", "/tmp/ca.pem"),
-            EnvGuard::set("CLAUDE_CODE_CLIENT_CERT", &cert),
-            EnvGuard::unset("CLAUDE_CODE_CLIENT_KEY"),
+            EnvVarGuard::set("CLAUDE_CODE_USE_BEDROCK", "1"),
+            EnvVarGuard::unset("CLAUDE_CODE_USE_VERTEX"),
+            EnvVarGuard::unset("CLAUDE_CODE_USE_FOUNDRY"),
+            EnvVarGuard::set("BEDROCK_BASE_URL", "https://bedrock.example"),
+            EnvVarGuard::set("AWS_DEFAULT_REGION", "us-west-2"),
+            EnvVarGuard::set("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "true"),
+            EnvVarGuard::set("https_proxy", "http://lowercase-proxy"),
+            EnvVarGuard::unset("HTTPS_PROXY"),
+            EnvVarGuard::unset("http_proxy"),
+            EnvVarGuard::unset("HTTP_PROXY"),
+            EnvVarGuard::set("NODE_EXTRA_CA_CERTS", "/tmp/ca.pem"),
+            EnvVarGuard::set("CLAUDE_CODE_CLIENT_CERT", &cert),
+            EnvVarGuard::unset("CLAUDE_CODE_CLIENT_KEY"),
         ];
+        // `getMTLSConfig` is memoized.
+        crate::utils::mtls::clear_mtls_cache();
 
         assert_eq!(
             build_api_provider_properties(),
@@ -419,12 +402,13 @@ mod tests {
         );
 
         drop(guards);
+        crate::utils::mtls::clear_mtls_cache();
         let _ = std::fs::remove_file(cert);
     }
 
     #[test]
     fn build_account_properties_matches_official_sources_without_secret_values() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK
+        let _lock = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!(
@@ -432,12 +416,12 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_home = EnvGuard::set("CLAUDE_CONFIG_DIR", &dir);
-        let _oauth = EnvGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
-        let _api_key = EnvGuard::unset("ANTHROPIC_API_KEY");
-        let _bedrock = EnvGuard::unset("CLAUDE_CODE_USE_BEDROCK");
-        let _vertex = EnvGuard::unset("CLAUDE_CODE_USE_VERTEX");
-        let _foundry = EnvGuard::unset("CLAUDE_CODE_USE_FOUNDRY");
+        let _config_home = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
+        let _oauth = EnvVarGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
+        let _api_key = EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        let _bedrock = EnvVarGuard::unset("CLAUDE_CODE_USE_BEDROCK");
+        let _vertex = EnvVarGuard::unset("CLAUDE_CODE_USE_VERTEX");
+        let _foundry = EnvVarGuard::unset("CLAUDE_CODE_USE_FOUNDRY");
 
         let mut config = crate::utils::config::GlobalConfig::default();
         config.primary_api_key = Some("sk-ant-secret".to_string());

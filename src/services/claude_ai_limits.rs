@@ -504,7 +504,7 @@ pub async fn check_quota_status() {
 
 /// Maps to CC `services/claudeAiLimits.ts:199-218` `makeTestQuery()`.
 async fn make_test_query(
-    client: &anthropic_sdk::Anthropic,
+    client: &crate::services::api::client::ClientBuildOutput,
     model: &str,
 ) -> Result<
     anthropic_sdk::core::response::ApiResponse<
@@ -528,7 +528,11 @@ async fn make_test_query(
         betas: (!betas.is_empty()).then_some(betas),
         ..Default::default()
     };
-    client.beta().messages().create_with_response(&params).await
+    client
+        .beta()
+        .messages()
+        .create_with_response_and_options(&params, None)
+        .await
 }
 
 /// Starts the preflight without putting network I/O on the retained frame.
@@ -680,6 +684,7 @@ pub fn reset_for_test() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     fn headers(entries: &[(&str, &str)]) -> HashMap<String, String> {
         entries
@@ -690,7 +695,7 @@ mod tests {
 
     #[test]
     fn header_status_and_overage_projection_match_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_for_test();
         extract_quota_status_from_headers_with(
             &headers(&[
@@ -715,7 +720,7 @@ mod tests {
 
     #[test]
     fn surpassed_threshold_and_time_relative_warning_match_official() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_for_test();
         extract_quota_status_from_headers_with(
             &headers(&[
@@ -747,7 +752,7 @@ mod tests {
 
     #[test]
     fn error_without_headers_forces_rejected_and_non_subscriber_resets() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_for_test();
         extract_quota_status_from_error_with(Some(429), None, true, 0.0);
         assert_eq!(current_limits().status, QuotaStatus::Rejected);
@@ -758,7 +763,7 @@ mod tests {
 
     #[test]
     fn listeners_only_receive_real_status_changes() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_for_test();
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let calls_for_listener = calls.clone();
@@ -815,7 +820,7 @@ mod tests {
     #[test]
     fn app_store_bridge_updates_live_limits_notifications_and_cleans_up() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_for_test();
         let store = crate::state::store::AppStore::new(
             crate::state::app_state_store::AppState::default(),

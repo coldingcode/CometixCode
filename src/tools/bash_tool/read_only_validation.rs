@@ -1560,7 +1560,7 @@ fn is_bare_git_repo(cwd: &std::path::Path) -> bool {
 
 /// Maps to CC `checkReadOnlyConstraints(...)` reduced to the
 /// `behavior === 'allow'` boolean consumed by `BashTool.isReadOnly(input)`.
-pub(crate) fn check_read_only_constraints_at_cwd(command: &str, cwd: &std::path::Path) -> bool {
+pub(crate) fn check_read_only_constraints(command: &str, cwd: &std::path::Path) -> bool {
     let command = command.trim();
     if command.is_empty()
         || crate::utils::bash::shell_quote::try_parse_shell_command(command).is_err()
@@ -1602,14 +1602,10 @@ pub(crate) fn check_read_only_constraints_at_cwd(command: &str, cwd: &std::path:
         })
 }
 
-pub(crate) fn check_read_only_constraints(command: &str) -> bool {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    check_read_only_constraints_at_cwd(command, &cwd)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn check_read_only_constraints_allows_plain_read_only_commands() {
@@ -1638,7 +1634,7 @@ mod tests {
             "pwd",
         ] {
             assert!(
-                check_read_only_constraints(command),
+                check_read_only_constraints(command, &std::env::current_dir().unwrap()),
                 "expected allow: {command}"
             );
         }
@@ -1739,7 +1735,7 @@ mod tests {
             ("cat foo\\", true),
         ] {
             assert_eq!(
-                check_read_only_constraints(command),
+                check_read_only_constraints(command, &std::env::current_dir().unwrap()),
                 expected,
                 "CC 2.1.88 read-only differential for {command:?}"
             );
@@ -1790,7 +1786,7 @@ mod tests {
             "git remote add origin url",
         ] {
             assert!(
-                !check_read_only_constraints(command),
+                !check_read_only_constraints(command, &std::env::current_dir().unwrap()),
                 "expected callback/parser rejection: {command}"
             );
         }
@@ -1805,7 +1801,7 @@ mod tests {
             "git tag --list 'v*'",
         ] {
             assert!(
-                check_read_only_constraints(command),
+                check_read_only_constraints(command, &std::env::current_dir().unwrap()),
                 "expected complete-map allow: {command}"
             );
         }
@@ -1822,7 +1818,7 @@ mod tests {
             "cat $FILE",
         ] {
             assert!(
-                !check_read_only_constraints(command),
+                !check_read_only_constraints(command, &std::env::current_dir().unwrap()),
                 "expected reject: {command}"
             );
         }
@@ -1851,7 +1847,7 @@ mod tests {
             "date -us 20260101",
         ] {
             assert!(
-                !check_read_only_constraints(command),
+                !check_read_only_constraints(command, &std::env::current_dir().unwrap()),
                 "expected reject: {command}"
             );
         }
@@ -1859,7 +1855,7 @@ mod tests {
 
     #[test]
     fn sandboxed_git_outside_original_cwd_is_not_auto_allowed() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let config = std::env::temp_dir().join(format!(
             "cometix-readonly-sandbox-settings-{}",
             uuid::Uuid::new_v4().simple()
@@ -1875,12 +1871,12 @@ mod tests {
             r#"{"sandbox":{"enabled":true}}"#,
         )
         .unwrap();
-        let _env = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config);
+        let _env = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config);
         // The sandbox gate reads merged settings, which are cached
         // process-wide (`settings_cache.rs:10-12`); without the reset an
         // earlier test's snapshot hides the `sandbox.enabled` written above.
         crate::utils::settings::settings_cache::reset_settings_cache();
-        assert!(!check_read_only_constraints_at_cwd("git status", &cwd));
+        assert!(!check_read_only_constraints("git status", &cwd));
         drop(_env);
         crate::utils::settings::settings_cache::reset_settings_cache();
         let _ = std::fs::remove_dir_all(config);
@@ -1894,10 +1890,10 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(root.join("objects")).unwrap();
-        assert!(!check_read_only_constraints_at_cwd("git status", &root));
+        assert!(!check_read_only_constraints("git status", &root));
         std::fs::create_dir_all(root.join(".git")).unwrap();
         std::fs::write(root.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
-        assert!(check_read_only_constraints_at_cwd("git status", &root));
+        assert!(check_read_only_constraints("git status", &root));
         let _ = std::fs::remove_dir_all(root);
     }
 
@@ -1911,7 +1907,7 @@ mod tests {
             "   ",
         ] {
             assert!(
-                !check_read_only_constraints(command),
+                !check_read_only_constraints(command, &std::env::current_dir().unwrap()),
                 "expected reject: {command}"
             );
         }

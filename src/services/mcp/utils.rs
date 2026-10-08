@@ -12,37 +12,26 @@ use crate::components::mcp::types::AgentMcpServerInfo;
 use crate::state::app_state_store::McpState;
 use crate::tools::agent_tool::load_agents_dir::{AgentDefinition, AgentMcpServerSpec};
 use crate::types::tools::Tool;
-use crate::utils::config::get_global_config_path;
 use crate::utils::settings::types::SettingsJson;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-/// Maps to: CC `services/mcp/config.ts#getEnterpriseMcpFilePath`.
+/// Maps to: CC `services/mcp/config.ts:62-64` `getEnterpriseMcpFilePath`:
+/// `join(getManagedFilePath(), 'managed-mcp.json')`. The managed root's
+/// `CLAUDE_CODE_MANAGED_SETTINGS_PATH` override is Ant-only there, so an
+/// external build cannot point the enterprise MCP file elsewhere.
 pub fn get_enterprise_mcp_file_path_readonly() -> PathBuf {
-    if let Ok(path) = std::env::var("CLAUDE_CODE_MANAGED_SETTINGS_PATH") {
-        return PathBuf::from(path).join("managed-mcp.json");
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        PathBuf::from("/Library/Application Support/ClaudeCode").join("managed-mcp.json")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        PathBuf::from(r"C:\Program Files\ClaudeCode").join("managed-mcp.json")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        PathBuf::from("/etc/claude-code").join("managed-mcp.json")
-    }
+    crate::utils::settings::managed_path::get_managed_file_path().join("managed-mcp.json")
 }
 
 /// Maps to: CC `services/mcp/utils.ts#describeMcpConfigFilePath`.
 pub fn describe_mcp_config_file_path(scope: ConfigScope) -> String {
     match scope {
-        ConfigScope::User => get_global_config_path().display().to_string(),
+        ConfigScope::User => crate::utils::env::get_global_claude_file()
+            .display()
+            .to_string(),
         ConfigScope::Project => std::env::current_dir()
             .unwrap_or_default()
             .join(".mcp.json")
@@ -50,7 +39,7 @@ pub fn describe_mcp_config_file_path(scope: ConfigScope) -> String {
             .to_string(),
         ConfigScope::Local => format!(
             "{} [project: {}]",
-            get_global_config_path().display(),
+            crate::utils::env::get_global_claude_file().display(),
             std::env::current_dir().unwrap_or_default().display()
         ),
         ConfigScope::Dynamic => "Dynamically configured".to_string(),

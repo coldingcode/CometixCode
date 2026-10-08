@@ -8,6 +8,10 @@ use std::sync::{LazyLock, Mutex};
 
 use serde::{Deserialize, Serialize};
 
+use crate::utils::process_env::JsTruthy;
+#[cfg(test)]
+use crate::utils::test_env::{EnvVarGuard, TestStateLock};
+
 const HIGH_WATER_MARK_FILE: &str = ".highwatermark";
 
 /// Maps to: CC `utils/tasks.ts:69` `TASK_STATUSES`.
@@ -55,10 +59,9 @@ pub fn clear_leader_team_name() {
 
 /// Maps to: CC `utils/tasks.ts#getTaskListId`.
 pub fn get_task_list_id() -> String {
-    if let Ok(task_list_id) = std::env::var("CLAUDE_CODE_TASK_LIST_ID") {
-        if !task_list_id.trim().is_empty() {
-            return task_list_id;
-        }
+    if let Some(task_list_id) = crate::utils::process_env::var("CLAUDE_CODE_TASK_LIST_ID").truthy()
+    {
+        return task_list_id;
     }
     crate::utils::teammate::get_team_name(None)
         .or_else(|| LEADER_TEAM_NAME.lock().unwrap().clone())
@@ -150,7 +153,7 @@ pub fn reset_task_list(task_list_id: &str) -> std::io::Result<()> {
 /// (`getIsNonInteractiveSession()`), not an env var.
 pub fn is_todo_v2_enabled() -> bool {
     if crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_ENABLE_TASKS").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_ENABLE_TASKS").as_deref(),
     ) {
         return true;
     }
@@ -461,7 +464,7 @@ pub(crate) fn clear_task_tool_store_for_test() {
 #[cfg(test)]
 pub(crate) struct TempTaskConfig {
     pub root: std::path::PathBuf,
-    _guards: Vec<TempEnvGuard>,
+    _guards: Vec<EnvVarGuard>,
     /// Redirecting `CLAUDE_CONFIG_DIR` also redirects `~/.claude.json`
     /// (`utils/config.rs:119-120`), so the temp root below carries no
     /// `hasTrustDialogAccepted` for any path and the workspace reads as
@@ -478,27 +481,13 @@ pub(crate) struct TempTaskConfig {
 }
 
 #[cfg(test)]
-struct TempEnvGuard {
-    _env: crate::utils::env_utils::EnvVarGuard,
-}
-
-#[cfg(test)]
-impl TempEnvGuard {
-    fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
-        Self {
-            _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-        }
-    }
-}
-
-#[cfg(test)]
 impl TempTaskConfig {
     pub fn new(list_id: &str) -> Self {
         let root =
             std::env::temp_dir().join(format!("cometix-tasks-{}", uuid::Uuid::new_v4().simple()));
         let guards = vec![
-            TempEnvGuard::set("CLAUDE_CONFIG_DIR", &root),
-            TempEnvGuard::set("CLAUDE_CODE_TASK_LIST_ID", list_id),
+            EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root),
+            EnvVarGuard::set("CLAUDE_CODE_TASK_LIST_ID", list_id),
         ];
         let _ = reset_task_list(list_id);
         Self {
@@ -569,18 +558,17 @@ impl TaskToolStoreCompatInner {
 }
 
 #[cfg(test)]
-pub(crate) static TASK_TOOL_TEST_LOCK: LazyLock<crate::utils::env_utils::TestStateLock> =
-    LazyLock::new(crate::utils::env_utils::TestStateLock::new);
+pub(crate) static TASK_TOOL_TEST_LOCK: LazyLock<TestStateLock> = LazyLock::new(TestStateLock::new);
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn task_claim_respects_official_owner_status_and_blocker_rules() {
         let _guard = TASK_TOOL_TEST_LOCK.lock().unwrap();
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-task-claim-{}",
             uuid::Uuid::new_v4().simple()
@@ -649,7 +637,7 @@ mod tests {
         let _teammate_guard = crate::utils::teammate::TEST_TEAMMATE_CONTEXT_LOCK
             .lock()
             .unwrap();
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let _task_list_guard = EnvVarGuard::set("CLAUDE_CODE_TASK_LIST_ID", "");
         clear_leader_team_name();
         crate::utils::teammate::clear_dynamic_team_context();
@@ -680,7 +668,7 @@ mod tests {
     #[test]
     fn reset_task_list_removes_task_files_and_preserves_high_water_mark() {
         let _guard = TASK_TOOL_TEST_LOCK.lock().unwrap();
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "cometix-task-reset-{}",
             uuid::Uuid::new_v4().simple()
@@ -720,7 +708,7 @@ mod tests {
 
     #[test]
     fn is_todo_v2_enabled_matches_official_interactive_default_and_env_override() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("CLAUDE_CODE_ENABLE_TASKS");
         crate::utils::process_env::remove("COMETIX_NON_INTERACTIVE_SESSION");
         assert!(super::is_todo_v2_enabled());

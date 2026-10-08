@@ -903,8 +903,7 @@ pub fn can_use_tool_or_queue_permission_for_params_with_store(
         crate::hooks::tool_permission::handlers::interactive_handler::fill_tool_description(
             &mut request,
         );
-        let wait_timeout = std::env::var("COMETIX_SWARM_PERMISSION_WAIT_MS")
-            .ok()
+        let wait_timeout = crate::utils::process_env::var("COMETIX_SWARM_PERMISSION_WAIT_MS")
             .and_then(|value| value.parse::<u64>().ok())
             .map(std::time::Duration::from_millis)
             .unwrap_or_else(|| std::time::Duration::from_millis(30_000));
@@ -1043,6 +1042,7 @@ mod tests {
         PermissionDecisionReason, PermissionMode, PermissionRequest, PermissionRuleSource,
         PermissionRuleValue,
     };
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::collections::HashMap;
 
     fn queued_bash() -> ToolUsePermissionRequest {
@@ -1407,8 +1407,8 @@ mod tests {
 
     #[test]
     fn lsp_tool_uses_read_permission_rules_for_file_path() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _lsp = crate::utils::env_utils::EnvVarGuard::set("ENABLE_LSP_TOOL", "1");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _lsp = EnvVarGuard::set("ENABLE_LSP_TOOL", "1");
         let mut queue = Vec::new();
         let tool_use = ToolUsePermissionRequest {
             tool_use_id: "toolu_lsp".to_string(),

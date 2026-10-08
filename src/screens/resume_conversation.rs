@@ -7,7 +7,7 @@
 
 use crate::commands::resume;
 use crate::components::log_selector::LogSelector;
-use crate::components::spinner::SpinnerGlyph;
+use crate::components::spinner::Spinner;
 use crate::screens::repl::ReplProps;
 use crate::utils::cross_project_resume::{CrossProjectResumeResult, check_cross_project_resume};
 use crate::utils::session_storage::{SessionLogResult, SessionSelection, SessionSummary};
@@ -112,33 +112,39 @@ fn filtered_logs(
     }
 }
 
-#[derive(Default, Props)]
-struct NoConversationsMessageProps {}
-
 /// Maps to: CC `screens/ResumeConversation.tsx` `NoConversationsMessage`.
 ///
 /// iocraft has no process exit-code channel on `App`; `app:interrupt` exits
 /// the retained root while preserving the official visible behavior.
+///
+/// Cometix-specific deviation (product requirement — skip in parity audits):
+/// `app:exit` exits too. Cometix binds Ctrl+C to it (default_bindings.rs),
+/// and "Press Ctrl+C to exit" stays true, as it is in 2.1.88.
 #[component]
-fn NoConversationsMessage(
-    _props: &NoConversationsMessageProps,
-    mut hooks: Hooks,
-) -> impl Into<AnyElement<'static>> {
+fn NoConversationsMessage(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
     let mut app = hooks.use_app();
-    let mut pending_exit = hooks.use_state(|| false);
+    let pending_exit = hooks.use_state(|| false);
     let keybinding_runtime = hooks
         .try_use_context::<crate::keybindings::keybinding_context::KeybindingRuntime>()
         .map(|runtime| runtime.clone());
-    crate::keybindings::use_keybinding::use_keybinding(
+    crate::keybindings::use_keybinding::use_keybindings(
         &mut hooks,
         keybinding_runtime,
-        "app:interrupt",
+        ["app:interrupt", "app:exit"]
+            .into_iter()
+            .map(|action| {
+                let mut pending_exit = pending_exit;
+                (
+                    action.to_string(),
+                    Box::new(move || {
+                        pending_exit.set(true);
+                        true
+                    }) as crate::keybindings::use_keybinding::KeybindingHandler,
+                )
+            })
+            .collect(),
         crate::keybindings::types::ContextName::Global,
         || true,
-        move || {
-            pending_exit.set(true);
-            true
-        },
     );
     if pending_exit.get() {
         app.exit();
@@ -184,6 +190,64 @@ fn CrossProjectMessage(
     }
 }
 
+#[derive(Default, Props)]
+struct ResumeFailedMessageProps {
+    /// The session whose load failed (CC 2.1.280 `cp(selected)`).
+    session_id: Option<String>,
+}
+
+/// Cometix-specific deviation (product requirement — skip in parity audits):
+/// backported from CC 2.1.280's resume-failure message. 2.1.88 logs the
+/// error, rethrows, and stays on "Resuming conversation…" with no way out.
+///
+/// Like `CrossProjectMessage`, it exits shortly after rendering. 2.1.280
+/// exits with code 1; iocraft has no process exit-code channel on `App`.
+#[component]
+fn ResumeFailedMessage(
+    props: &ResumeFailedMessageProps,
+    mut hooks: Hooks,
+) -> impl Into<AnyElement<'static>> {
+    let mut app = hooks.use_app();
+    hooks.use_future(async move {
+        futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+        app.exit();
+    });
+
+    let hint = match props
+        .session_id
+        .as_deref()
+        .filter(|id| is_command_safe_session_id(id))
+    {
+        Some(id) => format!("Run claude --resume {id} to retry, or claude to start a new session."),
+        None => "Run claude to start a new session.".to_string(),
+    };
+    element! {
+        View(flex_direction: FlexDirection::Column, row_gap: 1u32) {
+            Text(content: "Failed to resume the conversation.".to_string())
+            Text(content: hint, dim: true)
+        }
+    }
+}
+
+/// CC 2.1.280's check before a session id goes into a suggested command: at
+/// most 200 characters of `[A-Za-z0-9_][A-Za-z0-9_-]*`, and not a Windows
+/// device name.
+fn is_command_safe_session_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    let lower = id.to_ascii_lowercase();
+    let is_device_name = matches!(lower.as_str(), "con" | "prn" | "aux" | "nul")
+        || (lower.len() == 4
+            && (lower.starts_with("com") || lower.starts_with("lpt"))
+            && lower.as_bytes()[3].is_ascii_digit());
+    id.len() <= 200
+        && (first.is_ascii_alphanumeric() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        && !is_device_name
+}
+
 /// Maps to: CC `screens/ResumeConversation.tsx:63-376` top-level chooser props.
 /// Session-config fields are carried together as the same immutable `ReplProps`
 /// later spread into REPL.
@@ -224,7 +288,10 @@ pub fn ResumeConversation(
     let mut load_generation = hooks.use_state(|| 0u64);
     let mut selected_repl_props = hooks.use_state(|| Option::<ReplProps>::None);
     let mut cross_project_command = hooks.use_state(|| Option::<String>::None);
-    let mut resume_error = hooks.use_state(|| Option::<String>::None);
+    // CC 2.1.280's failure state (see `ResumeFailedMessage`): the session
+    // being resumed, and — once its load failed — the one the message names.
+    let mut resuming_session_id = hooks.use_state(|| Option::<String>::None);
+    let mut resume_failed_session_id = hooks.use_state(|| Option::<Option<String>>::None);
     let load_channel = hooks
         .use_const(|| std::sync::Arc::new(async_channel::unbounded::<SessionLogLoadRequest>()));
     let load_tx_initial = load_channel.0.clone();
@@ -323,7 +390,8 @@ pub fn ResumeConversation(
         let base_repl_props = props.repl_props.clone();
         async move {
             while let Ok(restored) = restore_rx.recv().await {
-                resuming.set(false);
+                // CC never resets `resuming` (:219): a loaded session renders
+                // its REPL, and a failed one its message, ahead of the spinner.
                 match restored {
                     Ok(processed) => {
                         // B3 flip-audit SEAM: CC builds this into the
@@ -339,7 +407,16 @@ pub fn ResumeConversation(
                         repl_props.apply_processed_resume(&processed);
                         selected_repl_props.set(Some(repl_props));
                     }
-                    Err(error) => resume_error.set(Some(error)),
+                    // CC 2.1.88 :346-353 logs and rethrows, and stays on
+                    // "Resuming conversation…". Cometix-specific deviation
+                    // (skip in parity audits), backported from CC 2.1.280's
+                    // onSelect catch: log, then show `ResumeFailedMessage`.
+                    Err(error) => {
+                        crate::utils::log::log_error(crate::utils::log::LogError::new(
+                            format!("resume picker: onSelect failed: {error}"),
+                        ));
+                        resume_failed_session_id.set(Some(resuming_session_id.read().clone()));
+                    }
                 }
             }
         }
@@ -382,32 +459,26 @@ pub fn ResumeConversation(
         return repl_props.into_element();
     }
 
-    if let Some(error) = resume_error.read().clone() {
-        return element! {
-            View(flex_direction: FlexDirection::Column) {
-                Text(content: error)
-                Text(content: "Press Ctrl+C to exit and start a new conversation.".to_string(), dim: true)
-            }
-        }
-        .into_any();
-    }
-
     if let Some(command) = cross_project_command.read().clone() {
         return element! { CrossProjectMessage(command: command) }.into_any();
     }
     if loading.get() && logs.read().is_empty() {
         return element! {
             View(flex_direction: FlexDirection::Row) {
-                SpinnerGlyph(frame: 0usize)
+                Spinner
                 Text(content: " Loading conversations…".to_string(), wrap: TextWrap::NoWrap)
             }
         }
         .into_any();
     }
+    // CC 2.1.280 renders its failure message ahead of the resuming spinner.
+    if let Some(session_id) = resume_failed_session_id.read().clone() {
+        return element! { ResumeFailedMessage(session_id) }.into_any();
+    }
     if resuming.get() {
         return element! {
             View(flex_direction: FlexDirection::Row) {
-                SpinnerGlyph(frame: 0usize)
+                Spinner
                 Text(content: " Resuming conversation…".to_string(), wrap: TextWrap::NoWrap)
             }
         }
@@ -456,7 +527,7 @@ pub fn ResumeConversation(
                     CrossProjectResumeResult::SameProject
                     | CrossProjectResumeResult::SameRepoWorktree { .. } => {
                         resuming.set(true);
-                        resume_error.set(None);
+                        resuming_session_id.set(Some(selection.session_id.clone()));
                         let restore_tx = restore_tx.clone();
                         let initial_agent = initial_agent_for_select.clone();
                         let agent_definitions =
@@ -603,6 +674,111 @@ mod tests {
             empty.contains("Press Ctrl+C to exit and start a new conversation."),
             "canvas=\n{empty}"
         );
+    }
+
+    /// Cometix binds Ctrl+C to app:exit; one Ctrl+C (or Ctrl+D) still leaves
+    /// this screen, as its copy says and as 2.1.88's does. The loop ignores
+    /// unowned Ctrl+C, as production does.
+    #[test]
+    fn no_conversations_message_exits_on_one_ctrl_c_or_ctrl_d() {
+        use futures::{FutureExt, StreamExt};
+        let exits = |c: char| {
+            futures::executor::block_on(async move {
+                let mut key = KeyEvent::new(KeyEventKind::Press, KeyCode::Char(c));
+                key.modifiers = KeyModifiers::CONTROL;
+                let events = futures::stream::iter(vec![TerminalEvent::Key(key)])
+                    .chain(futures::stream::pending());
+                let mut app = element! {
+                    ContextProvider(value: Context::owned(
+                        crate::keybindings::keybinding_context::KeybindingRuntime::with_default_bindings()
+                    )) {
+                        ContextProvider(value: Context::owned(*theme::current())) {
+                            NoConversationsMessage()
+                        }
+                    }
+                };
+                let mut frames = Box::pin(app.mock_terminal_render_loop(
+                    MockTerminalConfig::with_events(events)
+                        .with_size(80, 5)
+                        .with_ignore_ctrl_c(true),
+                ));
+                for _ in 0..20 {
+                    let next = crate::utils::race(frames.next().map(Some), async {
+                        futures_timer::Delay::new(std::time::Duration::from_millis(100)).await;
+                        None
+                    })
+                    .await;
+                    if matches!(next, Some(None)) {
+                        return true;
+                    }
+                }
+                false
+            })
+        };
+        assert!(exits('c'), "ctrl+c");
+        assert!(exits('d'), "ctrl+d");
+    }
+
+    /// Backported from CC 2.1.280 (`ResumeFailedMessage`): the message, the
+    /// retry hint for a session id a command can carry, and an exit shortly
+    /// after rendering, without a key.
+    #[test]
+    fn resume_failed_message_matches_2_1_280_and_exits_by_itself() {
+        use futures::StreamExt;
+        let render = |session_id: Option<&str>| {
+            element! {
+                ContextProvider(value: Context::owned(*theme::current())) {
+                    ResumeFailedMessage(session_id: session_id.map(str::to_string))
+                }
+            }
+            .render(Some(100))
+            .to_string()
+        };
+        let id = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b";
+        let text = render(Some(id));
+        assert!(text.contains("Failed to resume the conversation."), "canvas=\n{text}");
+        assert!(
+            text.contains(&format!("Run claude --resume {id} to retry, or claude to start a new session.")),
+            "canvas=\n{text}"
+        );
+        for unsafe_id in [None, Some(""), Some("a b"), Some("-x"), Some("CON")] {
+            let text = render(unsafe_id);
+            assert!(text.contains("Run claude to start a new session."), "{unsafe_id:?} canvas=\n{text}");
+            assert!(!text.contains("--resume"), "{unsafe_id:?} canvas=\n{text}");
+        }
+
+        let ended = futures::executor::block_on(async {
+            let mut app = element! {
+                ContextProvider(value: Context::owned(*theme::current())) {
+                    ResumeFailedMessage(session_id: Some(id.to_string()))
+                }
+            };
+            let mut frames = Box::pin(app.mock_terminal_render_loop(
+                MockTerminalConfig::with_events(futures::stream::pending()).with_size(100, 5),
+            ));
+            crate::utils::race(
+                async {
+                    while frames.next().await.is_some() {}
+                    true
+                },
+                async {
+                    futures_timer::Delay::new(std::time::Duration::from_secs(5)).await;
+                    false
+                },
+            )
+            .await
+        });
+        assert!(ended, "the message exits by itself");
+    }
+
+    #[test]
+    fn command_safe_session_id_matches_2_1_280() {
+        assert!(is_command_safe_session_id("0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"));
+        assert!(is_command_safe_session_id("_abc-1"));
+        assert!(is_command_safe_session_id("com10"));
+        for id in ["", "-abc", "a b", "a/b", "nul", "Lpt3", &"x".repeat(201)] {
+            assert!(!is_command_safe_session_id(id), "{id:?}");
+        }
     }
 
     #[test]

@@ -136,6 +136,7 @@ pub fn use_log_messages(hooks: &mut Hooks, messages: Arc<Vec<Message>>, ignore: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     /// What the effect does after a write: CC `useLogMessages.ts:117-118`.
     fn advance(cursor: &mut LogMessagesCursor, head: Option<&str>, len: usize) {
@@ -223,11 +224,8 @@ mod tests {
         use crate::state::app_state::{AppStateProvider, ProviderChildren};
         use crate::utils::session_storage as storage;
         use futures::StreamExt;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let previous_write = std::env::var_os("COMETIX_WRITE_ENABLED");
-        unsafe {
-            std::env::set_var("COMETIX_WRITE_ENABLED", "1");
-        }
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let fixture = std::env::current_dir()
             .unwrap()
             .join("target")
@@ -370,11 +368,5 @@ mod tests {
         crate::bootstrap::state::switch_session(previous_id, previous_dir);
         storage::clear_session_metadata();
         std::fs::remove_dir_all(fixture).unwrap();
-        unsafe {
-            match previous_write {
-                Some(value) => std::env::set_var("COMETIX_WRITE_ENABLED", value),
-                None => std::env::remove_var("COMETIX_WRITE_ENABLED"),
-            }
-        }
     }
 }

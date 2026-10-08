@@ -8,11 +8,12 @@ use crate::types::plugin::LoadedPlugin;
 
 use serde_json::Value;
 use std::collections::HashSet;
+#[cfg(test)]
 use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Maps to CC `loadPluginAgents.ts#loadPluginAgents`.
-pub fn load_plugin_agents_readonly() -> Vec<AgentDefinition> {
+pub fn load_plugin_agents() -> Vec<AgentDefinition> {
     let result = super::plugin_loader::load_all_plugins_cache_only_from_sync();
     load_plugin_agents_from_plugins(&result.enabled)
 }
@@ -31,9 +32,13 @@ pub fn load_plugin_agents_from_plugins(plugins: &[LoadedPlugin]) -> Vec<AgentDef
             ));
         }
         for path in &plugin.agents_paths {
-            if path.is_dir() {
+            let fs = crate::utils::fs_operations::get_fs_implementation();
+            let Ok(stats) = futures::executor::block_on(fs.stat(path)) else {
+                continue;
+            };
+            if stats.is_dir() {
                 all_agents.extend(load_agents_from_directory(path, plugin, &mut loaded_paths));
-            } else if path.is_file()
+            } else if stats.is_file()
                 && path
                     .extension()
                     .and_then(|extension| extension.to_str())
@@ -95,11 +100,16 @@ pub fn load_agent_from_file(
     namespace: &[String],
     loaded_paths: &mut HashSet<std::ffi::OsString>,
 ) -> Option<AgentDefinition> {
-    if crate::utils::fs_operations::is_duplicate_path(file_path, loaded_paths) {
+    let fs = crate::utils::fs_operations::get_fs_implementation();
+    if crate::utils::fs_operations::is_duplicate_path(fs.as_ref(), file_path, loaded_paths) {
         return None;
     }
 
-    let content = fs::read_to_string(file_path).ok()?;
+    let content = futures::executor::block_on(
+        fs.read_file(file_path, crate::utils::fs_operations::BufferEncoding::Utf8),
+    )
+    .ok()?
+    .to_string_lossy();
     let parsed = crate::utils::frontmatter_parser::parse_frontmatter(&content);
     let frontmatter = parsed.frontmatter;
     let markdown_content = parsed.content.trim().to_string();
@@ -202,7 +212,7 @@ pub fn load_agent_from_file(
         .get("memory")
         .and_then(Value::as_str)
         .and_then(parse_agent_memory_scope);
-    if agent.memory.is_some() && is_auto_memory_enabled_for_plugin_agents() {
+    if agent.memory.is_some() && crate::memdir::paths::is_auto_memory_enabled() {
         inject_agent_memory_tools(&mut agent.tools);
     }
     agent.isolation = frontmatter
@@ -298,11 +308,6 @@ fn parse_slash_command_tools_from_value(value: Option<&Value>) -> Vec<String> {
     parse_tool_list_value(value).unwrap_or_default()
 }
 
-fn is_auto_memory_enabled_for_plugin_agents() -> bool {
-    let settings = crate::utils::settings::get_initial_settings();
-    crate::memdir::paths::is_auto_memory_enabled_with_env(&settings, &|key| std::env::var(key).ok())
-}
-
 fn inject_agent_memory_tools(tools: &mut Option<Vec<String>>) {
     let Some(tools) = tools.as_mut() else {
         return;
@@ -381,7 +386,7 @@ mod tests {
         let tools = agent.tools.as_ref().unwrap();
         assert_eq!(tools[0], "Read");
         assert_eq!(tools[1], "Bash(git status, git diff)");
-        if is_auto_memory_enabled_for_plugin_agents() {
+        if crate::memdir::paths::is_auto_memory_enabled() {
             assert!(tools.contains(&"Write".to_string()));
             assert!(tools.contains(&"Edit".to_string()));
         } else {

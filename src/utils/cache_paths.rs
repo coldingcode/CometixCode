@@ -2,7 +2,7 @@
 
 use std::io;
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::LazyLock;
 
 const MAX_SANITIZED_LENGTH: usize = 200;
 
@@ -47,32 +47,35 @@ fn get_project_dir(cwd: &str) -> String {
 /// `utils/cachePaths.ts:6`. The env-paths implementation is outside the allowed
 /// source tree; this conventional platform layout is not a claim of full
 /// dependency equivalence. macOS layout is also observed in the original cache.
-fn cache_root() -> io::Result<&'static PathBuf> {
-    static ROOT: OnceLock<PathBuf> = OnceLock::new();
-    if let Some(root) = ROOT.get() {
-        return Ok(root);
-    }
-    let home = std::env::home_dir()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Home directory unavailable"))?;
+///
+/// `const paths = envPaths('claude-cli')` runs at import, before settings env
+/// applies, so `entrypoints/cli.rs` forces this in the startup window.
+/// env-paths takes `os.homedir()` once, at its own import.
+pub(crate) static CACHE_ROOT: LazyLock<PathBuf> = LazyLock::new(|| {
+    let home = crate::utils::node_os::homedir();
     #[cfg(target_os = "macos")]
     let root = home
         .join("Library")
         .join("Caches")
         .join("claude-cli-nodejs");
     #[cfg(target_os = "windows")]
-    let root = std::env::var_os("LOCALAPPDATA")
+    let root = crate::utils::process_env::var_os("LOCALAPPDATA")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join("AppData").join("Local"))
         .join("claude-cli-nodejs")
         .join("Cache");
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let root = std::env::var_os("XDG_CACHE_HOME")
+    let root = crate::utils::process_env::var_os("XDG_CACHE_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(".cache"))
         .join("claude-cli-nodejs");
-    Ok(ROOT.get_or_init(|| root))
+    root
+});
+
+fn cache_root() -> io::Result<&'static PathBuf> {
+    Ok(&CACHE_ROOT)
 }
 
 /// Maps to: CC `utils/cachePaths.ts#CACHE_PATHS:25-38` (object carrier).
@@ -129,9 +132,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         assert_eq!(
             base.parent().unwrap(),
-            std::env::home_dir()
-                .unwrap()
-                .join("Library/Caches/claude-cli-nodejs")
+            crate::utils::node_os::homedir().join("Library/Caches/claude-cli-nodejs")
         );
     }
 }

@@ -4,6 +4,7 @@
 //! API boundary and reuses the canonical provider/auth client factory.
 
 use crate::types::message::{AssistantContent, Message, UserContent};
+use crate::utils::process_env::JsTruthy;
 use base64::Engine as _;
 use serde_json::Value;
 
@@ -93,9 +94,10 @@ async fn count_tokens_with_bedrock(
         "input": {"invokeModel": {"body": encoded_body}}
     }))
     .ok()?;
-    let endpoint = std::env::var("ANTHROPIC_BEDROCK_BASE_URL")
-        .or_else(|_| std::env::var("AWS_ENDPOINT_URL_BEDROCK_RUNTIME"))
-        .unwrap_or_else(|_| format!("https://bedrock-runtime.{region}.amazonaws.com"));
+    let endpoint = crate::utils::process_env::var("ANTHROPIC_BEDROCK_BASE_URL")
+        .truthy()
+        .or_else(|| crate::utils::process_env::var("AWS_ENDPOINT_URL_BEDROCK_RUNTIME").truthy())
+        .unwrap_or_else(|| format!("https://bedrock-runtime.{region}.amazonaws.com"));
     let response = crate::services::api::client::send_bedrock_request(
         reqwest::Method::POST,
         &endpoint,
@@ -111,70 +113,6 @@ async fn count_tokens_with_bedrock(
     .await?;
     response
         .get("inputTokens")
-        .and_then(Value::as_u64)
-        .and_then(|tokens| usize::try_from(tokens).ok())
-}
-
-/// Maps to: CC `services/tokenEstimation.ts#countMessagesTokensWithAPI`
-/// Vertex branch (:161-178); extracted only as the documented Rust provider
-/// count-token wire adapter.
-async fn count_tokens_with_vertex(
-    handle: &crate::services::api::client::AnthropicClientHandle,
-    params: &anthropic_sdk::resources::beta::messages::BetaMessageCountTokensParams,
-    betas: &[String],
-) -> Option<usize> {
-    let crate::services::api::client::ProviderConfig::Vertex {
-        region,
-        project_id,
-        auth,
-    } = &handle.provider
-    else {
-        return None;
-    };
-    let project_id = project_id
-        .clone()
-        .or_else(|| std::env::var("ANTHROPIC_VERTEX_PROJECT_ID").ok())?;
-    let base_url = std::env::var("ANTHROPIC_VERTEX_BASE_URL").unwrap_or_else(|_| {
-        if region == "global" {
-            "https://aiplatform.googleapis.com/v1".to_string()
-        } else {
-            format!("https://{region}-aiplatform.googleapis.com/v1")
-        }
-    });
-    let url = format!(
-        "{}/projects/{project_id}/locations/{region}/publishers/anthropic/models/count-tokens:rawPredict",
-        base_url.trim_end_matches('/')
-    );
-    let mut body = serde_json::to_value(params).ok()?;
-    body["anthropic_version"] = Value::String("vertex-2023-10-16".to_string());
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(handle.timeout_ms))
-        .build()
-        .ok()?;
-    let mut request = client.post(url).json(&body);
-    for (name, value) in &handle.default_headers {
-        if let Some(value) = value {
-            request = request.header(name, value);
-        }
-    }
-    if !betas.is_empty() {
-        request = request.header("anthropic-beta", betas.join(","));
-    }
-    match auth {
-        crate::services::api::client::VertexAuth::SkipAuth => {}
-        crate::services::api::client::VertexAuth::GoogleAuth { .. } => {
-            tracing::warn!("Vertex GoogleAuth requires the provider SDK adapter");
-            return None;
-        }
-    }
-    let response = request.send().await.ok()?;
-    if !response.status().is_success() {
-        tracing::warn!(status = %response.status(), "Vertex count_tokens request failed");
-        return None;
-    }
-    let response = response.json::<Value>().await.ok()?;
-    response
-        .get("input_tokens")
         .and_then(Value::as_u64)
         .and_then(|tokens| usize::try_from(tokens).ok())
 }
@@ -450,11 +388,11 @@ pub async fn count_messages_tokens_with_api(
             )
             .await
         }
-        crate::utils::model::providers::ApiProvider::Vertex => {
-            count_tokens_with_vertex(&handle, &params, &betas).await
-        }
+        // CC `anthropic.beta.messages.countTokens` (`tokenEstimation.ts:172`),
+        // through the provider client; Vertex's betas are filtered above.
         crate::utils::model::providers::ApiProvider::FirstParty
-        | crate::utils::model::providers::ApiProvider::Foundry => {
+        | crate::utils::model::providers::ApiProvider::Foundry
+        | crate::utils::model::providers::ApiProvider::Vertex => {
             let client = handle.build().ok()?;
             match client.beta().messages().count_tokens(&params).await {
                 Ok(response) if response.input_tokens >= 0 => Some(response.input_tokens as usize),
@@ -471,7 +409,7 @@ pub async fn count_messages_tokens_with_api(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
     use std::io::{Read as _, Write as _};
 
     /// Maps to: CC `tokenEstimation.ts:430-434` — advisor blocks hit the
@@ -577,7 +515,7 @@ mod tests {
 
     #[tokio::test]
     async fn bedrock_count_tokens_uses_runtime_count_tokens_request() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let (endpoint, server) = spawn_json_server(r#"{"inputTokens":23}"#);
         let _bedrock = EnvVarGuard::set("CLAUDE_CODE_USE_BEDROCK", "1");
         let _vertex = EnvVarGuard::unset("CLAUDE_CODE_USE_VERTEX");
@@ -611,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn vertex_count_tokens_uses_raw_predict_route() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let (endpoint, server) = spawn_json_server(r#"{"input_tokens":19}"#);
         let _bedrock = EnvVarGuard::unset("CLAUDE_CODE_USE_BEDROCK");
         let _vertex = EnvVarGuard::set("CLAUDE_CODE_USE_VERTEX", "1");
@@ -636,7 +574,7 @@ mod tests {
 
     #[tokio::test]
     async fn foundry_count_tokens_uses_configured_anthropic_client() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         let (endpoint, server) = spawn_json_server(r#"{"input_tokens":17}"#);
         let _bedrock = EnvVarGuard::unset("CLAUDE_CODE_USE_BEDROCK");
         let _vertex = EnvVarGuard::unset("CLAUDE_CODE_USE_VERTEX");

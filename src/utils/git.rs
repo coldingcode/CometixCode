@@ -154,11 +154,18 @@ fn normalize_unicode(path: PathBuf) -> PathBuf {
 
 /// Synchronous Rust projection of CC `utils/git.ts::getBranch()`.
 ///
-/// CC resolves the cached branch asynchronously. The retained TUI snapshots the
-/// same original working directory once when `LogSelector` mounts.
+/// CC resolves the branch asynchronously; this projection blocks on a git
+/// subprocess. UI callers must run it off the render thread and land the
+/// result through `use_future` (as `LogSelector` does for CC's mount-effect
+/// `getBranch().then(setCurrentBranch)`) — calling it from a render body
+/// freezes the TUI for the whole git round-trip.
 pub fn get_branch() -> String {
     let cwd = crate::bootstrap::state::get_original_cwd();
-    Command::new("git")
+    let mut command = Command::new(git_exe());
+    // CC reads .git/HEAD without a spawn; while this one spawns, it takes the
+    // carrier (process.env) as its base.
+    crate::utils::subprocess_env::apply_process_env_std(&mut command);
+    command
         .args(["rev-parse", "--abbrev-ref", "HEAD"])
         .current_dir(cwd)
         .output()
@@ -180,9 +187,9 @@ mod tests {
         // the zero-argument memo nor Bun-compatible startup PATH is reset by
         // a test-only production hook. A candidate is never executed.
         const PROBE: &str = "COMETIX_GIT_EXE_MEMO_PROBE";
-        if let Ok(mode) = std::env::var(PROBE) {
+        if let Some(mode) = crate::utils::process_env::var(PROBE) {
             crate::utils::process_env::capture_startup();
-            let directory = PathBuf::from(std::env::var_os("PATH").unwrap());
+            let directory = PathBuf::from(crate::utils::process_env::var_os("PATH").unwrap());
             let executable = directory.join("git");
             let expected = if mode == "found" {
                 executable.clone()

@@ -7,9 +7,11 @@
 use super::message::Message;
 use super::messages_list::MessageLookups;
 use crate::types::message::{RenderableMessage, RenderableMessageKind, SystemMessage};
+use crate::components::offscreen_freeze::OffscreenFreeze;
+use crate::utils::theme::ThemeName;
 use iocraft::prelude::*;
-use std::collections::HashSet;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -44,9 +46,6 @@ pub struct MessageRowProps {
     /// Terminal columns, included in the row memo key because wrapping changes
     /// visible output even when message content is unchanged.
     pub columns: u16,
-    /// Pending permission request tool-use id, matching official
-    /// `pendingWorkerRequest?.toolUseId` for auxiliary tool rows.
-    pub pending_permission_tool_use_id: Option<String>,
     /// Maps to: CC `Messages.tsx:260` `inProgressToolUseIDs: Set<string>`,
     /// threaded down from REPL-owned state (`REPL.tsx:1897`).
     pub in_progress_tool_use_ids: Arc<HashSet<String>>,
@@ -78,6 +77,11 @@ struct MessageRowRenderKey {
     expand_thinking: bool,
     expand_collapsed_read_search: bool,
     columns: u16,
+    /// Not an `areMessageRowPropsEqual` term: React re-renders the row's
+    /// themed descendants past the memo when the ThemeProvider value changes,
+    /// and iocraft reads context only in an update. It also keys the
+    /// CachedSubtree, whose cells carry the old palette.
+    theme: ThemeName,
 }
 
 #[derive(Default)]
@@ -95,9 +99,11 @@ impl Component for MessageRow {
     fn update(
         &mut self,
         props: &mut Self::Props<'_>,
-        _hooks: Hooks,
+        mut hooks: Hooks,
         updater: &mut ComponentUpdater,
     ) {
+        let hooks = hooks.with_context_stack(updater.component_context_stack());
+        let (theme, _) = crate::components::design_system::theme_provider::use_theme(&hooks);
         let Some(message) = props.messages.get(props.index).cloned() else {
             if self.last_static_key.is_none() {
                 return;
@@ -111,17 +117,19 @@ impl Component for MessageRow {
             return;
         };
 
-        let next_static_key = message_row_static_key(&message, props);
-        if next_static_key.is_some() && self.last_static_key.as_ref() == next_static_key.as_ref() {
+        let next_static_key = message_row_static_key(&message, props, theme);
+        // Contract D (PORTING.md `iocraft selected external-store subscription
+        // carrier`): a manual bailout must still let a descendant's own
+        // AppState subscription through, as CC's `useSyncExternalStore`
+        // re-renders a subscriber past any memoized ancestor.
+        if next_static_key.is_some()
+            && self.last_static_key.as_ref() == next_static_key.as_ref()
+            && !updater.children_have_pending_change()
+        {
             return;
         }
         let static_cache_key = next_static_key.as_ref().map(message_row_cache_key);
         self.last_static_key = next_static_key;
-        let is_waiting_for_permission = assistant_tool_use_matches_pending_permission(
-            &message,
-            props.pending_permission_tool_use_id.as_deref(),
-            props.lookups.as_deref(),
-        );
         let message = apply_row_runtime_state(message, props);
         // CC `MessageRow.tsx:172-186`: computed AFTER the runtime-state pass,
         // so a collapsed group reads the same liveness both places.
@@ -143,7 +151,6 @@ impl Component for MessageRow {
                                     message: message,
                                     add_margin: props.add_margin,
                                     can_animate: should_animate,
-                                    is_waiting_for_permission: is_waiting_for_permission,
                                     verbose: props.verbose,
                                     is_transcript_mode: props.is_transcript_mode,
                                     expand_thinking: props.expand_thinking,
@@ -168,7 +175,6 @@ impl Component for MessageRow {
                                 message: message,
                                 add_margin: props.add_margin,
                                 can_animate: should_animate,
-                                is_waiting_for_permission: is_waiting_for_permission,
                                 verbose: props.verbose,
                                 is_transcript_mode: props.is_transcript_mode,
                                 expand_thinking: props.expand_thinking,
@@ -204,6 +210,7 @@ fn message_row_cache_key(key: &MessageRowRenderKey) -> String {
 fn message_row_static_key(
     message: &RenderableMessage,
     props: &MessageRowProps,
+    theme: ThemeName,
 ) -> Option<MessageRowRenderKey> {
     message_row_static_key_from_parts(
         message,
@@ -219,6 +226,7 @@ fn message_row_static_key(
         props.columns,
         &props.in_progress_tool_use_ids,
         &props.streaming_tool_use_ids,
+        theme,
     )
 }
 
@@ -237,14 +245,25 @@ fn message_row_static_key_from_parts(
     columns: u16,
     in_progress_tool_use_ids: &HashSet<String>,
     streaming_tool_use_ids: &HashSet<String>,
+    theme: ThemeName,
 ) -> Option<MessageRowRenderKey> {
-    should_render_statically(
-        message,
-        lookups,
-        is_transcript_mode,
-        in_progress_tool_use_ids,
-        streaming_tool_use_ids,
-    )
+    // A row may skip re-rendering only when it renders statically AND CC's
+    // memo comparator would bail: `if (isStreaming || !isResolved) return
+    // false` (`MessageRow.tsx:340-351`). The two are separate questions in
+    // CC — transcript mode renders every row statically (`Messages.tsx:1101`)
+    // while an unresolved one there still re-renders on every change.
+    // `lookups: None` mounts keep `should_render_statically`'s existing
+    // treat-as-resolved extension.
+    let memo_may_bail = !is_message_streaming(message, streaming_tool_use_ids)
+        && lookups.is_none_or(|lookups| all_tools_resolved(message, &lookups.resolved_tool_use_ids));
+    (memo_may_bail
+        && should_render_statically(
+            message,
+            lookups,
+            is_transcript_mode,
+            in_progress_tool_use_ids,
+            streaming_tool_use_ids,
+        ))
     .then(|| MessageRowRenderKey {
         message: message.clone(),
         conversation_id,
@@ -256,6 +275,7 @@ fn message_row_static_key_from_parts(
         expand_thinking,
         expand_collapsed_read_search,
         columns,
+        theme,
     })
 }
 
@@ -274,6 +294,7 @@ pub(crate) fn message_row_static_memo_key(
     columns: u16,
     in_progress_tool_use_ids: &HashSet<String>,
     streaming_tool_use_ids: &HashSet<String>,
+    theme: ThemeName,
 ) -> Option<String> {
     message_row_static_key_from_parts(
         message,
@@ -289,9 +310,69 @@ pub(crate) fn message_row_static_memo_key(
         columns,
         in_progress_tool_use_ids,
         streaming_tool_use_ids,
+        theme,
     )
     .as_ref()
     .map(message_row_cache_key)
+}
+
+/// Maps to: CC `utils/messages.ts:2765-2793` `getToolUseID`, over the kinds a
+/// render row carries. Two CC sources have no field on the Rust carriers yet —
+/// a user message's `sourceToolUseID` and a hook attachment's `toolUseID` —
+/// so those rows answer as CC does when the field is absent (seam).
+fn get_tool_use_id(message: &RenderableMessage) -> Option<&str> {
+    match &message.kind {
+        RenderableMessageKind::Assistant { .. } => assistant_tool_use_id(message),
+        RenderableMessageKind::User { message } => match message.first_content_block() {
+            Some(crate::types::message::UserContent::ToolResult(tool_result))
+                if !tool_result.tool_use_id.0.is_empty() =>
+            {
+                Some(tool_result.tool_use_id.0.as_str())
+            }
+            _ => None,
+        },
+        RenderableMessageKind::Progress { tool_use_id, .. } => Some(tool_use_id.as_str()),
+        RenderableMessageKind::System(SystemMessage::Informational { tool_use_id, .. }) => {
+            tool_use_id.as_deref()
+        }
+        _ => None,
+    }
+}
+
+/// Maps to: CC `MessageRow.tsx:255-271` `isMessageStreaming`.
+fn is_message_streaming(message: &RenderableMessage, streaming_tool_use_ids: &HashSet<String>) -> bool {
+    match &message.kind {
+        RenderableMessageKind::GroupedToolUse(group) => group.messages.iter().any(|member| {
+            assistant_tool_use_id(member).is_some_and(|id| streaming_tool_use_ids.contains(id))
+        }),
+        RenderableMessageKind::CollapsedReadSearch(group) => {
+            crate::utils::collapse_read_search::tool_use_ids_from_collapsed_group(group)
+                .any(|id| streaming_tool_use_ids.contains(id))
+        }
+        _ => get_tool_use_id(message).is_some_and(|id| streaming_tool_use_ids.contains(id)),
+    }
+}
+
+/// Maps to: CC `MessageRow.tsx:277-298` `allToolsResolved`.
+fn all_tools_resolved(message: &RenderableMessage, resolved_tool_use_ids: &BTreeSet<String>) -> bool {
+    match &message.kind {
+        RenderableMessageKind::GroupedToolUse(group) => group.messages.iter().all(|member| {
+            assistant_tool_use_id(member).is_some_and(|id| resolved_tool_use_ids.contains(id))
+        }),
+        RenderableMessageKind::CollapsedReadSearch(group) => {
+            crate::utils::collapse_read_search::tool_use_ids_from_collapsed_group(group)
+                .all(|id| resolved_tool_use_ids.contains(id))
+        }
+        RenderableMessageKind::Assistant { message: assistant } => {
+            if let Some(crate::types::message::AssistantContent::ServerToolUse(block)) =
+                assistant.first_content_block()
+            {
+                return resolved_tool_use_ids.contains(block.id.0.as_str());
+            }
+            get_tool_use_id(message).is_none_or(|id| resolved_tool_use_ids.contains(id))
+        }
+        _ => get_tool_use_id(message).is_none_or(|id| resolved_tool_use_ids.contains(id)),
+    }
 }
 
 /// The row's block is the first non-identity block — normalize
@@ -461,8 +542,9 @@ pub(crate) fn should_render_statically(
 /// }
 /// ```
 ///
-/// `canAnimate` is the outer gate (the query is running); which rows actually
-/// animate is a per-row question answered by the live set. Cometix passed the
+/// `canAnimate` is the outer gate (no permission dialog, message selector or
+/// local command UI holds animation, `Messages.tsx:764-767`); which rows
+/// actually animate is a per-row question answered by the live set. Cometix passed the
 /// gate straight through, so every row spun for the duration of a turn instead
 /// of only the row whose tool was executing.
 ///
@@ -539,33 +621,6 @@ fn apply_row_runtime_state(
     message
 }
 
-fn assistant_tool_use_matches_pending_permission(
-    message: &RenderableMessage,
-    pending_tool_use_id: Option<&str>,
-    lookups: Option<&MessageLookups>,
-) -> bool {
-    let Some(pending_tool_use_id) = pending_tool_use_id else {
-        return false;
-    };
-    match &message.kind {
-        // Maps to: CC `AssistantToolUseMessage.tsx:122`
-        // `const isWaitingForPermission = pendingWorkerRequest?.toolUseId === param.id`.
-        //
-        // CC needs no liveness guard because the pending request is cleared
-        // when the tool resolves. Cometix keeps one rather than assume that of
-        // its own pending-id plumbing — but sourced from `resolvedToolUseIDs`
-        // like every other liveness question, not from a status on the row.
-        RenderableMessageKind::Assistant { .. } if is_assistant_tool_use(message) => {
-            let id = assistant_tool_use_id(message).unwrap_or(message.uuid.as_str());
-            id == pending_tool_use_id
-                && !lookups
-                    .map(|lookups| lookups.resolved_tool_use_ids.contains(id))
-                    .unwrap_or(false)
-        }
-        _ => false,
-    }
-}
-
 fn sibling_tools_resolved(tool_use_id: &str, lookups: Option<&MessageLookups>) -> bool {
     let Some(lookups) = lookups else {
         return true;
@@ -639,43 +694,34 @@ mod tests {
     }
 
     #[test]
-    fn pending_permission_matches_only_active_tool_use_id() {
+    fn transcript_row_memo_bails_only_like_official_are_message_row_props_equal() {
+        // CC MessageRow.tsx:340-351: transcript renders every row statically,
+        // yet an in-flight or unresolved row still re-renders.
+        let key = |lookups: &MessageLookups, streaming: &HashSet<String>| {
+            message_row_static_memo_key(
+                &tool_use("tool1", "toolu_1"),
+                0,
+                true,
+                false,
+                false,
+                Some(lookups),
+                false,
+                true,
+                true,
+                true,
+                100,
+                &HashSet::new(),
+                streaming,
+                ThemeName::Dark,
+            )
+        };
         let unresolved = MessageLookups::default();
         let resolved = resolved_lookup("toolu_1");
-        let row = tool_use("tool1", "toolu_1");
+        let streaming: HashSet<String> = ["toolu_1".to_string()].into_iter().collect();
 
-        // Liveness now comes from `resolvedToolUseIDs`, so the same row matches
-        // while the tool is unresolved and stops matching once its result lands.
-        assert!(assistant_tool_use_matches_pending_permission(
-            &row,
-            Some("toolu_1"),
-            Some(&unresolved),
-        ));
-        assert!(!assistant_tool_use_matches_pending_permission(
-            &row,
-            Some("toolu_1"),
-            Some(&resolved),
-        ));
-        assert!(!assistant_tool_use_matches_pending_permission(
-            &row,
-            Some("toolu_2"),
-            Some(&unresolved),
-        ));
-
-        // Empty block id → the row falls back to its uuid, as before.
-        let fallback_id_message = RenderableMessage::assistant_block(
-            "message-id-fallback",
-            crate::types::message::AssistantContent::ToolUse(crate::types::message::ToolUseBlock {
-                id: crate::types::ids::ToolUseId(String::new()),
-                name: "Bash".to_string(),
-                input: serde_json::json!({"command": "echo permission-gated"}),
-            }),
-        );
-        assert!(assistant_tool_use_matches_pending_permission(
-            &fallback_id_message,
-            Some("message-id-fallback"),
-            Some(&unresolved),
-        ));
+        assert!(key(&unresolved, &HashSet::new()).is_none());
+        assert!(key(&resolved, &streaming).is_none());
+        assert!(key(&resolved, &HashSet::new()).is_some());
     }
 
     #[test]
@@ -777,8 +823,8 @@ mod tests {
         };
 
         assert_eq!(
-            message_row_static_key(&message, &base),
-            message_row_static_key(&message, &loading)
+            message_row_static_key(&message, &base, ThemeName::Dark),
+            message_row_static_key(&message, &loading, ThemeName::Dark)
         );
     }
 

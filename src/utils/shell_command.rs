@@ -553,7 +553,10 @@ fn terminate_process_tree(child: &mut Child) {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("taskkill")
+        let mut command = std::process::Command::new("taskkill");
+        // tree-kill `exec('taskkill ...')` inherits process.env; the carrier is its counterpart.
+        crate::utils::subprocess_env::apply_process_env_std(&mut command);
+        let _ = command
             .args(["/PID", &child.id().to_string(), "/T", "/F"])
             .status();
     }
@@ -630,6 +633,7 @@ pub fn create_failed_command(error: impl Into<String>) -> ShellCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::TEST_ENV_LOCK;
     use std::process::{Command, Stdio};
 
     fn spawned(script: &str, timeout: Duration, auto_background: bool) -> ShellCommand {
@@ -732,7 +736,7 @@ mod tests {
             }
         }
 
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         TEST_SIZE_WATCHDOG_LIMIT.store(1_024, Ordering::Release);
         TEST_SIZE_WATCHDOG_INTERVAL_MS.store(10, Ordering::Release);
         let _override = OverrideGuard;

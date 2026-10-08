@@ -2,10 +2,9 @@
 //!
 //! Maps to CC `memdir/memdir.ts`.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::utils::feature_flags::{FeatureFlag, feature_enabled};
-use crate::utils::settings::types::SettingsJson;
 
 pub const ENTRYPOINT_NAME: &str = "MEMORY.md";
 pub const MAX_ENTRYPOINT_LINES: usize = 200;
@@ -414,20 +413,11 @@ fn floor_char_boundary(value: &str, max_byte_index: usize) -> usize {
 /// unless their owning features are ported. GrowthBook-only skip-index and
 /// search-past-context prompt deltas are wired through source-controlled feature
 /// switches.
-pub fn load_memory_prompt(settings: &SettingsJson) -> Option<String> {
-    if !crate::memdir::paths::is_auto_memory_enabled(settings) {
+pub fn load_memory_prompt() -> Option<String> {
+    if !crate::memdir::paths::is_auto_memory_enabled() {
         return None;
     }
-    let trusted_settings =
-        crate::memdir::paths::settings_with_trusted_auto_memory_directory(settings.clone());
-    let memory_dir = crate::memdir::paths::get_auto_mem_path(&trusted_settings);
-    load_memory_prompt_for_dir(settings, memory_dir)
-}
-
-pub fn load_memory_prompt_for_dir(settings: &SettingsJson, memory_dir: PathBuf) -> Option<String> {
-    if !crate::memdir::paths::is_auto_memory_enabled(settings) {
-        return None;
-    }
+    let memory_dir = crate::memdir::paths::get_auto_mem_path();
     // Preserve production's CC-aligned ensureMemoryDirExists side effect, while
     // keeping parallel tests from creating whichever config-home path another
     // test temporarily installs. Tests that explicitly override the memory path
@@ -440,10 +430,9 @@ pub fn load_memory_prompt_for_dir(settings: &SettingsJson, memory_dir: PathBuf) 
             );
         }
     }
-    let extra_guidelines = std::env::var("CLAUDE_COWORK_MEMORY_EXTRA_GUIDELINES")
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
+    // CC memdir.ts:441-446 gates on the trimmed text but threads the raw value.
+    let extra_guidelines = crate::utils::process_env::var("CLAUDE_COWORK_MEMORY_EXTRA_GUIDELINES")
+        .filter(|value| !value.trim().is_empty())
         .map(|value| vec![value]);
     Some(
         build_memory_lines(
@@ -513,6 +502,8 @@ fn display_memory_dir(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
+    use std::path::PathBuf;
 
     #[test]
     fn build_memory_lines_matches_official_auto_memory_shape() {
@@ -654,21 +645,29 @@ mod tests {
 
     #[test]
     fn load_memory_prompt_respects_auto_memory_disable_gate() {
-        let _guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        for key in [
+        use crate::utils::settings::settings_cache;
+        use crate::utils::settings::types::SettingsJson;
+
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        let _env = [
             "CLAUDE_COWORK_MEMORY_PATH_OVERRIDE",
             "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
             "CLAUDE_CODE_SIMPLE",
             "CLAUDE_CODE_REMOTE",
             "CLAUDE_CODE_REMOTE_MEMORY_DIR",
-        ] {
-            crate::utils::process_env::remove(key);
-        }
-        let mut settings = SettingsJson::default();
-        settings.auto_memory_enabled = Some(false);
-        assert!(
-            load_memory_prompt_for_dir(&settings, PathBuf::from("/tmp/unused-memory")).is_none()
+        ]
+        .map(EnvVarGuard::unset);
+        // The lock guard resets the settings caches again on release.
+        settings_cache::set_session_settings_cache(
+            crate::utils::settings::validation::SettingsWithErrors {
+                settings: SettingsJson {
+                    auto_memory_enabled: Some(false),
+                    ..SettingsJson::default()
+                },
+                ..Default::default()
+            },
         );
+        assert!(load_memory_prompt().is_none());
     }
 
     fn temp_memory_dir(name: &str) -> PathBuf {

@@ -418,6 +418,7 @@ where
                         || crate::tools::bash_tool::bash_permissions::command_has_any_cd(&command)
                         || !crate::tools::bash_tool::read_only_validation::check_read_only_constraints(
                             &command,
+                            &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
                         )
                     {
                         update_active(&context, &id, |active| {
@@ -922,6 +923,7 @@ mod tests {
     use super::*;
     use crate::types::ids::ToolUseId;
     use crate::types::message::{AssistantMessage, StopReason, ToolResult, ToolUseBlock};
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     fn active_state(id: &str) -> ActiveSpeculationState {
         ActiveSpeculationState {
@@ -1315,10 +1317,10 @@ mod tests {
     #[cfg(feature = "anthropic_internal")]
     #[tokio::test]
     async fn accept_edits_mode_writes_only_to_overlay_until_acceptance() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         // Match main/print's process runtime before the forked query loads plugins.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _write = crate::utils::env_utils::EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-cow-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let destination = root.join("new.txt");
@@ -1379,8 +1381,8 @@ mod tests {
 
     #[tokio::test]
     async fn accepting_speculation_copies_overlay_and_resets_state() {
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _write = crate::utils::env_utils::EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let root = std::env::temp_dir().join(format!("cometix-spec-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
         let store = crate::state::store::AppStore::new(

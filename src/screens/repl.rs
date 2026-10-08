@@ -753,6 +753,7 @@ fn apply_repl_query_turn_context(
     >,
     interactive_permission_sink: &crate::tool::InteractivePermissionSink,
     has_interruptible_tool_in_progress: &Arc<std::sync::atomic::AtomicBool>,
+    set_in_progress_tool_use_ids: &crate::tool::SetInProgressToolUseIds,
     thinking_config: &crate::utils::thinking::ThinkingConfig,
     shell_context_seed: Option<std::collections::HashSet<String>>,
 ) -> Option<crate::utils::tool_result_storage::ContentReplacementState> {
@@ -868,6 +869,9 @@ fn apply_repl_query_turn_context(
         &mut params.tool_use_context,
         has_interruptible_tool_in_progress,
     );
+    // Maps to CC `REPL.tsx:3296` handing `setInProgressToolUseIDs` to the
+    // turn's `ToolUseContext`.
+    params.tool_use_context.set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
 
     query_content_replacement_state
 }
@@ -897,11 +901,116 @@ impl ReplStartupDialogSnapshot {
     }
 }
 
+/// Maps to: CC `screens/REPL.tsx`:2664-2683, the return type of
+/// `getFocusedInputDialog()`: the one dialog that owns input focus, if any.
+///
+/// Only the members this REPL has state for are listed, in CC's order. CC's
+/// `prompt` (hook PromptDialog queue), `cost`, `idle-return`,
+/// `ultraplan-choice` / `ultraplan-launch`, `ide-onboarding`, `model-switch`,
+/// `undercover-callout`, `effort-callout` and `lsp-recommendation` have no
+/// producing state here yet; each joins at its CC position when that state is
+/// ported. (`init-onboarding` is in CC's union but the function never returns
+/// it.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ReplStartupDialogKind {
+enum FocusedInputDialog {
+    MessageSelector,
+    SandboxPermission,
+    ToolPermission,
+    WorkerSandboxPermission,
+    Elicitation,
     RemoteCallout,
     PluginHint,
     DesktopUpsell,
+}
+
+impl FocusedInputDialog {
+    /// CC's string literal for this member, which is what `useInboxPoller`
+    /// receives as `focusedInputDialog`.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::MessageSelector => "message-selector",
+            Self::SandboxPermission => "sandbox-permission",
+            Self::ToolPermission => "tool-permission",
+            Self::WorkerSandboxPermission => "worker-sandbox-permission",
+            Self::Elicitation => "elicitation",
+            Self::RemoteCallout => "remote-callout",
+            Self::PluginHint => "plugin-hint",
+            Self::DesktopUpsell => "desktop-upsell",
+        }
+    }
+}
+
+/// The REPL state `getFocusedInputDialog()` closes over (REPL.tsx:2684-2760).
+#[derive(Clone, Copy, Debug, Default)]
+struct FocusedInputDialogInput {
+    /// CC `isExiting` (REPL.tsx:2655, set by `handleExit` :4861) — this
+    /// REPL's `should_exit`. Setting it does not end the render: the frame it
+    /// is set in is still drawn, and stays in inline scrollback, so it must
+    /// clear the focus like CC's does.
+    is_exiting: bool,
+    /// CC `exitFlow`.
+    exit_flow: bool,
+    is_message_selector_visible: bool,
+    is_prompt_input_active: bool,
+    /// `sandboxPermissionRequestQueue[0]`
+    has_sandbox_permission_request: bool,
+    /// `!toolJSX || toolJSX.shouldContinueAnimation` (:2696-2697).
+    allow_dialogs_with_animation: bool,
+    /// `toolUseConfirmQueue[0]`
+    has_tool_use_confirm: bool,
+    /// `workerSandboxPermissions.queue[0]`
+    has_worker_sandbox_permission: bool,
+    /// `elicitation.queue[0]`
+    has_elicitation: bool,
+    show_remote_callout: bool,
+    /// `hintRecommendation`
+    has_hint_recommendation: bool,
+    show_desktop_upsell_startup: bool,
+}
+
+/// Maps to: CC `screens/REPL.tsx`:2684-2760 `getFocusedInputDialog()`.
+///
+/// Like CC's, the answer does not depend on which screen is showing: the
+/// transcript screen simply has no dialog slot to mount it in (:5850-5989),
+/// while the inbox poller still reads it.
+fn get_focused_input_dialog(input: &FocusedInputDialogInput) -> Option<FocusedInputDialog> {
+    use FocusedInputDialog::*;
+    // Exit states always take precedence.
+    if input.is_exiting || input.exit_flow {
+        return None;
+    }
+    // High priority dialogs (always show regardless of typing).
+    if input.is_message_selector_visible {
+        return Some(MessageSelector);
+    }
+    // Suppress interrupt dialogs while user is actively typing.
+    if input.is_prompt_input_active {
+        return None;
+    }
+    if input.has_sandbox_permission_request {
+        return Some(SandboxPermission);
+    }
+    // Permission/interactive dialogs (show unless blocked by toolJSX).
+    let allow = input.allow_dialogs_with_animation;
+    if allow && input.has_tool_use_confirm {
+        return Some(ToolPermission);
+    }
+    if allow && input.has_worker_sandbox_permission {
+        return Some(WorkerSandboxPermission);
+    }
+    if allow && input.has_elicitation {
+        return Some(Elicitation);
+    }
+    if allow && input.show_remote_callout {
+        return Some(RemoteCallout);
+    }
+    if allow && input.has_hint_recommendation {
+        return Some(PluginHint);
+    }
+    if allow && input.show_desktop_upsell_startup {
+        return Some(DesktopUpsell);
+    }
+    None
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1005,10 +1114,95 @@ enum StreamingTextDisplayMode {
     Character,
 }
 
-// Code-level switch for the streaming preview presentation. The state model
-// stays aligned with CC either way: deltas update `StreamingTextPreview`, and
-// only completed assistant blocks enter transcript history.
-const STREAMING_TEXT_DISPLAY_MODE: StreamingTextDisplayMode = StreamingTextDisplayMode::Character;
+/// The streaming preview presentation, from the `streamingTextDisplay`
+/// setting (`/settings` → "Streaming text"). The state model stays aligned
+/// with CC either way: deltas update `StreamingTextPreview`, and only
+/// completed assistant blocks enter transcript history. Unset or unknown
+/// values keep the Cometix default (character); CC's own behavior is `line`.
+fn streaming_text_display_mode(
+    settings: &crate::utils::settings::SettingsJson,
+) -> StreamingTextDisplayMode {
+    match settings.streaming_text_display.as_deref() {
+        Some("line") => StreamingTextDisplayMode::Line,
+        _ => StreamingTextDisplayMode::Character,
+    }
+}
+
+/// Maps to: CC `REPL.tsx:1987` `showStreamingText = !reducedMotion && ...`.
+/// With reduce motion on, the preview is hidden and `onStreamingText`
+/// drops every delta without touching state (`:1990`), so streaming
+/// produces no frames at all. (`hasCursorUpViewportYankBug` is not ported.)
+fn show_streaming_text(settings: &crate::utils::settings::SettingsJson) -> bool {
+    !settings.prefers_reduced_motion.unwrap_or(false)
+}
+
+/// Maps to: CC 2.1.280 streaming-text coalescer `flushIntervalMs = 100`
+/// (`chunk-13g94vqq.js:61764` `K5e`). 2.1.88 sets state per delta
+/// (`REPL.tsx:1981`); 2.1.280 accumulates deltas and writes the preview
+/// store once per 100ms. Line mode adopts that: its visible text only
+/// changes at a newline, so per-delta frames were pure cost (measured 24.7
+/// frames/s for no visible change). Character mode keeps per-delta writes,
+/// as 2.1.88 and Pi do — a typewriter that only moves every 100ms stutters.
+const STREAMING_PREVIEW_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
+
+/// What the pump should do after a delta was pushed.
+#[derive(Debug, PartialEq, Eq)]
+enum StreamingPreviewWrite {
+    /// Write the preview now (character mode: every delta is visible).
+    Now(StreamingTextPreview),
+    /// Line mode, nothing armed: arm one flush timer.
+    Arm,
+    /// Line mode, a flush is already armed: the delta rides along.
+    Wait,
+}
+
+/// The pump-side twin of CC 2.1.280's `$5e`: `apply` accumulates into
+/// `pending` and arms one timer, `flush` hands back what to write, `clear`
+/// drops everything at a turn boundary. Kept free of hooks so the policy is
+/// unit-testable; the loop owns the timer and the `State`.
+#[derive(Default)]
+struct StreamingPreviewCoalescer {
+    pending: Option<StreamingTextPreview>,
+    armed: bool,
+}
+
+impl StreamingPreviewCoalescer {
+    fn push(
+        &mut self,
+        base: impl FnOnce() -> StreamingTextPreview,
+        delta: &str,
+        mode: StreamingTextDisplayMode,
+    ) -> StreamingPreviewWrite {
+        let pending = self.pending.get_or_insert_with(base);
+        pending.raw.push_str(delta);
+        match mode {
+            StreamingTextDisplayMode::Character => {
+                self.armed = false;
+                StreamingPreviewWrite::Now(pending.clone())
+            }
+            StreamingTextDisplayMode::Line if self.armed => StreamingPreviewWrite::Wait,
+            StreamingTextDisplayMode::Line => {
+                self.armed = true;
+                StreamingPreviewWrite::Arm
+            }
+        }
+    }
+
+    /// The timer fired. Returns the preview to write, or `None` when the
+    /// completed-line prefix the user can see has not changed since the
+    /// last write — then no state write, so no frame.
+    fn flush(&mut self, current_visible: Option<&str>) -> Option<StreamingTextPreview> {
+        self.armed = false;
+        let pending = self.pending.as_ref()?;
+        let next_visible = visible_streaming_text(&pending.raw, StreamingTextDisplayMode::Line);
+        (next_visible.as_deref() != current_visible).then(|| pending.clone())
+    }
+
+    fn clear(&mut self) {
+        self.pending = None;
+        self.armed = false;
+    }
+}
 
 /// Maps to: CC REPL.tsx:1403 `PROMPT_SUPPRESSION_MS = 1500` — how long after
 /// the last keystroke interrupt dialogs stay suppressed.
@@ -1030,7 +1224,10 @@ fn visible_streaming_text(raw: &str, mode: StreamingTextDisplayMode) -> Option<S
 /// owner; REPL still owns all live inputs.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct ShowSpinnerInput {
-    tool_jsx_allows_spinner: bool,
+    /// CC `!toolJSX || toolJSX.showSpinner === true` (REPL.tsx:2245-2263),
+    /// named for this port's toolJSX counterpart, the local command UI
+    /// (CC local-jsx, `CommandKind::LocalUi`) or the `!` shell row.
+    local_command_ui_allows_spinner: bool,
     tool_use_confirm_queue_empty: bool,
     prompt_queue_empty: bool,
     is_loading: bool,
@@ -1045,7 +1242,7 @@ struct ShowSpinnerInput {
 
 /// Maps to: CC `screens/REPL.tsx#showSpinner`.
 fn should_show_spinner(input: ShowSpinnerInput) -> bool {
-    input.tool_jsx_allows_spinner
+    input.local_command_ui_allows_spinner
         && input.tool_use_confirm_queue_empty
         && input.prompt_queue_empty
         && (input.is_loading
@@ -1935,7 +2132,6 @@ fn messages_memo_key(
     hide_logo: bool,
     columns: u16,
     rows: u16,
-    pending_permission_tool_use_id: Option<&str>,
     classifier_checking_tool_use_id: Option<&str>,
     classifier_checking_is_auto: bool,
     status_notice_context: &StatusNoticeContext,
@@ -1952,7 +2148,9 @@ fn messages_memo_key(
         hide_logo,
         columns,
         rows,
-        pending_permission_tool_use_id,
+        false,
+        0,
+        false,
         classifier_checking_tool_use_id,
         classifier_checking_is_auto,
         status_notice_context,
@@ -1962,6 +2160,7 @@ fn messages_memo_key(
         in_progress_tool_use_ids,
         streaming_tool_use_ids,
         tools,
+        crate::utils::theme::ThemeName::Dark,
     )
 }
 
@@ -1974,7 +2173,10 @@ fn messages_memo_key_for_screen(
     hide_logo: bool,
     columns: u16,
     rows: u16,
-    pending_permission_tool_use_id: Option<&str>,
+    // CC `Messages` props compared by its memo (Messages.tsx:1038-1052).
+    local_command_ui_pauses_animation: bool,
+    tool_use_confirm_queue_len: usize,
+    is_message_selector_visible: bool,
     classifier_checking_tool_use_id: Option<&str>,
     classifier_checking_is_auto: bool,
     status_notice_context: &StatusNoticeContext,
@@ -1984,6 +2186,7 @@ fn messages_memo_key_for_screen(
     in_progress_tool_use_ids: &std::collections::HashSet<String>,
     streaming_tool_use_ids: &std::collections::HashSet<String>,
     tools: &[crate::types::tools::Tool],
+    theme: crate::utils::theme::ThemeName,
 ) -> String {
     // Maps to: CC `Messages.tsx:1064-1065`, which compares `inProgressToolUseIDs`
     // with `setsEqual` inside the memo comparator. Without it the subtree keeps
@@ -1999,8 +2202,11 @@ fn messages_memo_key_for_screen(
     // `areMessagesPropsEqual` compares the ordered NAME list, not the array
     // identity, so a rebuilt pool with the same names keeps the memo.
     let tool_pool = crate::components::messages_list::tool_pool_memo_key(tools);
+    // Not a CC comparator term: React re-renders Messages' themed descendants
+    // past the memo when the ThemeProvider value changes; iocraft does not.
     format!(
-        "messages:{:p}:{}:{}:{:?}:{:?}:{}:{}:{}:{}:{}:{:?}:{:?}:{}:{:?}:{:?}:{:?}:{}:{:?}:{:?}:{}",
+        "messages:{:?}:{:p}:{}:{}:{:?}:{:?}:{}:{}:{}:{}:{}:{:?}:{}:{}:{:?}:{}:{:?}:{:?}:{:?}:{}:{:?}:{:?}:{}",
+        theme,
         Arc::as_ptr(messages),
         messages.len(),
         conversation_id,
@@ -2011,7 +2217,9 @@ fn messages_memo_key_for_screen(
         hide_logo,
         columns,
         rows,
-        pending_permission_tool_use_id,
+        local_command_ui_pauses_animation,
+        tool_use_confirm_queue_len,
+        is_message_selector_visible,
         classifier_checking_tool_use_id,
         classifier_checking_is_auto,
         status_notice_context,
@@ -2076,6 +2284,73 @@ fn AnimatedTerminalTitle(
     element!(View(width: 0u32, height: 0u32))
 }
 
+#[derive(Default, Props)]
+struct TranscriptModeFooterProps {
+    show_all_in_transcript: bool,
+}
+
+/// Maps to: CC `screens/REPL.tsx:614-690` `TranscriptModeFooter` — "must be
+/// rendered inside KeybindingSetup to access keybinding context". The search
+/// badge, virtual-scroll hints and status slot belong to fullscreen paths this
+/// inline REPL does not take.
+#[component]
+fn TranscriptModeFooter(
+    props: &TranscriptModeFooterProps,
+    hooks: Hooks,
+) -> impl Into<AnyElement<'static>> {
+    let theme = hooks
+        .try_use_context::<crate::utils::theme::Theme>()
+        .map(|theme| *theme)
+        .unwrap_or_else(|| *crate::utils::theme::current());
+    // CC :637-646 `useShortcutDisplay(...)`.
+    let bindings = hooks
+        .try_use_context::<crate::keybindings::keybinding_context::KeybindingRuntime>()
+        .map(|runtime| runtime.bindings());
+    let shortcut = |action: &str, context: crate::keybindings::types::ContextName, fallback: &str| {
+        bindings.as_ref().map_or_else(
+            || fallback.to_string(),
+            |bindings| {
+                crate::keybindings::shortcut_format::get_shortcut_display_from_bindings(
+                    action, &context, fallback, bindings,
+                )
+            },
+        )
+    };
+    let toggle = shortcut(
+        "app:toggleTranscript",
+        crate::keybindings::types::ContextName::Global,
+        "ctrl+o",
+    );
+    let show_all = shortcut(
+        "transcript:toggleShowAll",
+        crate::keybindings::types::ContextName::Transcript,
+        "ctrl+e",
+    );
+    let text = format!(
+        "Showing detailed transcript · {toggle} to toggle · {show_all} to {}",
+        if props.show_all_in_transcript {
+            "collapse"
+        } else {
+            "show all"
+        }
+    );
+    element! {
+        View(
+            margin_top: 1u32,
+            padding_left: 2u32,
+            border_style: BorderStyle::Single,
+            border_edges: Edges::Top,
+        ) {
+            // CC :661 `<Text dimColor>` is ThemedText: the inactive foreground.
+            Text(content: text, color: theme.inactive)
+        }
+    }
+}
+
+/// Prompt-screen shorthand for [`memoized_messages_for_screen`], kept for the
+/// test harnesses: the REPL itself mounts its one Messages site through the
+/// screen-aware form in its single tree.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn memoized_messages(
     messages: Arc<Vec<RenderableMessage>>,
@@ -2085,7 +2360,6 @@ fn memoized_messages(
     hide_logo: bool,
     columns: u16,
     rows: u16,
-    pending_permission_tool_use_id: Option<String>,
     classifier_approvals: ClassifierApprovalsState,
     status_notice_context: StatusNoticeContext,
     streaming_text: Option<String>,
@@ -2101,7 +2375,9 @@ fn memoized_messages(
         hide_logo,
         columns,
         rows,
-        pending_permission_tool_use_id,
+        false,
+        0,
+        false,
         classifier_approvals,
         status_notice_context,
         streaming_text,
@@ -2110,6 +2386,7 @@ fn memoized_messages(
         in_progress_tool_use_ids,
         streaming_tool_use_ids,
         tools,
+        crate::utils::theme::ThemeName::Dark,
     )
 }
 
@@ -2125,7 +2402,14 @@ fn memoized_messages_for_screen(
     hide_logo: bool,
     columns: u16,
     rows: u16,
-    pending_permission_tool_use_id: Option<String>,
+    // CC `toolJSX` (this port's local command UI, projected to whether it
+    // pauses animation), `toolUseConfirmQueue` (its length) and
+    // `isMessageSelectorVisible`: the prompt site passes REPL's
+    // (REPL.tsx:6165-6172), the transcript site `null` / `[]` / `false`
+    // (:5824-5827). Messages turns them into `canAnimate` itself.
+    local_command_ui_pauses_animation: bool,
+    tool_use_confirm_queue_len: usize,
+    is_message_selector_visible: bool,
     classifier_approvals: ClassifierApprovalsState,
     status_notice_context: StatusNoticeContext,
     streaming_text: Option<String>,
@@ -2136,6 +2420,9 @@ fn memoized_messages_for_screen(
     // Maps to: CC `REPL.tsx:5821` / `:6162` `tools={tools}` — the memo half at
     // `REPL.tsx:1216`, the same object both Messages sites receive.
     tools: Arc<Vec<crate::types::tools::Tool>>,
+    // The resolved theme REPL renders under (CC `REPL.tsx:2071` `useTheme()`),
+    // for the memo key only.
+    theme: crate::utils::theme::ThemeName,
 ) -> AnyElement<'static> {
     // Mirror official `Messages = React.memo(...)` before entering the
     // Messages component. The component keeps its own bailout as a safety
@@ -2148,7 +2435,9 @@ fn memoized_messages_for_screen(
         hide_logo,
         columns,
         rows,
-        pending_permission_tool_use_id.as_deref(),
+        local_command_ui_pauses_animation,
+        tool_use_confirm_queue_len,
+        is_message_selector_visible,
         classifier_approvals.checking_tool_use_id(),
         classifier_approvals.checking_is_auto(),
         &status_notice_context,
@@ -2158,6 +2447,7 @@ fn memoized_messages_for_screen(
         &in_progress_tool_use_ids,
         &streaming_tool_use_ids,
         &tools,
+        theme,
     );
     let classifier_checking_tool_use_id = classifier_approvals
         .checking()
@@ -2177,7 +2467,9 @@ fn memoized_messages_for_screen(
                 screen: screen,
                 show_all_in_transcript: show_all_in_transcript,
                 hide_logo: hide_logo,
-                pending_permission_tool_use_id: pending_permission_tool_use_id,
+                local_command_ui_pauses_animation: local_command_ui_pauses_animation,
+                tool_use_confirm_queue_len: tool_use_confirm_queue_len,
+                is_message_selector_visible: is_message_selector_visible,
                 classifier_checking_tool_use_id: classifier_checking_tool_use_id,
                 classifier_checking_is_auto: classifier_checking_is_auto,
                 status_notice_context: status_notice_context,
@@ -3072,7 +3364,7 @@ fn resume(
             loaded.renderable_messages =
                 Arc::new(crate::utils::messages::normalize_messages(&loaded.messages));
             agent_definitions = Arc::new(
-                crate::tools::agent_tool::load_agents_dir::get_agent_definitions_with_overrides_readonly(
+                crate::tools::agent_tool::load_agents_dir::get_agent_definitions_with_overrides(
                     &crate::bootstrap::state::get_original_cwd(),
                 ),
             );
@@ -3506,11 +3798,52 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // `const [inProgressToolUseIDs, setInProgressToolUseIDs] = useState<Set<string>>(new Set())`.
     //
     // The REPL owns this set; tool execution writes it through the setter
-    // `ToolUseContext` carries (`Tool.ts:227`). Cometix runs tool execution on
-    // the query actor, so the writes arrive as `QueryEvent::SetInProgressToolUse`
-    // deltas instead of in-process `setState` calls.
+    // `ToolUseContext` carries (`Tool.ts:227`).
     let mut in_progress_tool_use_ids =
         hooks.use_state(|| Arc::new(std::collections::HashSet::<String>::new()));
+    // That setter, handed to every turn's context by
+    // `apply_repl_query_turn_context`. Like CC's `setState` it writes this
+    // REPL's set whichever query calls it, including a replaced query whose
+    // tools finish after the next one started. Tool execution runs on the
+    // query actor, so the writes cross over a REPL-owned channel rather than
+    // the calling query's event stream, which stops being read once that
+    // query is replaced.
+    let in_progress_updates = hooks.use_const(|| {
+        let (sender, receiver) = futures::channel::mpsc::unbounded::<(String, bool)>();
+        (sender, Arc::new(std::sync::Mutex::new(Some(receiver))))
+    });
+    let set_in_progress_tool_use_ids = {
+        let sender = in_progress_updates.0.clone();
+        crate::tool::SetInProgressToolUseIds(Some(Arc::new(
+            move |tool_use_id: &str, in_progress: bool| {
+                let _ = sender.unbounded_send((tool_use_id.to_string(), in_progress));
+            },
+        )))
+    };
+    hooks.use_future({
+        let receiver = in_progress_updates
+            .1
+            .lock()
+            .expect("in-progress receiver lock")
+            .take();
+        async move {
+            use futures::StreamExt as _;
+            let Some(mut receiver) = receiver else {
+                return;
+            };
+            while let Some((tool_use_id, in_progress)) = receiver.next().await {
+                let mut ids = in_progress_tool_use_ids.read().as_ref().clone();
+                let changed = if in_progress {
+                    ids.insert(tool_use_id)
+                } else {
+                    ids.remove(&tool_use_id)
+                };
+                if changed {
+                    in_progress_tool_use_ids.set(Arc::new(ids));
+                }
+            }
+        }
+    });
     // Maps to CC `REPL.tsx:1900` `hasInterruptibleToolInProgressRef`. This
     // ref is read by `handlePromptSubmit` before it decides whether a new
     // prompt may abort the current query.
@@ -3537,8 +3870,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // Maps to: CC `REPL.tsx:939-942` mount-time env gate.
     let terminal_title_disabled = hooks.use_const(|| {
         crate::utils::env_utils::is_env_truthy(
-            std::env::var("CLAUDE_CODE_DISABLE_TERMINAL_TITLE")
-                .ok()
+            crate::utils::process_env::var("CLAUDE_CODE_DISABLE_TERMINAL_TITLE")
                 .as_deref(),
         )
     });
@@ -3733,6 +4065,8 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // Maps to CC `/context` using `process.stdout.columns || 80`; the same
     // terminal-size hook also owns main-screen responsive rendering below.
     let (terminal_cols, terminal_rows) = hooks.use_terminal_size();
+    // Maps to: CC REPL.tsx:2071 `const [theme] = useTheme()`.
+    let (theme_name, _) = crate::components::design_system::theme_provider::use_theme(&hooks);
     let mut permission_queue = hooks.use_state(Vec::<ToolUseConfirm>::new);
     // Maps to: CC REPL.tsx:1537-1543 `sandboxPermissionRequestQueue` useState —
     // REPL-local queue of network-host asks. The per-request resolver lives on
@@ -3962,11 +4296,6 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let external_editor_runtime = hooks
         .try_use_context::<crate::utils::prompt_editor::ExternalEditorRuntime>()
         .map(|runtime| *runtime);
-    let keybinding_runtime_for_reload = hooks
-        .try_use_context::<crate::keybindings::keybinding_context::KeybindingRuntime>()
-        .map(|runtime| runtime.clone());
-    let keybinding_runtime_for_command_handlers = keybinding_runtime_for_reload.clone();
-    let keybinding_runtime_for_transcript_display = keybinding_runtime_for_reload.clone();
     let channel_permission_callbacks =
         crate::state::app_state::use_app_state(&mut hooks, |state| {
             state.channel_permission_callbacks.clone()
@@ -4024,6 +4353,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     let speculation_acceptance_rx = speculation_acceptance_channel.1.clone();
     hooks.use_future({
         let app_store = app_store.clone();
+        let set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
         async move {
             while let Ok(outcome) = speculation_acceptance_rx.recv().await {
                 let is_complete = matches!(
@@ -4170,6 +4500,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     tool_use_context.loaded_nested_memory_paths =
                         loaded_nested_memory_paths.read().clone();
                     tool_use_context.resume_restore_stores = resume_restore_stores.read().clone();
+                    // The cached context may carry an earlier query's setter;
+                    // this turn writes the REPL's set like every other turn.
+                    tool_use_context.set_in_progress_tool_use_ids =
+                        set_in_progress_tool_use_ids.clone();
                     let params = crate::query::QueryParams {
                         turn_id: Uuid::new_v4().to_string(),
                         // The accepted user turn is already in typed history;
@@ -4339,8 +4673,6 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     });
     let keybindings_processing_tx = keybindings_processing_channel.0.clone();
     let keybindings_processing_rx = keybindings_processing_channel.1.clone();
-    let app_store_for_keybindings_reload = app_store.clone();
-    let keybinding_runtime_for_editor_reload = keybinding_runtime_for_reload.clone();
     hooks.use_future(async move {
         while let Ok((invocation, prepared)) = keybindings_processing_rx.recv().await {
             let (output, is_error) = match prepared {
@@ -4360,14 +4692,11 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         Some(runtime) => runtime.edit_file(&path).await,
                         None => crate::utils::prompt_editor::EditorResult::default(),
                     };
-                    let loaded = crate::keybindings::load_user_bindings::reload_keybindings_sync_with_warnings();
-                    if let Some(runtime) = keybinding_runtime_for_editor_reload.as_ref() {
-                        runtime.replace_bindings(loaded.bindings);
-                    }
-                    crate::keybindings::keybinding_provider_setup::sync_keybinding_warning_notification(
-                        &app_store_for_keybindings_reload,
-                        &loaded.warnings,
-                    );
+                    // CC reloads through its file watcher, whose change
+                    // reaches every KeybindingSetup's subscription
+                    // (loadUserBindings.ts:424-437); the new bindings and
+                    // their warnings land there, not in this REPL body.
+                    crate::keybindings::load_user_bindings::reload_keybindings_and_notify();
                     (
                         crate::commands::keybindings::keybindings::editor_result_message(
                             &path,
@@ -4750,6 +5079,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         hooks.use_const(|| std::sync::Arc::new(async_channel::unbounded::<()>()));
     let mock_pump_tx = mock_pump_channel.0.clone();
     let mock_pump_rx = mock_pump_channel.1.clone();
+    // The tree's animation clock (iocraft's root provides it, as Ink's root
+    // App mounts ClockProvider). The pump aims the line-mode preview flush at
+    // its 100ms grid so the flush shares a frame with the spinner row's tick.
+    let animation_clock = hooks.use_context::<iocraft::components::Clock>().clone();
     let mut active_prompt_shell_command = hooks.use_state(|| Option::<String>::None);
     let prompt_shell_channel = hooks.use_const(|| {
         std::sync::Arc::new(async_channel::unbounded::<(
@@ -4782,14 +5115,6 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             active_prompt_shell_command.set(None);
         }
     });
-    crate::hooks::use_global_keybindings::use_global_keybindings(
-        &mut hooks,
-        keybinding_runtime_for_reload.clone(),
-        app_store.clone(),
-        redraw_generation,
-        screen,
-        show_all_in_transcript,
-    );
 
     let active_query_for_on_cancel = active_query;
     let active_compact_for_on_cancel = active_compact_abort;
@@ -4831,37 +5156,28 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         }
     };
 
-    // Maps to: CC REPL.tsx:5891 mounting `<CancelRequestHandler {...props}/>`
-    // inside KeybindingSetup; the handler itself lives in
-    // hooks/use_cancel_request.rs (CC hooks/useCancelRequest.ts).
-    {
+    // Maps to: CC REPL.tsx:2901-2918 `cancelRequestProps`, handed to the
+    // `<CancelRequestHandler {...cancelRequestProps}/>` mounted in the tree
+    // below (:5891, :6133; hooks/use_cancel_request.rs).
+    let cancel_request_can_cancel: Arc<dyn Fn() -> bool + Send + Sync> = {
         let active_query_for_cancel = active_query;
         let active_compact_for_cancel = active_compact_abort;
-        let is_context_blocked = {
-            // Maps to: CC isContextActive guards (:141-148). Messages
-            // screen and local command panels own their own Escape.
-            let showing_local_command_ui = active_local_command_ui.read().is_some();
-            showing_local_command_ui || screen.get() == Screen::Transcript
-        };
-        crate::hooks::use_cancel_request::use_cancel_request(
-            &mut hooks,
-            crate::hooks::use_cancel_request::UseCancelRequestOptions {
-                app_store: app_store.clone(),
-                can_cancel_running_task: move || {
-                    active_query_for_cancel
-                        .read()
-                        .as_ref()
-                        .is_some_and(|handle| !handle.abort_controller.is_aborted())
-                        || active_compact_for_cancel
-                            .read()
-                            .as_ref()
-                            .is_some_and(|abort| !abort.is_aborted())
-                },
-                on_cancel,
-                is_context_blocked,
-            },
-        );
-    }
+        Arc::new(move || {
+            active_query_for_cancel
+                .read()
+                .as_ref()
+                .is_some_and(|handle| !handle.abort_controller.is_aborted())
+                || active_compact_for_cancel
+                    .read()
+                    .as_ref()
+                    .is_some_and(|abort| !abort.is_aborted())
+        })
+    };
+    let cancel_request_on_cancel: Arc<dyn Fn() + Send + Sync> = Arc::new(on_cancel);
+    // Maps to: CC isContextActive guards (useCancelRequest.ts:141-148).
+    // Messages screen and local command panels own their own Escape.
+    let cancel_request_context_blocked =
+        active_local_command_ui.read().is_some() || screen.get() == Screen::Transcript;
 
     hooks.use_future({
         let runtime_mcp_context = runtime_mcp_context.clone();
@@ -4872,6 +5188,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         let mut content_replacement_state = content_replacement_state;
         let mut pending_responses = pending_responses;
         let mut streaming_text_preview = streaming_text_preview;
+        // Read at delta time (not captured at pump start) so a `/settings`
+        // change to reduce motion applies to the stream in progress.
+        let app_store_for_pump = app_store.clone();
+        let animation_clock = animation_clock.clone();
         let mut stream_mode = stream_mode;
         let mut response_length_ref = response_length_ref;
         let mut stop_hook_spinner_state = stop_hook_spinner_state;
@@ -4886,6 +5206,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         let query_pump_profile = crate::utils::debug::query_pump_profile_enabled();
         async move {
             let mut query_pump_burst = QueryPumpBurstProfile::default();
+            // Line-mode preview coalescing (CC 2.1.280, 100ms). The timer is
+            // raced against the next event only while a flush is armed.
+            let mut preview_coalescer = StreamingPreviewCoalescer::default();
+            let mut preview_flush_timer: Option<futures_timer::Delay> = None;
             loop {
                 if !permission_queue.read().is_empty() {
                     // Mirrors CC query/canUseTool gating: once a permission
@@ -4899,7 +5223,35 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 
                 let active_handle = { active_query.read().clone() };
                 if let Some(handle) = active_handle {
-                    let event = handle.events.recv().await;
+                    let event = match preview_flush_timer.as_mut() {
+                        Some(timer) => {
+                            let recv = handle.events.recv();
+                            futures::pin_mut!(recv);
+                            match futures::future::select(recv, timer).await {
+                                futures::future::Either::Left((event, _)) => event,
+                                futures::future::Either::Right(((), _)) => {
+                                    // CC 2.1.280 `$5e.flush` → `previewStore.setRaw`.
+                                    preview_flush_timer = None;
+                                    let current_visible = streaming_text_preview
+                                        .read()
+                                        .as_ref()
+                                        .and_then(|preview| {
+                                            visible_streaming_text(
+                                                &preview.raw,
+                                                StreamingTextDisplayMode::Line,
+                                            )
+                                        });
+                                    if let Some(preview) =
+                                        preview_coalescer.flush(current_visible.as_deref())
+                                    {
+                                        streaming_text_preview.set(Some(preview));
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
+                        None => handle.events.recv().await,
+                    };
                     let still_active = {
                         active_query
                             .read()
@@ -4931,6 +5283,8 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                                 stream_mode.set(SpinnerMode::Responding);
                             } else if let Some(block_type) = stream_event_content_block_start_type(&event) {
                                 streaming_text_preview.set(None);
+                                preview_coalescer.clear();
+                                preview_flush_timer = None;
                                 stream_mode.set(stream_block_type_to_spinner_mode(block_type));
                             }
 
@@ -4940,14 +5294,42 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                                 response_length_ref += delta.encode_utf16().count();
                             }
                             if let Some(delta) = stream_event_text_delta(&event) {
-                                let mut next =
-                                    streaming_text_preview.read().clone().unwrap_or_default();
-                                next.raw.push_str(&delta);
-                                streaming_text_preview.set(Some(next));
+                                // CC REPL.tsx:1990 `onStreamingText`: with reduce
+                                // motion on the delta is dropped before any
+                                // state write, so the stream renders no frames.
+                                let settings = app_store_for_pump.get().settings.clone();
+                                if show_streaming_text(&settings) {
+                                    let base = || {
+                                        streaming_text_preview.read().clone().unwrap_or_default()
+                                    };
+                                    match preview_coalescer.push(
+                                        base,
+                                        &delta,
+                                        streaming_text_display_mode(&settings),
+                                    ) {
+                                        StreamingPreviewWrite::Now(preview) => {
+                                            preview_flush_timer = None;
+                                            streaming_text_preview.set(Some(preview));
+                                        }
+                                        StreamingPreviewWrite::Arm => {
+                                            // Aimed at the tree clock's 100ms grid
+                                            // so the flush lands in the same frame
+                                            // as the spinner row's 100ms tick
+                                            // (CC: one ClockContext per tree).
+                                            preview_flush_timer = Some(futures_timer::Delay::new(
+                                                animation_clock
+                                                    .delay_to_next(STREAMING_PREVIEW_FLUSH_INTERVAL),
+                                            ));
+                                        }
+                                        StreamingPreviewWrite::Wait => {}
+                                    }
+                                }
                             }
                         }
                         Ok(QueryEvent::ClearStreamingPreview) => {
                             streaming_text_preview.set(None);
+                            preview_coalescer.clear();
+                            preview_flush_timer = None;
                         }
                         Ok(QueryEvent::ToolUseSummary(_summary)) => {}
                         Ok(QueryEvent::Message(message)) => {
@@ -4956,6 +5338,8 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                             // enters the ONE history — render rows and API
                             // history are projections of the same entry.
                             streaming_text_preview.set(None);
+                            preview_coalescer.clear();
+                            preview_flush_timer = None;
                             // CC REPL.tsx:3440-3526: producers update history;
                             // useLogMessages owns transcript parent selection and writes.
                             if crate::utils::messages::is_compact_boundary_message(&message) {
@@ -5267,9 +5651,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
 
                             // Maps to CC `QueryEngine.query()` eager/cowork
                             // result boundary.
-                            if crate::utils::env_utils::is_env_truthy(std::env::var(
-                                "CLAUDE_CODE_EAGER_FLUSH").ok().as_deref()) || crate::utils::env_utils::is_env_truthy(std::env::var(
-                                "CLAUDE_CODE_IS_COWORK").ok().as_deref()) {
+                            if crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_EAGER_FLUSH").as_deref()) || crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_IS_COWORK").as_deref()) {
                                 if let Err(error) =
                                     crate::utils::session_storage::flush_session_storage().await
                                 {
@@ -5430,6 +5812,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         let initial_tools_for_mcp = initial_tools.clone();
         let has_interruptible_tool_in_progress =
             Arc::clone(&has_interruptible_tool_in_progress);
+        let set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
         move |submit: McpPromptSlashCommandSubmit| {
             let runtime_mcp_context = runtime_mcp_context.clone();
             let prompt_submit_for_mcp = prompt_submit_for_mcp.clone();
@@ -5443,6 +5826,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             let initial_tools_for_mcp = initial_tools_for_mcp.clone();
             let has_interruptible_tool_in_progress =
                 Arc::clone(&has_interruptible_tool_in_progress);
+            let set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
             async move {
                 let blocks = match crate::services::mcp::client::get_mcp_prompt_for_command(
                 &submit.server_name,
@@ -5528,6 +5912,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 channel_permission_callbacks_for_mcp.as_ref(),
                 &permission_sink_for_mcp,
                 &has_interruptible_tool_in_progress,
+                &set_in_progress_tool_use_ids,
                 thinking_config_for_mcp.as_ref(),
                 // The one path whose context never met the builder:
                 // `submit_processed_prompt_deferred_query` builds it from
@@ -5720,11 +6105,9 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         move |invocation: SlashCommandInvocation| {
             let mock_pump = mock_pump.clone();
             async move {
-                let configured_theme = crate::utils::config::load_global_config().theme;
-                let theme = configured_theme
-                    .as_deref()
-                    .and_then(crate::utils::theme::ThemeName::from_config_or_display)
-                    .unwrap_or(crate::utils::theme::ThemeName::Dark);
+                // CC terminalSetup.tsx:219 `setupTerminal(context.options.theme)`,
+                // the REPL's resolved `useTheme()` (REPL.tsx:2071, :3205).
+                let theme = theme_name;
                 let result = match crate::utils::process_runtime::runtime_handle_for_detached_work()
                 {
                     Some(runtime) => runtime
@@ -5918,6 +6301,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         let mut exit_flow_active = exit_flow_active;
         let ide_selection_for_submit = ide_selection;
         let has_interruptible_tool_in_progress = Arc::clone(&has_interruptible_tool_in_progress);
+        let set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
         move |request: PromptQuerySubmit| {
             #[cfg(test)]
             let query_probe = query_probe.clone();
@@ -5953,6 +6337,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             let mock_pump_tx_for_submit = mock_pump_tx_for_submit.clone();
             let has_interruptible_tool_in_progress =
                 Arc::clone(&has_interruptible_tool_in_progress);
+            let set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
             async move {
                 let PromptQuerySubmit {
                     text,
@@ -6185,6 +6570,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                             channel_permission_callbacks_for_submit.as_ref(),
                             &permission_sink_for_submit,
                             &has_interruptible_tool_in_progress,
+                            &set_in_progress_tool_use_ids,
                             thinking_config_for_submit.as_ref(),
                             // Context came from `build_repl_process_user_input_context`
                             // above, which already applied the builder-owned fields.
@@ -6776,14 +7162,14 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         });
     };
 
-    // Maps to: CC `CommandKeybindingHandlers` in both REPL render branches.
-    // The hook records `/<name>`; invoking the normal submit owner here keeps
-    // PromptInput's existing buffer mounted and therefore preserves it.
-    // Hoisted out of the `&&` chain below: `&&` short-circuits, and this is a
-    // hook — iocraft resolves hooks by call index, so a skipped call shifts
-    // every later hook in the component and panics at render.
-    let modal_overlay_active =
-        crate::context::overlay_context::use_is_modal_overlay_active(&mut hooks);
+    // Maps to: CC `<CommandKeybindingHandlers onSubmit isActive/>` in both
+    // REPL render branches (REPL.tsx:5867-5870, :6099-6102), mounted in the
+    // tree below. It records `/<name>` in this State; invoking the normal
+    // submit owner here keeps PromptInput's existing buffer mounted and
+    // therefore preserves it. The component reads the modal overlay itself
+    // (useCommandKeybindings.tsx:48,76). The rest of this gate is the known
+    // focus approximation — CC's is `!toolJSX?.isLocalJSXCommand` alone.
+    let mut pending_keybinding_command = hooks.use_state(|| Option::<String>::None);
     let command_keybindings_active = active_local_command_ui
         .read()
         .as_ref()
@@ -6795,21 +7181,25 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         && !show_remote_callout
         && !show_desktop_upsell_startup.get()
         && hint_recommendation.read().is_none()
-        && !prompt_modal_overlay_active.get()
-        && !modal_overlay_active;
-    let mut command_keybinding_handlers =
-        crate::hooks::use_command_keybindings::use_command_keybinding_handlers(
-            &mut hooks,
-            keybinding_runtime_for_command_handlers,
-            command_keybindings_active,
-        );
-    if let Some(command) = command_keybinding_handlers.take_pending_command() {
+        && !prompt_modal_overlay_active.get();
+    let pending_command = pending_keybinding_command.read().clone();
+    if let Some(command) = pending_command {
+        pending_keybinding_command.set(None);
         on_submit(PromptSubmission {
             text: command,
             pasted_contents: std::collections::BTreeMap::new(),
             from_keybinding: true,
         });
     }
+
+    // Transport for the value CC hands `useInboxPoller` (REPL.tsx:5390-5395
+    // `focusedInputDialog,`), which its poll callback closes over through its
+    // dependencies (useInboxPoller.ts:867-873). This interval callback is
+    // built before this render computes the value, so the value crosses in a
+    // ref written where `get_focused_input_dialog` runs below — the same
+    // shape as CC's own `focusedInputDialogRef` (:1397-1399, :2778), whose
+    // one reader, the idle-notification timer (:5229-5262), is not ported.
+    let mut focused_input_dialog_ref = hooks.use_ref(|| None::<FocusedInputDialog>);
 
     // Maps to: CC `REPL.tsx` `useInboxPoller({ enabled, isLoading,
     // focusedInputDialog, onSubmitMessage: handleIncomingPrompt })`.
@@ -6833,10 +7223,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             let loaded_nested_memory_paths = loaded_nested_memory_paths;
             let main_thread_agent_definition = main_thread_agent_definition;
             let system_prompt_overrides = system_prompt_overrides.clone();
-            let active_local_command_ui = active_local_command_ui;
-            let show_desktop_upsell_startup = show_desktop_upsell_startup;
-            let hint_recommendation = hint_recommendation;
-            let exit_flow_active = exit_flow_active;
+            let focused_input_dialog_ref = focused_input_dialog_ref;
             let channel_permission_callbacks_for_inbox = channel_permission_callbacks.clone();
             let permission_sink_for_inbox = interactive_permission_sink.clone();
             let app_store_for_inbox = app_store.clone();
@@ -6846,26 +7233,38 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             let response_length_ref_for_inbox = response_length_ref;
             let has_interruptible_tool_in_progress =
                 Arc::clone(&has_interruptible_tool_in_progress);
+            let set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
             move || {
                 let enabled = crate::utils::agent_swarms_enabled::is_agent_swarms_enabled();
                 if !enabled {
                     return;
                 }
 
+                // CC REPL.tsx:1336 `isLoading = isQueryActive ||
+                // isExternalLoading`: the query guard, reservation included
+                // (`user_input_on_processing`). A queued permission request is
+                // not loading — CC's poll pushes worker requests into
+                // `toolUseConfirmQueue` while the leader stays idle.
                 let is_loading_now = !pending_responses.read().is_empty()
                     || active_query.read().is_some()
-                    || !permission_queue.read().is_empty();
-                let show_remote_callout = app_store_for_inbox.get().show_remote_callout;
-                let focused_input_dialog = (!permission_queue.read().is_empty()
-                    // CC useInboxPoller receives 'sandbox-permission' via
-                    // focusedInputDialog (use_inbox_poller.tsx:572,597).
-                    || !sandbox_permission_request_queue.read().is_empty()
-                    || active_local_command_ui.read().is_some()
-                    || show_remote_callout
-                    || show_desktop_upsell_startup.get()
-                    || hint_recommendation.read().is_some()
-                    || exit_flow_active.get())
-                .then_some("dialog".to_string());
+                    || user_input_on_processing
+                        .read()
+                        .as_ref()
+                        .is_some_and(|input| !input.is_empty());
+                // CC `handleIncomingPrompt` (REPL.tsx:5347-5365) is the
+                // poll's `onSubmitMessage`: it refuses while the query guard is
+                // active or a typed prompt/bash command is queued, and a
+                // refused message stays queued in the inbox
+                // (useInboxPoller.ts). The poll core takes that answer up
+                // front as `idle_submit_accepted`.
+                let idle_submit_accepted = !is_loading_now
+                    && !crate::utils::message_queue_manager::get_command_queue()
+                        .iter()
+                        .any(|command| command.mode == "prompt" || command.mode == "bash");
+                // CC hands the hook `getFocusedInputDialog()`'s value itself.
+                let focused_input_dialog = focused_input_dialog_ref
+                    .get()
+                    .map(|dialog| dialog.as_str().to_string());
 
                 let poller_local = inbox_poller_state.read().clone();
                 let app_snapshot = app_store_for_inbox.get();
@@ -6889,7 +7288,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     enabled,
                     is_loading_now,
                     focused_input_dialog.as_deref(),
-                    true,
+                    idle_submit_accepted,
                 );
                 let outcome = crate::hooks::use_inbox_poller::poll_inbox_once(
                     &mut state,
@@ -6899,7 +7298,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         enabled,
                         is_loading: is_loading_now || delivered.is_some(),
                         focused_input_dialog: focused_input_dialog.clone(),
-                        idle_submit_accepted: true,
+                        idle_submit_accepted,
                     },
                 );
 
@@ -6974,15 +7373,13 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     }
                 });
                 inbox_poller_state.set(state.poller);
+                // Only an accepted message comes back as `submitted` (see
+                // `idle_submit_accepted` above); a refused one is already in
+                // the inbox queue. A second check here, after the message was
+                // marked read, would drop it.
                 let Some(content) = submitted else {
                     return;
                 };
-                if !pending_responses.read().is_empty()
-                    || active_query.read().is_some()
-                    || !permission_queue.read().is_empty()
-                {
-                    return;
-                }
 
                 let mcp_state_for_input = runtime_mcp_context
                     .as_ref()
@@ -7046,6 +7443,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     channel_permission_callbacks_for_inbox.as_ref(),
                     &permission_sink_for_inbox,
                     &has_interruptible_tool_in_progress,
+                    &set_in_progress_tool_use_ids,
                     thinking_config_for_inbox.as_ref(),
                     // Context came from `build_repl_process_user_input_context`
                     // above, which already applied the builder-owned fields.
@@ -7112,6 +7510,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             let mut active_prompt_shell_for_cron = active_prompt_shell_command;
             let has_interruptible_tool_in_progress =
                 Arc::clone(&has_interruptible_tool_in_progress);
+            let set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
             move || {
                 // Maps to: CC `useScheduledTasks` — cron only. The queue drain
                 // below is CC `useQueueProcessor`, a SEPARATE effect with no
@@ -7580,6 +7979,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     channel_permission_callbacks_for_cron.as_ref(),
                     &permission_sink_for_cron,
                     &has_interruptible_tool_in_progress,
+                    &set_in_progress_tool_use_ids,
                     thinking_config_for_cron.as_ref(),
                     // Context came from `build_repl_process_user_input_context`
                     // above, which already applied the builder-owned fields.
@@ -8213,10 +8613,20 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             .as_ref()
             .is_some_and(|initial| initial.len() == model_messages.len()),
     );
+    // CC REPL.tsx:1997 `visibleStreamingText`: gated by showStreamingText,
+    // then cut to the presentation mode (CC: completed lines only).
+    let (streaming_preview_shown, streaming_display_mode) =
+        crate::state::app_state::use_app_state(&mut hooks, |state| {
+            (
+                show_streaming_text(&state.settings),
+                streaming_text_display_mode(&state.settings),
+            )
+        });
     let streaming_text = streaming_text_preview
         .read()
         .as_ref()
-        .and_then(|preview| visible_streaming_text(&preview.raw, STREAMING_TEXT_DISPLAY_MODE));
+        .filter(|_| streaming_preview_shown)
+        .and_then(|preview| visible_streaming_text(&preview.raw, streaming_display_mode));
     let active_local_command_ui_snapshot = active_local_command_ui.read().clone();
     // Maps to CC processSlashCommand.tsx:733-813 and REPL.tsx:4336-4404.
     // Each invocation captures its own args/result route. Source immediate
@@ -8304,18 +8714,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     );
     let active_prompt_shell_command_snapshot = active_prompt_shell_command.read().clone();
     let exit_flow_active_snapshot = exit_flow_active.get();
-    // Maps to: CC REPL.tsx:2689 `getFocusedInputDialog() === 'message-selector'`.
+    // Maps to: CC `isMessageSelectorVisible`, the input behind
+    // `getFocusedInputDialog()`'s 'message-selector' (REPL.tsx:2689).
     let message_selector_visible_snapshot = message_selector_visible.get();
     let hint_recommendation_snapshot = hint_recommendation.read().clone();
-    let active_startup_dialog = if show_remote_callout {
-        Some(ReplStartupDialogKind::RemoteCallout)
-    } else if hint_recommendation_snapshot.is_some() {
-        Some(ReplStartupDialogKind::PluginHint)
-    } else if show_desktop_upsell_startup.get() {
-        Some(ReplStartupDialogKind::DesktopUpsell)
-    } else {
-        None
-    };
     let current_permission = permission_queue.read().first().cloned();
     let query_is_loading = !pending_responses.read().is_empty() || active_query.read().is_some();
     let user_input_on_processing_active = user_input_on_processing
@@ -8346,11 +8748,12 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // branches. Local command/shell panels are the Rust toolJSX projection;
     // none currently opt into `showSpinner: true`.
     let show_spinner = should_show_spinner(ShowSpinnerInput {
-        tool_jsx_allows_spinner: active_local_command_ui_snapshot.is_none()
+        local_command_ui_allows_spinner: active_local_command_ui_snapshot.is_none()
             && active_prompt_shell_command_snapshot.is_none(),
         tool_use_confirm_queue_empty: current_permission.is_none(),
-        // Prompt requests that need input share the focused permission/dialog
-        // branches in this port and return before the main-screen spinner.
+        // CC `promptQueue` (hook prompt requests, `components/hooks/PromptDialog`)
+        // is an unported seam: `components/hooks/prompt_dialog.rs` has no
+        // producer or mount yet, so the queue is always empty.
         prompt_queue_empty: true,
         is_loading: query_is_loading,
         user_input_on_processing: user_input_on_processing_active,
@@ -8463,21 +8866,111 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         ),
     );
 
-    // Maps to: CC `getFocusedInputDialog()` head (REPL.tsx:2686-2694): exit
-    // states always take precedence, then the message selector, and interrupt
-    // dialogs are suppressed while the user is actively typing
-    // (`isPromptInputActive`); only then does
-    // `sandboxPermissionRequestQueue[0]` focus, outranking tool-permission.
-    // (CC `isExiting` corresponds to the immediate `should_exit` exit above;
-    // `exitFlow` to `exit_flow_active`.)
-    let current_local_sandbox_ask = if exit_flow_active_snapshot
-        || message_selector_visible_snapshot
-        || is_prompt_input_active.get()
-    {
-        None
+    // The queues behind the dialogs below, read before any dialog is chosen so
+    // every render calls the same hooks. These reads used to sit after the
+    // sandbox and tool-permission branches, which returned early, so a render
+    // with either dialog up skipped them.
+    let current_sandbox_permission = crate::state::app_state::use_app_state(&mut hooks, |state| {
+        state.worker_sandbox_permissions.queue.first().cloned()
+    });
+    // Maps to: CC REPL `{pendingWorkerRequest && <WorkerPendingPermission .../>}`.
+    let pending_worker_request = crate::state::app_state::use_app_state(&mut hooks, |state| {
+        state.pending_worker_request.clone()
+    });
+    // Maps to: CC REPL `{pendingSandboxRequest && <WorkerPendingPermission toolName="Network Access" .../>}`.
+    let pending_sandbox_request = crate::state::app_state::use_app_state(&mut hooks, |state| {
+        state.pending_sandbox_request.clone()
+    });
+    // Maps to: CC `const elicitation = useAppState(s => s.elicitation)`
+    // (REPL.tsx:990) — a subscription, so an elicitation arriving re-renders
+    // the REPL. (This was a snapshot read, which showed a new request only
+    // when something else happened to re-render.)
+    let current_elicitation = crate::state::app_state::use_app_state(&mut hooks, |state| {
+        state.elicitation.queue.first().cloned()
+    });
+    let elicitation_queued = current_elicitation.is_some();
+
+    // Maps to: CC REPL.tsx:2696-2697 `allowDialogsWithAnimation = !toolJSX ||
+    // toolJSX.shouldContinueAnimation`. Both of this REPL's toolJSX stand-ins
+    // lack the flag: local-jsx command panels (processSlashCommand.tsx:836-842)
+    // and the `!` bash-mode progress row (processBashCommand.tsx:58-92 sets
+    // toolJSX without it, and its inner override keeps only `.jsx`, dropping
+    // BashTool's).
+    let allow_dialogs_with_animation = active_local_command_ui_snapshot.is_none()
+        && active_prompt_shell_command_snapshot.is_none();
+    // Maps to: CC REPL.tsx:2765 `const focusedInputDialog =
+    // getFocusedInputDialog()` and :2778 `focusedInputDialogRef.current = ...`.
+    let focused_input_dialog = get_focused_input_dialog(&FocusedInputDialogInput {
+        is_exiting: should_exit.get(),
+        exit_flow: exit_flow_active_snapshot,
+        is_message_selector_visible: message_selector_visible_snapshot,
+        is_prompt_input_active: is_prompt_input_active.get(),
+        has_sandbox_permission_request: !sandbox_permission_request_queue.read().is_empty(),
+        allow_dialogs_with_animation,
+        has_tool_use_confirm: current_permission.is_some(),
+        has_worker_sandbox_permission: current_sandbox_permission.is_some(),
+        has_elicitation: elicitation_queued,
+        show_remote_callout,
+        has_hint_recommendation: hint_recommendation_snapshot.is_some(),
+        show_desktop_upsell_startup: show_desktop_upsell_startup.get(),
+    });
+    focused_input_dialog_ref.set(focused_input_dialog);
+    // The dialog slots exist only in CC's prompt-screen return; the transcript
+    // return (:5850-5989) has none. So the focused dialog is mounted only on
+    // the prompt screen, each at its CC slot in the single tree below, inside
+    // MCPConnectionManager — while `focused_input_dialog` itself stays
+    // screen-independent, as CC's is.
+    let mounted_input_dialog = focused_input_dialog.filter(|_| screen.get() == Screen::Prompt);
+    let current_local_sandbox_ask = (mounted_input_dialog
+        == Some(FocusedInputDialog::SandboxPermission))
+    .then(|| sandbox_permission_request_queue.read().first().cloned())
+    .flatten();
+    let focused_tool_permission = (mounted_input_dialog
+        == Some(FocusedInputDialog::ToolPermission))
+    .then(|| current_permission.clone())
+    .flatten();
+    let focused_worker_sandbox_permission = (mounted_input_dialog
+        == Some(FocusedInputDialog::WorkerSandboxPermission))
+    .then(|| current_sandbox_permission.clone())
+    .flatten();
+    let focused_elicitation = if mounted_input_dialog == Some(FocusedInputDialog::Elicitation) {
+        current_elicitation
     } else {
-        sandbox_permission_request_queue.read().first().cloned()
+        None
     };
+    // Maps to: CC REPL.tsx:6165-6172 — the prompt-screen Messages receives
+    // REPL's `toolJSX`, `toolUseConfirmQueue` and `isMessageSelectorVisible`,
+    // and turns them into `canAnimate` itself (Messages.tsx:764-767); the
+    // transcript site passes `null`, `[]` and `false` (:5824-5827). This
+    // REPL's toolJSX counterparts — a local command UI or the `!` shell row —
+    // never let animation continue, which is `!allow_dialogs_with_animation`.
+    let (
+        messages_local_command_ui_pauses_animation,
+        messages_tool_use_confirm_queue_len,
+        messages_selector_visible,
+    ) = if screen.get() == Screen::Prompt {
+        (
+            !allow_dialogs_with_animation,
+            permission_queue.read().len(),
+            message_selector_visible_snapshot,
+        )
+    } else {
+        (false, 0, false)
+    };
+    // Maps to: CC REPL.tsx:2768-2775 `hasSuppressedDialogs` — permission
+    // prompts exist but are held back because the user is typing; PromptInput
+    // says so (PromptInput.tsx:2981-2985). CC's `promptQueue` and cost dialog
+    // have no counterpart here.
+    let has_suppressed_dialogs = is_prompt_input_active.get()
+        && (!sandbox_permission_request_queue.read().is_empty()
+            || current_permission.is_some()
+            || current_sandbox_permission.is_some()
+            || elicitation_queued);
+
+    let mut sandbox_permission_dialog: Option<AnyElement<'static>> = None;
+    let mut tool_permission_overlay: Option<AnyElement<'static>> = None;
+    let mut worker_sandbox_permission_dialog: Option<AnyElement<'static>> = None;
+    let mut elicitation_dialog: Option<AnyElement<'static>> = None;
     if let Some(current_ask) = current_local_sandbox_ask {
         let permission_store_for_local_sandbox = permission_store.clone();
         let mut sandbox_queue_for_response = sandbox_permission_request_queue;
@@ -8536,30 +9029,8 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             );
             sandbox_queue_for_response.set(queue);
         };
-        return element! {
-            View(flex_direction: FlexDirection::Column, width: main_screen_width) {
-                ClearTerminalOnResize(cols: terminal_cols, rows: terminal_rows)
-                ClearScreenOnGeneration(generation: redraw_generation.get())
-                #(if !messages.is_empty() {
-                    Some(memoized_messages(
-                        messages.clone(),
-                        conversation_generation,
-                        false,
-                        verbose,
-                        false,
-                        terminal_cols,
-                        terminal_rows,
-                        None,
-                        classifier_approvals.read().clone(),
-                        status_notice_context.clone(),
-                        None,
-                        Arc::clone(&in_progress_tool_use_ids_value),
-                        Arc::clone(&streaming_tool_use_ids_value),
-                        Arc::clone(&tools),
-                    ))
-                } else {
-                    None
-                })
+        sandbox_permission_dialog = Some(
+            element! {
                 SandboxPermissionRequest(
                     // Maps to: CC REPL.tsx:6290
                     // `key={sandboxPermissionRequestQueue[0]!.hostPattern.host}`
@@ -8569,45 +9040,21 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     on_user_response: on_local_sandbox_response,
                 )
             }
-        }
-        .into_any();
+            .into_any(),
+        );
     }
 
-    if let Some(confirm) = current_permission.clone() {
+    if let Some(confirm) = focused_tool_permission {
         let worker_badge = confirm.worker_badge.map(permission_worker_badge_to_ui);
         let request = confirm.request;
         let permission_context_snapshot = permission_store.tool_permission_context();
-        let pending_permission_tool_use_id = request.tool_use_id.clone();
         // Maps to: CC `screens/REPL.tsx:6034-6035` permission overlay remount key.
         let permission_request_key = request.tool_use_id.clone();
-        // Main-screen/native-scrollback path only. Keep the official
-        // sequential order explicitly in REPL: {scrollable}{overlay}.
-        // PromptInput is hidden while the permission dialog is focused,
-        // matching CC's focusedInputDialog behavior.
-        return element! {
-            View(flex_direction: FlexDirection::Column, width: main_screen_width) {
-                ClearTerminalOnResize(cols: terminal_cols, rows: terminal_rows)
-                ClearScreenOnGeneration(generation: redraw_generation.get())
-                #(if !messages.is_empty() {
-                    Some(memoized_messages(
-                        messages.clone(),
-                        conversation_generation,
-                        false,
-                        verbose,
-                        false,
-                        terminal_cols,
-                        terminal_rows,
-                        Some(pending_permission_tool_use_id.clone()),
-                        classifier_approvals.read().clone(),
-                        status_notice_context.clone(),
-                        None,
-                        Arc::clone(&in_progress_tool_use_ids_value),
-                        Arc::clone(&streaming_tool_use_ids_value),
-                        Arc::clone(&tools),
-                    ))
-                } else {
-                    None
-                })
+        // Maps to: CC `toolPermissionOverlay` (REPL.tsx:6032-6051), handed to
+        // FullscreenLayout as `overlay`; outside fullscreen that renders after
+        // `bottom` (FullscreenLayout.tsx:`{scrollable}{bottom}{overlay}`).
+        tool_permission_overlay = Some(
+            element! {
                 PermissionRequest(
                     key: permission_request_key,
                     request: Some(request),
@@ -8622,132 +9069,61 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     on_cancel: on_permission_cancel,
                 )
             }
-        }
-        .into_any();
+            .into_any(),
+        );
     }
 
-    let current_sandbox_permission = crate::state::app_state::use_app_state(&mut hooks, |state| {
-        state.worker_sandbox_permissions.queue.first().cloned()
-    });
-    if let Some(sandbox_request) = current_sandbox_permission {
-        let pending_permission_tool_use_id = format!("sandbox:{}", sandbox_request.request_id);
-        return element! {
-                View(flex_direction: FlexDirection::Column, width: main_screen_width) {
-                    ClearTerminalOnResize(cols: terminal_cols, rows: terminal_rows)
-                    ClearScreenOnGeneration(generation: redraw_generation.get())
-                    #(if !messages.is_empty() {
-                        Some(memoized_messages(
-                            messages.clone(),
-                            conversation_generation,
-                            false,
-                            verbose,
-                            false,
-                            terminal_cols,
-                            terminal_rows,
-                            Some(pending_permission_tool_use_id.clone()),
-                            classifier_approvals.read().clone(),
-                            status_notice_context.clone(),
-                            None,
-                            Arc::clone(&in_progress_tool_use_ids_value),
-                            Arc::clone(&streaming_tool_use_ids_value),
-                            Arc::clone(&tools),
-                        ))
-                    } else {
-                        None
-                    })
-                    SandboxPermissionRequest(
-                        host_pattern: Some(crate::utils::sandbox::sandbox_adapter::NetworkHostPattern::new(sandbox_request.host)),
-                        on_user_response: on_sandbox_permission_response,
-                    )
-                }
+    // Maps to: CC `focusedInputDialog === 'worker-sandbox-permission'`
+    // (REPL.tsx:6396-6459).
+    if let Some(sandbox_request) = focused_worker_sandbox_permission {
+        worker_sandbox_permission_dialog = Some(
+            element! {
+                SandboxPermissionRequest(
+                    // Maps to: CC REPL.tsx:6398 `key={…queue[0]!.requestId}` —
+                    // a new request gets a fresh dialog, not the last one's
+                    // selection.
+                    key: sandbox_request.request_id.clone(),
+                    host_pattern: Some(crate::utils::sandbox::sandbox_adapter::NetworkHostPattern::new(sandbox_request.host)),
+                    on_user_response: on_sandbox_permission_response,
+                )
             }
-        .into_any();
+            .into_any(),
+        );
     }
 
-    // Maps to: CC REPL `{pendingWorkerRequest && <WorkerPendingPermission .../>}`.
-    let pending_worker_request = crate::state::app_state::use_app_state(&mut hooks, |state| {
-        state.pending_worker_request.clone()
-    });
-    if let Some(pending) = pending_worker_request {
-        let pending_permission_tool_use_id = pending.tool_use_id.clone();
-        return element! {
-            View(flex_direction: FlexDirection::Column, width: main_screen_width) {
-                ClearTerminalOnResize(cols: terminal_cols, rows: terminal_rows)
-                ClearScreenOnGeneration(generation: redraw_generation.get())
-                #(if !messages.is_empty() {
-                    Some(memoized_messages(
-                        messages.clone(),
-                        conversation_generation,
-                        false,
-                        verbose,
-                        false,
-                        terminal_cols,
-                        terminal_rows,
-                        Some(pending_permission_tool_use_id.clone()),
-                        classifier_approvals.read().clone(),
-                        status_notice_context.clone(),
-                        None,
-                        Arc::clone(&in_progress_tool_use_ids_value),
-                        Arc::clone(&streaming_tool_use_ids_value),
-                        Arc::clone(&tools),
-                    ))
-                } else {
-                    None
-                })
+    // Maps to: CC REPL.tsx:6382-6394 — the worker-side pending indicators are
+    // not focused dialogs: they render whenever their request is pending,
+    // alongside PromptInput. Main screen only, like every dialog slot.
+    let worker_pending_permission = pending_worker_request
+        .as_ref()
+        .filter(|_| screen.get() == Screen::Prompt)
+        .map(|pending| {
+            element! {
                 WorkerPendingPermission(
                     tool_name: pending.tool_name.clone(),
                     description: pending.description.clone(),
                 )
             }
-        }
-        .into_any();
-    }
-
-    // Maps to: CC REPL `{pendingSandboxRequest && <WorkerPendingPermission toolName="Network Access" .../>}`.
-    let pending_sandbox_request = crate::state::app_state::use_app_state(&mut hooks, |state| {
-        state.pending_sandbox_request.clone()
-    });
-    if let Some(pending) = pending_sandbox_request {
-        let pending_permission_tool_use_id = format!("sandbox:{}", pending.request_id);
-        let description = format!(
-            "Waiting for leader to approve network access to {}",
-            pending.host
-        );
-        return element! {
-            View(flex_direction: FlexDirection::Column, width: main_screen_width) {
-                ClearTerminalOnResize(cols: terminal_cols, rows: terminal_rows)
-                ClearScreenOnGeneration(generation: redraw_generation.get())
-                #(if !messages.is_empty() {
-                    Some(memoized_messages(
-                        messages.clone(),
-                        conversation_generation,
-                        false,
-                        verbose,
-                        false,
-                        terminal_cols,
-                        terminal_rows,
-                        Some(pending_permission_tool_use_id.clone()),
-                        classifier_approvals.read().clone(),
-                        status_notice_context.clone(),
-                        None,
-                        Arc::clone(&in_progress_tool_use_ids_value),
-                        Arc::clone(&streaming_tool_use_ids_value),
-                        Arc::clone(&tools),
-                    ))
-                } else {
-                    None
-                })
+            .into_any()
+        });
+    let worker_sandbox_pending_permission = pending_sandbox_request
+        .as_ref()
+        .filter(|_| screen.get() == Screen::Prompt)
+        .map(|pending| {
+            element! {
                 WorkerPendingPermission(
                     tool_name: "Network Access".to_string(),
-                    description: description,
+                    description: format!(
+                        "Waiting for leader to approve network access to {}",
+                        pending.host
+                    ),
                 )
             }
-        }
-        .into_any();
-    }
+            .into_any()
+        });
 
-    let current_elicitation = app_store.get().elicitation.queue.first().cloned();
-    if let Some(elicitation_event) = current_elicitation {
+    // Maps to: CC `focusedInputDialog === 'elicitation'` (REPL.tsx:6460-6498).
+    if let Some(elicitation_event) = focused_elicitation {
         let response_server_name = elicitation_event.server_name.clone();
         let response_request_id = elicitation_event.request_id.clone();
         let waiting_server_name = elicitation_event.server_name.clone();
@@ -8814,48 +9190,35 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 app.elicitation = std::sync::Arc::new(state);
             });
         };
-        return element! {
-            View(flex_direction: FlexDirection::Column, width: main_screen_width) {
-                ClearTerminalOnResize(cols: terminal_cols, rows: terminal_rows)
-                ClearScreenOnGeneration(generation: redraw_generation.get())
-                #(if !messages.is_empty() {
-                    Some(memoized_messages(
-                        messages.clone(),
-                        conversation_generation,
-                        false,
-                        verbose,
-                        false,
-                        terminal_cols,
-                        terminal_rows,
-                        None,
-                        classifier_approvals.read().clone(),
-                        status_notice_context.clone(),
-                        None,
-                        Arc::clone(&in_progress_tool_use_ids_value),
-                        Arc::clone(&streaming_tool_use_ids_value),
-                        Arc::clone(&tools),
-                    ))
-                } else {
-                    None
-                })
+        // Maps to: CC REPL.tsx:6461-6465 `key={serverName + ':' + requestId}`.
+        let elicitation_key = format!(
+            "{}:{}",
+            elicitation_event.server_name, elicitation_event.request_id
+        );
+        elicitation_dialog = Some(
+            element! {
                 ElicitationDialog(
+                    key: elicitation_key,
                     event: Some(elicitation_event),
                     on_response: on_elicitation_response,
                     on_waiting_dismiss: on_elicitation_waiting_dismiss,
                 )
             }
-        }
-        .into_any();
+            .into_any(),
+        );
     }
-
     let active_is_resume = active_local_command_ui_snapshot
         .as_ref()
         .is_some_and(ActiveLocalCommandUi::is_resume);
     let should_render_prompt_input = screen.get() == Screen::Prompt
         && !exit_flow_active_snapshot
-        && active_startup_dialog.is_none()
-        // CC: PromptInput unmounts while the message selector is active.
-        && !message_selector_visible_snapshot
+        // CC REPL.tsx:6733 `!focusedInputDialog`: any focused dialog — the
+        // message selector, a permission dialog, a startup callout — takes
+        // PromptInput's place.
+        && focused_input_dialog.is_none()
+        // CC :6734 `!isExiting`: the exiting frame, which stays in inline
+        // scrollback, carries no prompt box.
+        && !should_exit.get()
         && active_local_command_ui_snapshot
             .as_ref()
             .is_none_or(|active| !active.should_hide_prompt_input);
@@ -9037,45 +9400,58 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         let _done = done;
         show_desktop_upsell_startup.set(false);
     };
-    let transcript_footer_text = if screen.get() == Screen::Transcript {
-        let runtime_bindings = keybinding_runtime_for_transcript_display
-            .as_ref()
-            .map(|runtime| runtime.bindings());
-        let toggle = runtime_bindings.as_ref().map_or_else(
-            || "ctrl+o".to_string(),
-            |bindings| {
-                crate::keybindings::shortcut_format::get_shortcut_display_from_bindings(
-                    "app:toggleTranscript",
-                    &crate::keybindings::types::ContextName::Global,
-                    "ctrl+o",
-                    bindings,
-                )
-            },
-        );
-        let show_all = runtime_bindings.as_ref().map_or_else(
-            || "ctrl+e".to_string(),
-            |bindings| {
-                crate::keybindings::shortcut_format::get_shortcut_display_from_bindings(
-                    "transcript:toggleShowAll",
-                    &crate::keybindings::types::ContextName::Transcript,
-                    "ctrl+e",
-                    bindings,
-                )
-            },
-        );
-        Some(format!(
-            "Showing detailed transcript · {toggle} to toggle · {show_all} to {}",
-            if show_all_in_transcript.get() {
-                "collapse"
-            } else {
-                "show all"
-            }
-        ))
-    } else {
-        None
-    };
 
+    // This is the REPL's only return: every screen state, every dialog and
+    // every panel is a child of the one tree below, so a dialog appearing is a
+    // child being added, never the tree being swapped for another. CC has one
+    // more top-level tree, the transcript return (REPL.tsx:5805-5989), which
+    // mounts no MCPConnectionManager; here the transcript screen lives in the
+    // same tree, so toggling it keeps the manager mounted as well.
+    //
+    // Maps to: CC `<KeybindingSetup>` as the outermost element of both
+    // returns (REPL.tsx:5851, :6083). This REPL owns its keybinding runtime,
+    // as CC's does; nothing above it provides one. The one tree parents both
+    // screens, so one mount covers both, as with the manager below.
     element! {
+        crate::keybindings::keybinding_provider_setup::KeybindingSetup {
+            // CC mounts AnimatedTerminalTitle before, not inside,
+            // MCPConnectionManager (REPL.tsx:6084 vs :6134), in both the
+            // transcript and main returns; this single tree parents both
+            // screens, so one mount is the same coverage. isAnimating mirrors
+            // :1578-1589: loading, not waiting for approval (confirm queue,
+            // worker, sandbox), and no local-JSX command showing. noPrefix
+            // maps to showStatusInTerminalTab — the tab-status feature is an
+            // unported seam, so it stays false.
+            AnimatedTerminalTitle(
+                is_animating: is_loading
+                    && current_permission.is_none()
+                    && spinner_app_snapshot.pending_worker_request.is_none()
+                    && spinner_app_snapshot.pending_sandbox_request.is_none()
+                    && active_local_command_ui_snapshot.is_none(),
+                title: terminal_tab_title.clone(),
+                disabled: terminal_title_disabled,
+                no_prefix: false,
+            )
+        // Maps to: CC REPL.tsx:6090-6133 (and :5858-5891) — the keybinding
+        // handler components, in CC's order, ahead of the rest of the tree.
+        // Earlier siblings are polled first, so like CC's listeners — which
+        // registered before PromptInput's — they see a key before
+        // PromptInput does. (Voice, Scroll and MessageActions handlers are
+        // not ported.)
+        crate::hooks::use_global_keybindings::GlobalKeybindingHandlers(
+            redraw_generation: Some(redraw_generation),
+            screen: Some(screen),
+            show_all_in_transcript: Some(show_all_in_transcript),
+        )
+        crate::hooks::use_command_keybindings::CommandKeybindingHandlers(
+            pending_command: Some(pending_keybinding_command),
+            is_active: command_keybindings_active,
+        )
+        crate::hooks::use_cancel_request::CancelRequestHandler(
+            can_cancel_running_task: Some(cancel_request_can_cancel.clone()),
+            on_cancel: Some(cancel_request_on_cancel.clone()),
+            is_context_blocked: cancel_request_context_blocked,
+        )
         // Maps to: CC `REPL.tsx:6134-6138` — `<MCPConnectionManager
         // dynamicMcpConfig isStrictMcpConfig>` WRAPS the rest of the tree. It
         // owns the connection effect and publishes the context that
@@ -9086,25 +9462,6 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             mcp_startup: props.mcp_startup.clone(),
         ) {
             View(flex_direction: FlexDirection::Column, width: main_screen_width) {
-                // CC mounts AnimatedTerminalTitle in both the transcript and
-                // main returns (:5852, :6084) because they are separate JSX
-                // trees; this single tree parents both screens, so one mount
-                // is the same coverage. isAnimating mirrors :1578-1589:
-                // loading, not waiting for approval (confirm queue, worker,
-                // sandbox; the prompt queue shares the focused dialog branch
-                // here), and no local-JSX command showing. noPrefix maps to
-                // showStatusInTerminalTab — the tab-status feature is an
-                // unported seam, so it stays false.
-                AnimatedTerminalTitle(
-                    is_animating: is_loading
-                        && current_permission.is_none()
-                        && spinner_app_snapshot.pending_worker_request.is_none()
-                        && spinner_app_snapshot.pending_sandbox_request.is_none()
-                        && active_local_command_ui_snapshot.is_none(),
-                    title: terminal_tab_title.clone(),
-                    disabled: terminal_title_disabled,
-                    no_prefix: false,
-                )
                 ClearTerminalOnResize(cols: terminal_cols, rows: terminal_rows)
                 ClearScreenOnGeneration(generation: redraw_generation.get())
 
@@ -9121,7 +9478,9 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     active_is_resume,
                     terminal_cols,
                     terminal_rows,
-                    None,
+                    messages_local_command_ui_pauses_animation,
+                    messages_tool_use_confirm_queue_len,
+                    messages_selector_visible,
                     classifier_approvals.read().clone(),
                     status_notice_context.clone(),
                     None,
@@ -9130,6 +9489,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     Arc::clone(&in_progress_tool_use_ids_value),
                     Arc::clone(&streaming_tool_use_ids_value),
                     Arc::clone(&tools),
+                    theme_name,
                 ))
             } else {
                 None
@@ -9146,7 +9506,9 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     active_is_resume,
                     terminal_cols,
                     terminal_rows,
-                    None,
+                    messages_local_command_ui_pauses_animation,
+                    messages_tool_use_confirm_queue_len,
+                    messages_selector_visible,
                     classifier_approvals.read().clone(),
                     status_notice_context.clone(),
                     streaming_text_for_messages.clone(),
@@ -9155,6 +9517,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                     Arc::clone(&in_progress_tool_use_ids_value),
                     Arc::clone(&streaming_tool_use_ids_value),
                     Arc::clone(&tools),
+                    theme_name,
                 ))
             } else {
                 None
@@ -9283,7 +9646,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }.into_any())
                     },
                     LocalCommandPanel::Theme => Some(element! {
-                        theme::ThemePickerWrapper(
+                        theme::ThemePickerCommand(
                             on_close: on_local_command_ui_close,
                             on_select: on_local_command_ui_result,
                         )
@@ -9564,7 +9927,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         }.into_any())
                     },
                     LocalCommandPanel::Theme => Some(element! {
-                        theme::ThemePickerWrapper(
+                        theme::ThemePickerCommand(
                             on_close: on_local_command_ui_close,
                             on_select: on_local_command_ui_result,
                         )
@@ -9671,11 +10034,23 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 }
             }))
 
-            #(match active_startup_dialog {
-                Some(ReplStartupDialogKind::RemoteCallout) => Some(element! {
+            // Maps to: CC FullscreenLayout `bottom` (REPL.tsx:6288-6498), in
+            // source order: the focused sandbox-permission dialog, the
+            // worker-side pending indicators, the focused worker-sandbox
+            // dialog, the focused elicitation dialog.
+            #(sandbox_permission_dialog)
+            #(worker_pending_permission)
+            #(worker_sandbox_pending_permission)
+            #(worker_sandbox_permission_dialog)
+            #(elicitation_dialog)
+
+            // Maps to: CC REPL.tsx:6607-6653 `{focusedInputDialog ===
+            // 'remote-callout' / 'plugin-hint' / 'desktop-upsell' && ...}`.
+            #(match mounted_input_dialog {
+                Some(FocusedInputDialog::RemoteCallout) => Some(element! {
                     RemoteCallout(on_done: on_remote_callout_done)
                 }.into_any()),
-                Some(ReplStartupDialogKind::PluginHint) => hint_recommendation_snapshot.clone().map(|recommendation| element! {
+                Some(FocusedInputDialog::PluginHint) => hint_recommendation_snapshot.clone().map(|recommendation| element! {
                     crate::components::claude_code_hint::PluginHintMenu(
                         plugin_name: recommendation.plugin_name,
                         plugin_description: recommendation.plugin_description,
@@ -9684,7 +10059,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         on_response: on_plugin_hint_response,
                     )
                 }.into_any()),
-                Some(ReplStartupDialogKind::DesktopUpsell) => Some(element! {
+                Some(FocusedInputDialog::DesktopUpsell) => Some(element! {
                     DesktopUpsellStartup(
                         handoff_state: startup_dialog_snapshot.desktop_handoff_state,
                         handoff_error: startup_dialog_snapshot.desktop_handoff_error.clone(),
@@ -9692,7 +10067,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         on_done: on_desktop_upsell_done,
                     )
                 }.into_any()),
-                None => None,
+                _ => None,
             })
 
             #(if exit_flow_active_snapshot {
@@ -9707,9 +10082,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 None
             })
 
-            // Maps to: CC REPL.tsx:6876 `<MessageSelector messages={...}/>`
+            // Maps to: CC REPL.tsx:6875-6876 `{focusedInputDialog ===
+            // 'message-selector' && <MessageSelector messages={...}/>}`
             // (rewind dialog; /rewind command or empty-input double-Escape).
-            #(if message_selector_visible_snapshot {
+            #(if mounted_input_dialog == Some(FocusedInputDialog::MessageSelector) {
                 let selector_messages = Arc::clone(&model_messages);
                 let store_for_restore_code = app_store.clone();
                 let mut message_selector_visible_for_close = message_selector_visible;
@@ -9750,15 +10126,8 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 )
             }.into_any()))
 
-            #(transcript_footer_text.map(|text| element! {
-                View(
-                    margin_top: 1u32,
-                    padding_left: 2u32,
-                    border_style: BorderStyle::Single,
-                    border_edges: Edges::Top,
-                ) {
-                    Text(content: text, dim: true)
-                }
+            #((screen.get() == Screen::Transcript).then(|| element! {
+                TranscriptModeFooter(show_all_in_transcript: show_all_in_transcript.get())
             }))
 
             #(if should_render_prompt_input {
@@ -9816,11 +10185,13 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         initial_input: Some(prompt_input_snapshot.read().clone()),
                         controlled_input: restored_input.read().clone(),
                         on_input_state_change: move |next: crate::components::prompt_input::PromptInputTextUpdate| {
+                            let mut restored_input = restored_input;
                             if restored_input.read().as_ref() != Some(&next) {
                                 restored_input.set(Some(next));
                             }
                         },
                         on_input_change: move |next: String| {
+                            let mut prompt_input_snapshot = prompt_input_snapshot;
                             if *prompt_input_snapshot.read() != next {
                                 // Maps to: CC REPL.tsx:1855
                                 // `setIsPromptInputActive(value.trim().length > 0)`
@@ -9852,6 +10223,7 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         permission_mode: permission_store.tool_permission_context().mode,
                         swarm_banner_input: swarm_banner_input.clone(),
                         on_permission_mode_cycle: on_permission_mode_cycle,
+                        has_suppressed_dialogs: has_suppressed_dialogs,
                     )
                     // CC REPL.tsx:6865: same visibility/lifetime as PromptInput,
                     // after it in sibling order; never a global Task context.
@@ -9863,7 +10235,13 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             } else {
                 None
             })
+
+            // Maps to: CC FullscreenLayout `overlay={toolPermissionOverlay}`
+            // (REPL.tsx:6140); outside fullscreen it renders after `bottom`
+            // (FullscreenLayout.tsx `{scrollable}{bottom}{overlay}{modal}`).
+            #(tool_permission_overlay)
             }
+        }
         }
     }
     .into_any()
@@ -9889,7 +10267,10 @@ mod tests {
         }
     }
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{
+        CLIPBOARD_OFF_SYSTEM, EnvVarGuard, IsolatedProjectSettings, PinnedProjectDir,
+        TEST_ENV_LOCK, TestEnvLock, in_child_process,
+    };
     use crate::utils::{conversation, conversation_recovery, theme};
     use futures::{Stream, StreamExt, stream};
     use serde_json::json;
@@ -9956,7 +10337,7 @@ mod tests {
     /// Maps to: CC replLauncher.tsx:24-26 props spread and REPL.tsx:6134-6138 manager.
     #[test]
     fn repl_props_into_element_preserves_mcp_startup_and_runs_non_strict_discovery() {
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_runtime::initialize_test_process_runtime();
         let runtime = crate::utils::process_runtime::runtime_handle_for_detached_work().unwrap();
         let _runtime = runtime.enter();
@@ -11215,7 +11596,7 @@ mod tests {
     fn fork_apply_matches_official_live_replacement_and_file_history_preservation() {
         // CC REPL.tsx:2548-2558 skips replacement reconstruction for Fork;
         // sessionRestore.ts:104-109 keeps fileHistory when log omits snapshots.
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let target = resume::ResumeTarget {
             session_id: Uuid::new_v4().to_string(),
             project_path: None,
@@ -11268,10 +11649,10 @@ mod tests {
     #[test]
     fn branch_command_matches_official_hot_resume_and_system_output() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let temp = BranchFixtureDirectory::new();
         let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
-        let _project = crate::utils::env_utils::PinnedProjectDir::at(temp.path());
+        let _project = PinnedProjectDir::at(temp.path());
         let _projects = crate::utils::session_storage::set_test_projects_dir_override(
             temp.path().join("projects"),
         );
@@ -11577,10 +11958,10 @@ mod tests {
     #[test]
     fn fork_resume_matches_official_worktree_metadata_and_live_file_history() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let temp = BranchFixtureDirectory::new();
         let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
-        let _project = crate::utils::env_utils::PinnedProjectDir::at(temp.path());
+        let _project = PinnedProjectDir::at(temp.path());
         let _no_hooks = EnvVarGuard::set("CLAUDE_CODE_SIMPLE", "1");
         struct RestoreSession {
             id: String,
@@ -11674,10 +12055,10 @@ mod tests {
 
     #[test]
     fn fork_resume_matches_official_session_end_then_explicit_target_start_identity() {
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let temp = BranchFixtureDirectory::new();
         let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path());
-        let _project = crate::utils::env_utils::PinnedProjectDir::at(temp.path());
+        let _project = PinnedProjectDir::at(temp.path());
         let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         // Moving config/cwd away from just's trusted fixture removes its
         // persisted trust grant. Use the existing accepted-workspace fixture
@@ -11732,8 +12113,8 @@ mod tests {
 
     #[test]
     fn resume_runs_session_end_before_session_start_like_official_repl_callback() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _simple = crate::utils::env_utils::EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         let marker_path = std::env::temp_dir().join(format!(
             "cometix-repl-resume-hooks-{}",
             uuid::Uuid::new_v4()
@@ -12197,6 +12578,8 @@ mod tests {
         let thinking = crate::utils::thinking::ThinkingConfig::Adaptive;
         let has_interruptible_tool_in_progress =
             Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let repl_in_progress_setter =
+            crate::tool::SetInProgressToolUseIds(Some(Arc::new(|_: &str, _: bool| {})));
         let make_params = |context: ToolUseContext| crate::query::QueryParams {
             turn_id: "turn-1".to_string(),
             input: "/mcp-prompt".to_string(),
@@ -12244,6 +12627,7 @@ mod tests {
             None,
             &crate::tool::InteractivePermissionSink::default(),
             &has_interruptible_tool_in_progress,
+            &repl_in_progress_setter,
             &thinking,
             None,
         );
@@ -12270,6 +12654,7 @@ mod tests {
             None,
             &crate::tool::InteractivePermissionSink::default(),
             &has_interruptible_tool_in_progress,
+            &repl_in_progress_setter,
             &thinking,
             Some(loaded_nested_memory_paths.clone()),
         );
@@ -12278,6 +12663,19 @@ mod tests {
         let shell = &shell_params.tool_use_context;
         assert!(builder.set_has_interruptible_tool_in_progress.0.is_some());
         assert!(shell.set_has_interruptible_tool_in_progress.0.is_some());
+        // CC REPL.tsx:3296: every turn's context carries the REPL's own
+        // `setInProgressToolUseIDs`, not a per-query forwarder.
+        for context in [builder, shell] {
+            assert!(
+                context
+                    .set_in_progress_tool_use_ids
+                    .0
+                    .as_ref()
+                    .zip(repl_in_progress_setter.0.as_ref())
+                    .is_some_and(|(installed, repl)| Arc::ptr_eq(installed, repl)),
+                "the turn context must carry the REPL's in-progress setter"
+            );
+        }
         (builder
             .set_has_interruptible_tool_in_progress
             .0
@@ -12508,6 +12906,7 @@ mod tests {
                 None,
                 &crate::tool::InteractivePermissionSink::default(),
                 &has_interruptible_tool_in_progress,
+                &crate::tool::SetInProgressToolUseIds::default(),
                 &thinking,
                 shell_context_seed.clone(),
             );
@@ -12563,6 +12962,7 @@ mod tests {
                 None,
                 &crate::tool::InteractivePermissionSink::default(),
                 &has_interruptible_tool_in_progress,
+                &crate::tool::SetInProgressToolUseIds::default(),
                 &thinking,
                 shell_context_seed.clone(),
             );
@@ -12947,7 +13347,6 @@ mod tests {
                                 false,
                                 cols,
                                 rows,
-                                None,
                                 ClassifierApprovalsState::default(),
                                 StatusNoticeContext::default(),
                                 None,
@@ -13168,12 +13567,12 @@ mod tests {
             action: Some("command:help".to_string()),
             context: crate::keybindings::types::ContextName::Chat,
         });
-        let runtime = crate::keybindings::keybinding_context::KeybindingRuntime::new(bindings);
+        // The REPL mounts its own KeybindingSetup, which loads the bindings
+        // as a `keybindings.json` would supply them.
+        crate::keybindings::load_user_bindings::set_cached_keybindings_for_testing(bindings);
         element! {
-            ContextProvider(value: Context::owned(runtime)) {
-                ContextProvider(value: Context::owned(current_theme)) {
-                    IsolatedAuthRepl
-                }
+            ContextProvider(value: Context::owned(current_theme)) {
+                IsolatedAuthRepl
             }
         }
     }
@@ -13309,11 +13708,8 @@ mod tests {
     fn rewind_composer_matches_official_restore_and_edited_remount() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _checkpointing = crate::utils::env_utils::EnvVarGuard::set(
-            "CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING",
-            "0",
-        );
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _checkpointing = EnvVarGuard::set("CLAUDE_CODE_DISABLE_FILE_CHECKPOINTING", "0");
         let entries = vec![
             json!({"type":"user","uuid":"rewind-first","timestamp":"2026-07-12T00:00:00.000Z","message":{"role":"user","content":"first prompt"}}),
             json!({"type":"user","uuid":"rewind-second","timestamp":"2026-07-12T00:00:01.000Z","message":{"role":"user","content":"<ide_selection>noise</ide_selection>\n<code>second</code>"}}),
@@ -13409,8 +13805,8 @@ mod tests {
     fn transcript_keybindings_toggle_cap_expand_and_return_to_prompt_matches_official_identity() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _fullscreen = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _fullscreen = EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
         let prompt_path = "identity-fixture/verbose-only.rs";
         let absolute_path = crate::bootstrap::state::get_original_cwd()
             .join(prompt_path)
@@ -13564,6 +13960,89 @@ mod tests {
         assert!(text.contains("Authorize docs"), "canvas=\n{text}");
     }
 
+    // A dialog arriving and leaving must be a child added to and removed from
+    // the REPL's one tree, as in CC (REPL.tsx:6134 wraps every dialog slot in
+    // MCPConnectionManager). The REPL used to return a separate tree for each
+    // dialog, which unmounted the manager — aborting its connection work — and
+    // remounted the whole transcript on the way in and again on the way out.
+    #[component]
+    fn ReplDialogRemountHarness(mut hooks: Hooks) -> impl Into<AnyElement<'static>> {
+        let mut system = hooks.use_context_mut::<SystemContext>();
+        let current_theme = *theme::current();
+        let store = hooks.use_state(|| {
+            crate::state::store::AppStore::new(
+                crate::state::app_state_store::AppState::default(),
+                None,
+            )
+        });
+        let phase = hooks.use_state(|| 0u8);
+        let store_for_future = store.read().clone();
+        let mut phase_for_future = phase;
+        hooks.use_future(async move {
+            futures_timer::Delay::new(Duration::from_millis(300)).await;
+            store_for_future.replace_with(|app| {
+                app.elicitation =
+                    std::sync::Arc::new(crate::state::app_state_store::ElicitationState {
+                        queue: vec![
+                            crate::services::mcp::elicitation_handler::ElicitationRequestEvent::new(
+                                "docs",
+                                "request-1",
+                                crate::services::mcp::elicitation_handler::ElicitationRequestParams::Url {
+                                    message: "Authorize docs".to_string(),
+                                    url: "https://example.com/auth".to_string(),
+                                    elicitation_id: Some("elicit-1".to_string()),
+                                },
+                            ),
+                        ],
+                    });
+            });
+            phase_for_future.set(1);
+            futures_timer::Delay::new(Duration::from_millis(300)).await;
+            store_for_future.replace_with(|app| {
+                app.elicitation =
+                    std::sync::Arc::new(crate::state::app_state_store::ElicitationState {
+                        queue: Vec::new(),
+                    });
+            });
+            phase_for_future.set(2);
+            futures_timer::Delay::new(Duration::from_millis(300)).await;
+            phase_for_future.set(3);
+        });
+        if phase.get() == 3 {
+            system.exit();
+        }
+        element! {
+            ContextProvider(value: Context::owned(current_theme)) {
+                IsolatedAuthRepl(app_store: Some(store.read().clone()))
+            }
+        }
+    }
+
+    #[test]
+    fn repl_dialog_coming_and_going_does_not_remount_the_mcp_connection_manager() {
+        crate::utils::process_runtime::initialize_test_process_runtime();
+        let canvases = futures::executor::block_on(
+            element!(ReplDialogRemountHarness)
+                .mock_terminal_render_loop(MockTerminalConfig::default().with_size(120, 30))
+                .collect::<Vec<_>>(),
+        );
+        let texts: Vec<String> = canvases.iter().map(|canvas| canvas.to_string()).collect();
+        assert!(
+            texts.iter().any(|text| text.contains("Authorize docs")),
+            "the elicitation dialog never rendered"
+        );
+        assert!(
+            !texts.last().expect("frames").contains("Authorize docs"),
+            "the dialog should be gone once its queue is empty"
+        );
+        assert_eq!(
+            crate::services::mcp::mcp_connection_manager::MOUNTS
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "MCPConnectionManager must stay mounted while a dialog comes and goes"
+        );
+    }
+
     #[derive(Default, Props)]
     struct ReplStartupDialogHarnessProps {
         snapshot: ReplStartupDialogSnapshot,
@@ -13632,7 +14111,6 @@ mod tests {
                                 false,
                                 cols,
                                 rows,
-                                None,
                                 ClassifierApprovalsState::default(),
                                 StatusNoticeContext::default(),
                                 None,
@@ -13730,8 +14208,8 @@ mod tests {
         }
     }
 
-    fn env_lock() -> &'static crate::utils::env_utils::TestEnvLock {
-        &crate::utils::env_utils::TEST_ENV_LOCK
+    fn env_lock() -> &'static TestEnvLock {
+        &TEST_ENV_LOCK
     }
 
     struct OriginalCwdGuard {
@@ -13809,6 +14287,92 @@ mod tests {
             .map(|ch| key(KeyCode::Char(ch)))
             .chain(std::iter::once(key(KeyCode::Enter)))
             .collect()
+    }
+
+    /// One step of an event-driven REPL script: wait until a frame rendered
+    /// after the previous step's input contains every `wait_for` needle (an
+    /// empty list waits for any such frame), then send `send`.
+    struct ReplScriptStep {
+        wait_for: Vec<String>,
+        send: Vec<TerminalEvent>,
+    }
+
+    fn script_step(wait_for: &[&str], send: Vec<TerminalEvent>) -> ReplScriptStep {
+        ReplScriptStep {
+            wait_for: wait_for.iter().map(|needle| needle.to_string()).collect(),
+            send,
+        }
+    }
+
+    /// Drives `app` through `steps`, sending each step's input only once the
+    /// UI it targets is on screen, then collects the frames the last input
+    /// settles into. Unlike a `timed_stream` script, input can never race
+    /// ahead of an asynchronously mounted view (an Enter sent before a picker
+    /// finishes loading is consumed by whatever else is focused), so the
+    /// script holds under any load. End each script with a step whose
+    /// `wait_for` names the expected final state and whose `send` is empty.
+    fn run_repl_script(mut app: AnyElement<'static>, steps: Vec<ReplScriptStep>) -> Vec<Canvas> {
+        // Generous: only reached when the awaited state never renders.
+        const STEP_BUDGET: Duration = Duration::from_secs(15);
+        const SETTLE: Duration = Duration::from_millis(300);
+        const MAX_FRAMES: usize = 400;
+        let render_frames = |canvases: &[Canvas]| {
+            canvases
+                .iter()
+                .map(canvas_lines)
+                .map(|lines| lines.join("\n"))
+                .collect::<Vec<_>>()
+                .join("\n--- frame ---\n")
+        };
+        futures::executor::block_on(async {
+            let (event_tx, event_rx) = futures::channel::mpsc::unbounded::<TerminalEvent>();
+            let mut render_loop =
+                Box::pin(app.mock_terminal_render_loop(MockTerminalConfig::with_events(event_rx)));
+            let mut canvases: Vec<Canvas> = Vec::new();
+            let mut since = 0usize;
+            for (index, step) in steps.into_iter().enumerate() {
+                let deadline = std::time::Instant::now() + STEP_BUDGET;
+                while !canvases[since..].iter().any(|canvas| {
+                    let text = canvas_lines(canvas).join("\n");
+                    step.wait_for.iter().all(|needle| text.contains(needle.as_str()))
+                }) {
+                    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                    let next = if remaining.is_zero() || canvases.len() >= MAX_FRAMES {
+                        None
+                    } else {
+                        crate::utils::race(render_loop.next(), async move {
+                            futures_timer::Delay::new(remaining).await;
+                            None
+                        })
+                        .await
+                    };
+                    let Some(canvas) = next else {
+                        panic!(
+                            "script step {index} never rendered {:?}; frames=\n{}",
+                            step.wait_for,
+                            render_frames(&canvases)
+                        );
+                    };
+                    canvases.push(canvas);
+                }
+                since = canvases.len();
+                for event in step.send {
+                    let _ = event_tx.unbounded_send(event);
+                }
+            }
+            while canvases.len() < MAX_FRAMES {
+                let next = crate::utils::race(render_loop.next(), async {
+                    futures_timer::Delay::new(SETTLE).await;
+                    None
+                })
+                .await;
+                let Some(canvas) = next else {
+                    break;
+                };
+                canvases.push(canvas);
+            }
+            canvases
+        })
     }
 
     fn collect_repl_canvases<S>(events: S, timeout_ms: u64, max_frames: usize) -> Vec<Canvas>
@@ -14274,7 +14838,7 @@ mod tests {
         // Immediate completion schedules a notification on the same process
         // runtime that main publishes before mounting the actual REPL.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _no_flicker = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
+        let _no_flicker = EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
         let observer = PluginCompletionObserver::default();
         futures::executor::block_on(async {
             let mut app = element! { ContextProvider(value: Context::owned(observer.clone())) { ReplHarness } };
@@ -14690,8 +15254,8 @@ mod tests {
     }
 
     struct KeybindingsTestEnv {
-        config_dir: Option<crate::utils::env_utils::EnvVarGuard>,
-        write_enabled: Option<crate::utils::env_utils::EnvVarGuard>,
+        config_dir: Option<EnvVarGuard>,
+        write_enabled: Option<EnvVarGuard>,
         root: std::path::PathBuf,
     }
 
@@ -14707,14 +15271,8 @@ mod tests {
 
     fn install_keybindings_test_env(root: std::path::PathBuf) -> KeybindingsTestEnv {
         let restore = KeybindingsTestEnv {
-            config_dir: Some(crate::utils::env_utils::EnvVarGuard::set(
-                "CLAUDE_CONFIG_DIR",
-                &root,
-            )),
-            write_enabled: Some(crate::utils::env_utils::EnvVarGuard::set(
-                "COMETIX_WRITE_ENABLED",
-                "1",
-            )),
+            config_dir: Some(EnvVarGuard::set("CLAUDE_CONFIG_DIR", &root)),
+            write_enabled: Some(EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1")),
             root: root.clone(),
         };
         crate::utils::config::clear_global_config_cache_for_testing();
@@ -14760,7 +15318,7 @@ mod tests {
     #[test]
     fn repl_keybindings_creates_official_template_off_frame_and_restores_prompt() {
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-repl-keybindings-{}", uuid::Uuid::new_v4()));
         let _restore = install_keybindings_test_env(root.clone());
@@ -14795,7 +15353,7 @@ mod tests {
     fn repl_stats_loads_real_transcript_aggregates_off_frame() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-repl-stats-{}", uuid::Uuid::new_v4()));
         write_stats_fixture(&root);
@@ -14816,20 +15374,30 @@ mod tests {
     fn repl_stats_escape_appends_official_system_display_result_and_restores_prompt() {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _env_lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let root =
             std::env::temp_dir().join(format!("cometix-repl-stats-{}", uuid::Uuid::new_v4()));
         write_stats_fixture(&root);
         let _projects = crate::utils::session_storage::set_test_projects_dir_override(&root);
         let _cache =
             crate::utils::stats_cache::set_test_stats_cache_path(root.join("stats-cache.json"));
-        let mut events = text_input_events("/stats")
-            .into_iter()
-            .map(|event| (event, 0))
-            .collect::<Vec<_>>();
-        events.push((key(KeyCode::Esc), 500));
-
-        let text = last_repl_text(timed_stream(events), 1_500, 40);
+        // Esc goes out only once the loaded panel is on screen: the stats
+        // load runs off the render thread, and an Esc that lands before the
+        // panel mounts is consumed by PromptInput instead.
+        let canvases = run_repl_script(
+            element!(ReplHarness).into_any(),
+            vec![
+                script_step(&[], text_input_events("/stats")),
+                script_step(&["Overview", "Esc to cancel"], vec![key(KeyCode::Esc)]),
+                script_step(&["Stats dialog dismissed"], Vec::new()),
+            ],
+        );
+        let text = canvas_lines(
+            canvases
+                .last()
+                .expect("mock render should produce a final canvas"),
+        )
+        .join("\n");
 
         assert!(text.contains("/stats"), "canvas=\n{text}");
         assert!(text.contains("Stats dialog dismissed"), "canvas=\n{text}");
@@ -15010,7 +15578,6 @@ mod tests {
             80,
             24,
             None,
-            None,
             false,
             &status_notice_context,
             None,
@@ -15026,7 +15593,6 @@ mod tests {
             true,
             80,
             24,
-            None,
             None,
             false,
             &status_notice_context,
@@ -15066,7 +15632,6 @@ mod tests {
                 true,
                 80,
                 24,
-                None,
                 None,
                 false,
                 &status_notice_context,
@@ -15113,7 +15678,6 @@ mod tests {
                 80,
                 24,
                 None,
-                None,
                 false,
                 &status_notice_context,
                 None,
@@ -15154,7 +15718,6 @@ mod tests {
                 80,
                 24,
                 None,
-                None,
                 false,
                 &status_notice_context,
                 None,
@@ -15168,6 +15731,136 @@ mod tests {
         assert_ne!(key(&["Bash", "Read"]), key(&["Bash"]));
         // CC compares position-by-position, so order is part of the identity.
         assert_ne!(key(&["Bash", "Read"]), key(&["Read", "Bash"]));
+    }
+
+    #[test]
+    fn messages_memo_key_tracks_the_theme() {
+        // React re-renders Messages' themed rows past `React.memo` when the
+        // ThemeProvider value changes; this memo must let a theme change
+        // alone through.
+        let messages = Arc::new(vec![RenderableMessage::user("u1", "hello")]);
+        let status_notice_context = StatusNoticeContext::default();
+        let key = |theme| {
+            messages_memo_key_for_screen(
+                &messages,
+                0,
+                false,
+                false,
+                true,
+                80,
+                24,
+                false,
+                0,
+                false,
+                None,
+                false,
+                &status_notice_context,
+                None,
+                Screen::Prompt,
+                false,
+                &std::collections::HashSet::new(),
+                &std::collections::HashSet::new(),
+                &[],
+                theme,
+            )
+        };
+        use crate::utils::theme::ThemeName;
+        assert_eq!(key(ThemeName::Dark), key(ThemeName::Dark));
+        assert_ne!(key(ThemeName::Dark), key(ThemeName::Light));
+    }
+
+    #[test]
+    fn streaming_preview_coalescer_writes_per_delta_in_character_mode() {
+        let mut coalescer = StreamingPreviewCoalescer::default();
+        let base = StreamingTextPreview::default;
+        let write = coalescer.push(base, "he", StreamingTextDisplayMode::Character);
+        assert_eq!(
+            write,
+            StreamingPreviewWrite::Now(StreamingTextPreview {
+                raw: "he".to_string()
+            })
+        );
+        let write = coalescer.push(base, "llo", StreamingTextDisplayMode::Character);
+        assert_eq!(
+            write,
+            StreamingPreviewWrite::Now(StreamingTextPreview {
+                raw: "hello".to_string()
+            })
+        );
+        assert!(!coalescer.armed);
+    }
+
+    #[test]
+    fn streaming_preview_coalescer_arms_once_per_flush_window_in_line_mode() {
+        let mut coalescer = StreamingPreviewCoalescer::default();
+        let base = StreamingTextPreview::default;
+        assert_eq!(
+            coalescer.push(base, "one", StreamingTextDisplayMode::Line),
+            StreamingPreviewWrite::Arm
+        );
+        assert_eq!(
+            coalescer.push(base, "\ntwo", StreamingTextDisplayMode::Line),
+            StreamingPreviewWrite::Wait
+        );
+        assert_eq!(
+            coalescer.push(base, " more", StreamingTextDisplayMode::Line),
+            StreamingPreviewWrite::Wait
+        );
+        // Timer fires: the completed line is new, so the preview is written.
+        let flushed = coalescer.flush(None).expect("a completed line appeared");
+        assert_eq!(flushed.raw, "one\ntwo more");
+        assert!(!coalescer.armed);
+        // The next delta arms again.
+        assert_eq!(
+            coalescer.push(base, " still", StreamingTextDisplayMode::Line),
+            StreamingPreviewWrite::Arm
+        );
+        // No newline arrived: the visible prefix is unchanged, no write.
+        assert_eq!(coalescer.flush(Some("one\n")), None);
+        // A newline arrives and the next flush writes again.
+        coalescer.push(base, "\n", StreamingTextDisplayMode::Line);
+        let flushed = coalescer.flush(Some("one\n")).expect("second line completed");
+        assert_eq!(flushed.raw, "one\ntwo more still\n");
+        coalescer.clear();
+        assert_eq!(coalescer.flush(None), None);
+    }
+
+    #[test]
+    fn streaming_preview_coalescer_switching_to_character_mode_writes_the_backlog() {
+        let mut coalescer = StreamingPreviewCoalescer::default();
+        let base = StreamingTextPreview::default;
+        coalescer.push(base, "a", StreamingTextDisplayMode::Line);
+        coalescer.push(base, "b", StreamingTextDisplayMode::Line);
+        // /settings flipped the mode mid-stream: the accumulated text is written now.
+        assert_eq!(
+            coalescer.push(base, "c", StreamingTextDisplayMode::Character),
+            StreamingPreviewWrite::Now(StreamingTextPreview {
+                raw: "abc".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn streaming_text_display_mode_reads_the_setting_and_reduce_motion_hides_the_preview() {
+        let mut settings = crate::utils::settings::SettingsJson::default();
+        assert_eq!(
+            streaming_text_display_mode(&settings),
+            StreamingTextDisplayMode::Character
+        );
+        settings.streaming_text_display = Some("line".to_string());
+        assert_eq!(
+            streaming_text_display_mode(&settings),
+            StreamingTextDisplayMode::Line
+        );
+        settings.streaming_text_display = Some("nonsense".to_string());
+        assert_eq!(
+            streaming_text_display_mode(&settings),
+            StreamingTextDisplayMode::Character
+        );
+        // CC REPL.tsx:1987: reduce motion hides the preview in every mode.
+        assert!(show_streaming_text(&settings));
+        settings.prefers_reduced_motion = Some(true);
+        assert!(!show_streaming_text(&settings));
     }
 
     #[test]
@@ -15194,9 +15887,96 @@ mod tests {
         );
     }
 
+    #[test]
+    fn focused_input_dialog_follows_official_priority_and_gates() {
+        use FocusedInputDialog::*;
+        let every_dialog = FocusedInputDialogInput {
+            is_exiting: false,
+            exit_flow: false,
+            is_message_selector_visible: true,
+            is_prompt_input_active: false,
+            has_sandbox_permission_request: true,
+            allow_dialogs_with_animation: true,
+            has_tool_use_confirm: true,
+            has_worker_sandbox_permission: true,
+            has_elicitation: true,
+            show_remote_callout: true,
+            has_hint_recommendation: true,
+            show_desktop_upsell_startup: true,
+        };
+
+        // CC REPL.tsx:2684-2760 order: peel the winner off one at a time.
+        let mut input = every_dialog;
+        let mut order = Vec::new();
+        while let Some(dialog) = get_focused_input_dialog(&input) {
+            order.push(dialog);
+            match dialog {
+                MessageSelector => input.is_message_selector_visible = false,
+                SandboxPermission => input.has_sandbox_permission_request = false,
+                ToolPermission => input.has_tool_use_confirm = false,
+                WorkerSandboxPermission => input.has_worker_sandbox_permission = false,
+                Elicitation => input.has_elicitation = false,
+                RemoteCallout => input.show_remote_callout = false,
+                PluginHint => input.has_hint_recommendation = false,
+                DesktopUpsell => input.show_desktop_upsell_startup = false,
+            }
+        }
+        assert_eq!(
+            order,
+            vec![
+                MessageSelector,
+                SandboxPermission,
+                ToolPermission,
+                WorkerSandboxPermission,
+                Elicitation,
+                RemoteCallout,
+                PluginHint,
+                DesktopUpsell,
+            ]
+        );
+
+        // Exit states always take precedence, even over the message selector
+        // (CC :2686 `if (isExiting || exitFlow) return undefined`).
+        let exit_flow = FocusedInputDialogInput { exit_flow: true, ..every_dialog };
+        assert_eq!(get_focused_input_dialog(&exit_flow), None);
+        let exiting = FocusedInputDialogInput { is_exiting: true, ..every_dialog };
+        assert_eq!(get_focused_input_dialog(&exiting), None);
+
+        // Typing suppresses everything below the message selector.
+        let typing = FocusedInputDialogInput {
+            is_message_selector_visible: false,
+            is_prompt_input_active: true,
+            ..every_dialog
+        };
+        assert_eq!(get_focused_input_dialog(&typing), None);
+        let typing_with_selector = FocusedInputDialogInput {
+            is_prompt_input_active: true,
+            ..every_dialog
+        };
+        assert_eq!(get_focused_input_dialog(&typing_with_selector), Some(MessageSelector));
+
+        // A local command UI (CC toolJSX without shouldContinueAnimation)
+        // blocks everything after the sandbox permission, which is not behind
+        // that gate.
+        let local_command_ui = FocusedInputDialogInput {
+            is_message_selector_visible: false,
+            allow_dialogs_with_animation: false,
+            ..every_dialog
+        };
+        assert_eq!(get_focused_input_dialog(&local_command_ui), Some(SandboxPermission));
+        let local_command_ui_no_sandbox = FocusedInputDialogInput {
+            has_sandbox_permission_request: false,
+            ..local_command_ui
+        };
+        assert_eq!(get_focused_input_dialog(&local_command_ui_no_sandbox), None);
+
+        assert_eq!(ToolPermission.as_str(), "tool-permission");
+        assert_eq!(WorkerSandboxPermission.as_str(), "worker-sandbox-permission");
+    }
+
     fn spinner_input() -> ShowSpinnerInput {
         ShowSpinnerInput {
-            tool_jsx_allows_spinner: true,
+            local_command_ui_allows_spinner: true,
             tool_use_confirm_queue_empty: true,
             prompt_queue_empty: true,
             ..Default::default()
@@ -15221,7 +16001,7 @@ mod tests {
         assert!(should_show_spinner(input));
 
         for suppress in [
-            |value: &mut ShowSpinnerInput| value.tool_jsx_allows_spinner = false,
+            |value: &mut ShowSpinnerInput| value.local_command_ui_allows_spinner = false,
             |value: &mut ShowSpinnerInput| value.tool_use_confirm_queue_empty = false,
             |value: &mut ShowSpinnerInput| value.prompt_queue_empty = false,
             |value: &mut ShowSpinnerInput| value.pending_worker_request = true,
@@ -15952,50 +16732,20 @@ mod tests {
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
         let _write_guard = EnvVarGuard::set("COMETIX_WRITE_ENABLED", &PathBuf::from("0"));
 
-        let mut events = text_input_events("/status")
-            .into_iter()
-            .map(|event| (event, 0))
-            .collect::<Vec<_>>();
-        // 300ms gap: under a saturated suite the render loop lags the event
-        // clock — Esc landing before the panel mounts means the dismissal
-        // output never appears (same class as the permissions tests).
-        events.push((key(KeyCode::Esc), 300));
-        let event_stream = stream::unfold(events.into_iter(), |mut events| async move {
-            let (event, delay_ms) = events.next()?;
-            if delay_ms > 0 {
-                futures_timer::Delay::new(Duration::from_millis(delay_ms)).await;
-            }
-            Some((event, events))
-        });
-        let canvases = futures::executor::block_on(async {
-            let mut app = element!(ReplHarness);
-            let mut render_loop = Box::pin(
-                app.mock_terminal_render_loop(MockTerminalConfig::with_events(event_stream)),
-            );
-            let mut canvases = Vec::new();
-            // Explicit settle: collect until the dismissal output lands (the
-            // terminal state this test asserts) instead of a silence window —
-            // the silence-settled collector truncates under load.
-            let deadline = std::time::Instant::now() + Duration::from_millis(10_000);
-            loop {
-                let settled = canvases
-                    .last()
-                    .map(|canvas| canvas_lines(canvas).join("\n"))
-                    .is_some_and(|text| text.contains("Status dialog dismissed"));
-                if settled || std::time::Instant::now() >= deadline {
-                    break;
-                }
-                let next = crate::utils::race(render_loop.next(), async {
-                    futures_timer::Delay::new(Duration::from_millis(100)).await;
-                    None
-                })
-                .await;
-                if let Some(canvas) = next {
-                    canvases.push(canvas);
-                }
-            }
-            canvases
-        });
+        // Esc goes out only once the Settings tab header is on screen: an Esc
+        // that lands before the panel mounts is consumed by PromptInput and
+        // the dismissal output never appears.
+        let canvases = run_repl_script(
+            element!(ReplHarness).into_any(),
+            vec![
+                script_step(&[], text_input_events("/status")),
+                script_step(
+                    &["Settings", "Status", "Config", "Usage"],
+                    vec![key(KeyCode::Esc)],
+                ),
+                script_step(&["Status dialog dismissed"], Vec::new()),
+            ],
+        );
         let rendered = canvases
             .iter()
             .map(canvas_lines)
@@ -16342,7 +17092,7 @@ mod tests {
         // open, then drive the actual REPL, command dispatcher and Workspace UI.
         // No user prompt is submitted and no model actor is started.
         let _guard = env_lock().lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _settings = IsolatedProjectSettings::pin();
         for fullscreen in [false, true] {
             let _fullscreen =
                 EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", if fullscreen { "1" } else { "0" });
@@ -16375,14 +17125,13 @@ mod tests {
                 action: Some("command:permissions".to_string()),
                 context: crate::keybindings::types::ContextName::Chat,
             });
+            // The REPL's own KeybindingSetup loads these, as a
+            // `keybindings.json` would supply them.
+            crate::keybindings::load_user_bindings::set_cached_keybindings_for_testing(bindings);
             let mut app = element! {
                 ContextProvider(value: Context::owned(probe.clone())) {
-                    ContextProvider(value: Context::owned(
-                        crate::keybindings::keybinding_context::KeybindingRuntime::new(bindings)
-                    )) {
-                        ContextProvider(value: Context::owned(*theme::current())) {
-                            IsolatedAuthRepl(app_store: Some(store.clone()))
-                        }
+                    ContextProvider(value: Context::owned(*theme::current())) {
+                        IsolatedAuthRepl(app_store: Some(store.clone()))
                     }
                 }
             };
@@ -16531,7 +17280,7 @@ mod tests {
         // PermissionRuleInput Settings binding. Exercise the real REPL command
         // mount; an isolated input lacks the other live keybinding contexts.
         let _guard = env_lock().lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _settings = IsolatedProjectSettings::pin();
         let _fullscreen = EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
         let mut app = element! {
             ContextProvider(value: Context::owned(
@@ -16592,7 +17341,7 @@ mod tests {
         // Ordinary processUserInput resumes its hook/query continuation, while
         // REPL.tsx's command shortcut ignores shouldQuery during an active query.
         let _guard = env_lock().lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _settings = IsolatedProjectSettings::pin();
         let _fullscreen = EnvVarGuard::set("CLAUDE_CODE_NO_FLICKER", "0");
         let _title = EnvVarGuard::set("CLAUDE_CODE_DISABLE_TERMINAL_TITLE", "1");
         let command = "echo permissions-retry-scout";
@@ -16631,14 +17380,13 @@ mod tests {
                 action: Some("command:permissions".into()),
                 context: crate::keybindings::types::ContextName::Chat,
             });
+            // The REPL's own KeybindingSetup loads these, as a
+            // `keybindings.json` would supply them.
+            crate::keybindings::load_user_bindings::set_cached_keybindings_for_testing(bindings);
             let mut app = element! {
                 ContextProvider(value: Context::owned(probe.clone())) {
-                    ContextProvider(value: Context::owned(
-                        crate::keybindings::keybinding_context::KeybindingRuntime::new(bindings)
-                    )) {
-                        ContextProvider(value: Context::owned(*theme::current())) {
-                            IsolatedAuthRepl(app_store: Some(store.clone()))
-                        }
+                    ContextProvider(value: Context::owned(*theme::current())) {
+                        IsolatedAuthRepl(app_store: Some(store.clone()))
                     }
                 }
             };
@@ -16775,7 +17523,21 @@ mod tests {
         );
         let _write_guard = EnvVarGuard::unset("COMETIX_WRITE_ENABLED");
 
-        let text = last_repl_text(stream::iter(text_input_events("/resume")), 200, 40);
+        // The picker loads on worker threads now (CC awaits it), so wait for
+        // the onDone output instead of an idle window the load can outlast.
+        let canvases = run_repl_script(
+            element!(ReplHarness).into_any(),
+            vec![
+                script_step(&[], text_input_events("/resume")),
+                script_step(&["No conversations found to resume"], Vec::new()),
+            ],
+        );
+        let text = canvas_lines(
+            canvases
+                .last()
+                .expect("mock render should produce a final canvas"),
+        )
+        .join("\n");
         let _ = std::fs::remove_dir_all(&config_home);
 
         assert!(
@@ -16826,12 +17588,16 @@ mod tests {
         let before = std::fs::read_to_string(&session_file)
             .expect("session fixture should be readable before resume");
 
-        let mut events = text_input_events("/resume")
-            .into_iter()
-            .map(|event| (event, 0))
-            .collect::<Vec<_>>();
-        events.push((key(KeyCode::Enter), 250));
-        let canvases = collect_repl_canvases(timed_stream(events), 250, 80);
+        let focused_fixture = format!("❯ {prompt_text}");
+        let canvases = run_repl_script(
+            element!(ReplHarness).into_any(),
+            vec![
+                script_step(&[], text_input_events("/resume")),
+                // Enter only once the loaded picker has the fixture focused.
+                script_step(&["Resume Session", &focused_fixture], vec![key(KeyCode::Enter)]),
+                script_step(&[assistant_text], Vec::new()),
+            ],
+        );
         let rendered = canvases
             .iter()
             .map(canvas_lines)
@@ -16895,12 +17661,16 @@ mod tests {
         let before = std::fs::read_to_string(&session_file)
             .expect("empty session fixture should be readable before picker selection");
 
-        let mut events = text_input_events("/resume")
-            .into_iter()
-            .map(|event| (event, 0))
-            .collect::<Vec<_>>();
-        events.push((key(KeyCode::Enter), 250));
-        let canvases = collect_repl_canvases(timed_stream(events), 250, 80);
+        let canvases = run_repl_script(
+            element!(ReplHarness).into_any(),
+            vec![
+                script_step(&[], text_input_events("/resume")),
+                // The picker only mounts once loading finished, with the lone
+                // fixture focused.
+                script_step(&["Resume Session"], vec![key(KeyCode::Enter)]),
+                script_step(&["Failed to resume"], Vec::new()),
+            ],
+        );
         let rendered = canvases
             .iter()
             .map(canvas_lines)
@@ -16955,7 +17725,7 @@ mod tests {
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
         // The fixture encodes the process cwd; the lookup reads the project
         // dir — pin them to the same root.
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let config_home =
             std::env::temp_dir().join(format!("cometix-repl-resume-id-{}", Uuid::new_v4()));
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
@@ -17010,7 +17780,7 @@ mod tests {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let config_home =
             std::env::temp_dir().join(format!("cometix-repl-resume-title-{}", Uuid::new_v4()));
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
@@ -17072,7 +17842,7 @@ mod tests {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let config_home = std::env::temp_dir().join(format!(
             "cometix-repl-resume-title-ambiguous-{}",
             Uuid::new_v4()
@@ -17160,7 +17930,7 @@ mod tests {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
-        let _project_dir = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project_dir = PinnedProjectDir::at_manifest_root();
         let config_home =
             std::env::temp_dir().join(format!("cometix-repl-resume-missing-{}", Uuid::new_v4()));
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
@@ -17254,18 +18024,21 @@ mod tests {
         let current_before = std::fs::read_to_string(&current_file)
             .expect("current session fixture should be readable before resume");
 
-        let mut events = text_input_events("/resume")
-            .into_iter()
-            .map(|event| (event, 0))
-            .collect::<Vec<_>>();
-        events.push((key(KeyCode::Enter), 250));
-        let mut reopen_events = text_input_events("/resume");
-        if let Some(first) = reopen_events.first_mut() {
-            events.push((first.clone(), 500));
-            events.extend(reopen_events.into_iter().skip(1).map(|event| (event, 0)));
-        }
-
-        let canvases = collect_repl_canvases(timed_stream(events), 500, 120);
+        // Newest first: the restored-to-be current session is the focused row.
+        let focused_current = format!("❯ {current_prompt}");
+        let canvases = run_repl_script(
+            element!(ReplHarness).into_any(),
+            vec![
+                script_step(&[], text_input_events("/resume")),
+                script_step(&["Resume Session", &focused_current], vec![key(KeyCode::Enter)]),
+                // Reopen only after the selection restored the transcript.
+                script_step(
+                    &["restored current session assistant reply"],
+                    text_input_events("/resume"),
+                ),
+                script_step(&["Resume Session", older_prompt], Vec::new()),
+            ],
+        );
         let rendered = canvases
             .iter()
             .map(canvas_lines)
@@ -17318,10 +18091,16 @@ mod tests {
 
     #[test]
     fn resume_cross_project_selection_appends_official_on_done_output_without_restoring() {
+        // iocraft reads the session's terminal from the OS environment.
+        if !in_child_process(
+            module_path!(),
+            "resume_cross_project_selection_appends_official_on_done_output_without_restoring",
+            CLIPBOARD_OFF_SYSTEM,
+        ) {
+            return;
+        }
         let _guard = env_lock().lock().expect("env lock should not be poisoned");
         crate::utils::process_runtime::initialize_test_process_runtime();
-        let _ssh = EnvVarGuard::set("SSH_CONNECTION", "fixture");
-        let _tmux = EnvVarGuard::unset("TMUX");
         let config_home =
             std::env::temp_dir().join(format!("cometix-repl-resume-cross-{}", Uuid::new_v4()));
         let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
@@ -17357,42 +18136,39 @@ mod tests {
         let other_before = std::fs::read_to_string(&other_file)
             .expect("cross project fixture should be readable before resume");
 
-        let mut events = text_input_events("/resume")
-            .into_iter()
-            .map(|event| (event, 0))
-            .collect::<Vec<_>>();
-        events.push((ctrl_key('a'), 250));
-        events.extend(other_prompt.chars().map(|ch| (key(KeyCode::Char(ch)), 5)));
-        events.push((key(KeyCode::Down), 250));
-        events.push((key(KeyCode::Down), 250));
-        events.push((key(KeyCode::Enter), 1_000));
-
         // Match the retained production root's imported clipboard executor;
         // SSH + no tmux exercises OSC without touching the system clipboard.
-        let canvases = futures::executor::block_on(async {
-            let app = element! { ReplHarness };
-            let mut app = element! {
-                ContextProvider(value: Context::owned(iocraft::Clipboard::new(Arc::new(crate::utils::exec_file_no_throw::ExecFileClipboardBackend)))) { #(app) }
-            };
-            let mut frames = Box::pin(
-                app.mock_terminal_render_loop(MockTerminalConfig::with_events(timed_stream(
-                    events,
-                ))),
-            );
-            let mut canvases = Vec::new();
-            while canvases.len() < 100 {
-                let next = crate::utils::race(frames.next(), async {
-                    futures_timer::Delay::new(Duration::from_millis(1_500)).await;
-                    None
-                })
-                .await;
-                let Some(canvas) = next else {
-                    break;
-                };
-                canvases.push(canvas);
-            }
-            canvases
-        });
+        let app = element! { ReplHarness };
+        let app = element! {
+            ContextProvider(value: Context::owned(iocraft::Clipboard::new(Arc::new(crate::utils::exec_file_no_throw::ExecFileClipboardBackend)))) { #(app) }
+        };
+        let search_query = format!("⌕ {other_prompt}");
+        let focused_other = format!("❯ {other_prompt}");
+        let canvases = run_repl_script(
+            app.into_any(),
+            vec![
+                script_step(&[], text_input_events("/resume")),
+                script_step(
+                    &["Resume Session", "current project resume prompt"],
+                    vec![ctrl_key('a')],
+                ),
+                // The all-projects reload has landed once the other project's
+                // session is listed; only then type the search.
+                script_step(
+                    &["Resume Session", &other_prompt],
+                    other_prompt.chars().map(|ch| key(KeyCode::Char(ch))).collect(),
+                ),
+                script_step(
+                    &[&search_query],
+                    vec![key(KeyCode::Down), key(KeyCode::Down)],
+                ),
+                script_step(&[&focused_other], vec![key(KeyCode::Enter)]),
+                script_step(
+                    &["This conversation is from a different directory."],
+                    Vec::new(),
+                ),
+            ],
+        );
         let rendered = canvases
             .iter()
             .map(canvas_lines)
@@ -17539,8 +18315,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn resume_pending_clipboard_matches_official_restore_first_settlement() {
+        // iocraft reads the session's terminal from the OS environment.
+        if !in_child_process(
+            module_path!(),
+            "resume_pending_clipboard_matches_official_restore_first_settlement",
+            &[
+                ("SSH_CONNECTION", Some("fixture")),
+                ("TMUX", Some("fixture")),
+            ],
+        ) {
+            return;
+        }
         let _guard = env_lock().lock().unwrap();
-        let _project = crate::utils::env_utils::PinnedProjectDir::at_manifest_root();
+        let _project = PinnedProjectDir::at_manifest_root();
         crate::utils::process_runtime::initialize_test_process_runtime();
         for fail_restore in [false, true] {
             let directory =
@@ -17551,8 +18338,6 @@ mod tests {
                 directory.join("projects"),
             );
             let _write = EnvVarGuard::unset("COMETIX_WRITE_ENABLED");
-            let _ssh = EnvVarGuard::set("SSH_CONNECTION", "fixture");
-            let _tmux = EnvVarGuard::set("TMUX", "fixture");
             let clipboard_input = Arc::new(std::sync::Mutex::new(None));
             let clipboard_finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (release_clipboard, clipboard_completion) = futures::channel::oneshot::channel();
@@ -17609,9 +18394,32 @@ mod tests {
                     for event in text_input_events("/resume") {
                         sender.send(event).await.unwrap();
                     }
-                    futures_timer::Delay::new(Duration::from_millis(250)).await;
+                    // Both picker loads run on worker threads (CC awaits
+                    // them), so gate each key on the view it targets instead
+                    // of a fixed sleep the load can outlast.
+                    for _ in 0..1500 {
+                        if frames
+                            .lock()
+                            .unwrap()
+                            .last()
+                            .is_some_and(|text| text.contains("Resume Session"))
+                        {
+                            break;
+                        }
+                        futures_timer::Delay::new(Duration::from_millis(10)).await;
+                    }
                     sender.send(ctrl_key('a')).await.unwrap();
-                    futures_timer::Delay::new(Duration::from_millis(200)).await;
+                    // The all-projects reload has landed once the newest row —
+                    // the other project's session — is listed and focused.
+                    for _ in 0..1500 {
+                        if frames.lock().unwrap().last().is_some_and(|text| {
+                            text.lines()
+                                .any(|line| line.trim() == "❯ newest cross-project target")
+                        }) {
+                            break;
+                        }
+                        futures_timer::Delay::new(Duration::from_millis(10)).await;
+                    }
                     sender.send(key(KeyCode::Enter)).await.unwrap();
                     for _ in 0..100 {
                         if clipboard_input.lock().unwrap().is_some() {
@@ -17854,10 +18662,10 @@ mod tests {
 
     #[test]
     fn terminal_setup_uses_official_on_done_null_transcript_path_without_panel() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _terminal = crate::utils::env_utils::EnvVarGuard::set("TERM", "xterm-kitty");
-        let _cursor = crate::utils::env_utils::EnvVarGuard::unset("CURSOR_TRACE_ID");
-        let _askpass = crate::utils::env_utils::EnvVarGuard::unset("VSCODE_GIT_ASKPASS_MAIN");
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _terminal = EnvVarGuard::set("TERM", "xterm-kitty");
+        let _cursor = EnvVarGuard::unset("CURSOR_TRACE_ID");
+        let _askpass = EnvVarGuard::unset("VSCODE_GIT_ASKPASS_MAIN");
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let _runtime = runtime.enter();
         let text = last_repl_text_waiting_for(
@@ -17889,8 +18697,7 @@ mod tests {
 
     #[test]
     fn terminal_setup_matches_official_live_installer_receipt_and_file() {
-        use crate::utils::env_utils::EnvVarGuard;
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!("terminal-command-{}", uuid::Uuid::new_v4()));
         let fixture = install_keybindings_test_env(root.clone());
         let _vars = [
@@ -17898,6 +18705,8 @@ mod tests {
             EnvVarGuard::set("TERM_PROGRAM", "alacritty"),
             EnvVarGuard::unset("CURSOR_TRACE_ID"),
             EnvVarGuard::unset("VSCODE_GIT_ASKPASS_MAIN"),
+            // A host IDE's bundle ID would be detected before TERM_PROGRAM.
+            EnvVarGuard::unset("__CFBundleIdentifier"),
             EnvVarGuard::set("XDG_CONFIG_HOME", root.join("xdg")),
         ];
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -18075,8 +18884,8 @@ mod tests {
         crate::utils::process_runtime::initialize_test_process_runtime();
         // Submitting now awaits the UserPromptSubmit hooks, and this repository
         // configures one; without the pin the render would try to spawn it.
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
+        let _settings = IsolatedProjectSettings::pin();
         let event_stream = stream::iter(text_input_events("hello during query"));
         let canvases = collect_repl_spinner_owner_canvases(event_stream, 80, 12);
         let rendered = canvases
@@ -18175,7 +18984,7 @@ mod tests {
         // Mirror the process runtime published by the production entrypoint.
         crate::utils::process_runtime::initialize_test_process_runtime();
         let _lock = env_lock().lock().unwrap();
-        let _settings = crate::utils::env_utils::IsolatedProjectSettings::pin();
+        let _settings = IsolatedProjectSettings::pin();
         let before_session = crate::bootstrap::state::get_session_id();
         let permission = crate::utils::permissions::permission_update::apply_permission_update(
             &ToolPermissionContext::default(),
@@ -18238,10 +19047,10 @@ mod tests {
     fn hot_resume_matches_official_hook_identity_cache_and_no_early_write() {
         // REPL.tsx:2398-2452,2478-2510: hooks precede switch; restoreReadFileState
         // consumes messages+hooks with log.projectPath, and no separate hook write.
-        let _env = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env = TEST_ENV_LOCK.lock().unwrap();
         let temp = BranchFixtureDirectory::new();
         let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", temp.path().join("config"));
-        let _project = crate::utils::env_utils::PinnedProjectDir::at(temp.path());
+        let _project = PinnedProjectDir::at(temp.path());
         let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
         let _simple = EnvVarGuard::unset("CLAUDE_CODE_SIMPLE");
         let _remote = EnvVarGuard::set("CLAUDE_CODE_ENVIRONMENT_KIND", "byoc");

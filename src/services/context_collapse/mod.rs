@@ -24,13 +24,12 @@ pub struct ContextCollapseOverflowRecovery {
 /// Maps to: CC `services/contextCollapse/index.ts` `isContextCollapseEnabled()`.
 pub fn is_context_collapse_enabled() -> bool {
     crate::utils::env_utils::is_env_truthy(
-        std::env::var("COMETIX_CONTEXT_COLLAPSE").ok().as_deref(),
+        crate::utils::process_env::var("COMETIX_CONTEXT_COLLAPSE").as_deref(),
     ) || crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_CONTEXT_COLLAPSE")
-            .ok()
+        crate::utils::process_env::var("CLAUDE_CODE_CONTEXT_COLLAPSE")
             .as_deref(),
     ) || crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CONTEXT_COLLAPSE").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CONTEXT_COLLAPSE").as_deref(),
     )
 }
 
@@ -92,10 +91,11 @@ mod tests {
     use super::*;
     use crate::tool::ToolPermissionContext;
     use crate::tool::ToolUseContext;
+    use crate::utils::test_env::TEST_ENV_LOCK;
 
     #[test]
     fn context_collapse_enabled_honors_official_env_alias() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::remove("COMETIX_CONTEXT_COLLAPSE");
         crate::utils::process_env::remove("CLAUDE_CODE_CONTEXT_COLLAPSE");
         crate::utils::process_env::remove("CLAUDE_CONTEXT_COLLAPSE");
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn withheld_prompt_too_long_and_recover_overflow_are_safe_noops_until_store_is_ported() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         crate::utils::process_env::set("CLAUDE_CONTEXT_COLLAPSE", "1");
         let error = crate::types::message::SystemApiErrorMessage {
             content: crate::services::api::errors::PROMPT_TOO_LONG_ERROR_MESSAGE.to_string(),

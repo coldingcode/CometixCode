@@ -15,6 +15,7 @@ use crate::utils::auth_file_descriptor::{
 };
 use crate::utils::config::{GlobalConfig, normalize_api_key_for_config};
 use crate::utils::env_utils::is_running_on_homespace;
+use crate::utils::process_env::JsTruthy;
 use crate::utils::settings::constants::SettingSource;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -168,13 +169,13 @@ fn env_value(get_env: &impl Fn(&str) -> Option<String>, key: &str) -> Option<Str
     // JavaScript `process.env[key]` truthiness rejects only the empty string;
     // callers that parse booleans or numbers apply their own source-defined
     // whitespace handling. Credential bytes must remain unmodified.
-    get_env(key).filter(|value| !value.is_empty())
+    get_env(key).truthy()
 }
 
 /// Maps to: CC `utils/auth.ts:88-96` `isManagedOAuthContext`.
 fn is_managed_oauth_context() -> bool {
-    crate::utils::env_utils::is_env_truthy(std::env::var("CLAUDE_CODE_REMOTE").ok().as_deref())
-        || std::env::var("CLAUDE_CODE_ENTRYPOINT").ok().as_deref() == Some("claude-desktop")
+    crate::utils::env_utils::is_env_truthy(crate::utils::process_env::var("CLAUDE_CODE_REMOTE").as_deref())
+        || crate::utils::process_env::var("CLAUDE_CODE_ENTRYPOINT").as_deref() == Some("claude-desktop")
 }
 
 /// Maps to: CC `utils/auth.ts:355-363` `getConfiguredApiKeyHelper`.
@@ -230,9 +231,7 @@ static API_KEY_HELPER_STATE: LazyLock<Mutex<ApiKeyHelperState>> =
 
 /// Maps to: CC `utils/auth.ts:435-452` `calculateApiKeyHelperTTL`.
 pub fn calculate_api_key_helper_ttl() -> u64 {
-    if let Some(raw) = std::env::var("CLAUDE_CODE_API_KEY_HELPER_TTL_MS")
-        .ok()
-        .filter(|value| !value.is_empty())
+    if let Some(raw) = crate::utils::process_env::var("CLAUDE_CODE_API_KEY_HELPER_TTL_MS").truthy()
     {
         if let Ok(parsed) = raw.parse::<u64>() {
             return parsed;
@@ -263,19 +262,20 @@ fn execute_api_key_helper_command(
         return Ok(None);
     }
     record_auth_io(AuthIoOperation::ApiKeyHelperSubprocess);
-    let mut child = if cfg!(target_os = "windows") {
-        std::process::Command::new("cmd")
-            .args(["/C", command])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?
+    // CC execa `shell: true` (auth.ts:558-559): `/bin/sh` off Windows.
+    let (shell, shell_flag) = if cfg!(target_os = "windows") {
+        ("cmd", "/C")
     } else {
-        std::process::Command::new("sh")
-            .args(["-c", command])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?
+        ("/bin/sh", "-c")
     };
+    let mut helper = std::process::Command::new(shell);
+    // CC inherits process.env (execa default env); the carrier is its counterpart.
+    crate::utils::subprocess_env::apply_process_env_std(&mut helper);
+    let mut child = helper
+        .args([shell_flag, command])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -498,7 +498,10 @@ pub fn get_api_key_from_config_or_macos_keychain() -> Option<AnthropicApiKeyWith
                 #[cfg(not(test))]
                 let value = {
                     record_auth_io(AuthIoOperation::KeychainSubprocess);
-                    std::process::Command::new("security")
+                    let mut security = std::process::Command::new("security");
+                    // CC passes `env: process.env` (execSyncWithDefaults_DEPRECATED); the carrier is its counterpart.
+                    crate::utils::subprocess_env::apply_process_env_std(&mut security);
+                    security
                         .args([
                             "find-generic-password",
                             "-a",
@@ -699,10 +702,7 @@ pub fn get_claude_ai_oauth_tokens() -> Option<ClaudeAiOAuthTokensSnapshot> {
     if crate::utils::env_utils::is_bare_mode() {
         return None;
     }
-    if let Some(access_token) = std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-        .ok()
-        .filter(|token| !token.is_empty())
-    {
+    if let Some(access_token) = crate::utils::process_env::var("CLAUDE_CODE_OAUTH_TOKEN").truthy() {
         return Some(ClaudeAiOAuthTokensSnapshot {
             access_token,
             refresh_token: None,
@@ -882,9 +882,9 @@ pub fn get_auth_token_source() -> AuthTokenSourceStatus {
         };
     }
 
-    if std::env::var("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .is_some_and(|token| !token.is_empty())
+    if crate::utils::process_env::var("ANTHROPIC_AUTH_TOKEN")
+        .truthy()
+        .is_some()
         && !is_managed_oauth_context()
     {
         return AuthTokenSourceStatus {
@@ -893,9 +893,9 @@ pub fn get_auth_token_source() -> AuthTokenSourceStatus {
         };
     }
 
-    if std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-        .ok()
-        .is_some_and(|token| !token.is_empty())
+    if crate::utils::process_env::var("CLAUDE_CODE_OAUTH_TOKEN")
+        .truthy()
+        .is_some()
     {
         return AuthTokenSourceStatus {
             source: AuthTokenSource::ClaudeCodeOauthToken,
@@ -905,7 +905,11 @@ pub fn get_auth_token_source() -> AuthTokenSourceStatus {
 
     if get_oauth_token_from_file_descriptor().is_some() {
         return AuthTokenSourceStatus {
-            source: if std::env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR").is_some() {
+            source: if crate::utils::process_env::var_os("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR")
+                .as_deref()
+                .truthy()
+                .is_some()
+            {
                 AuthTokenSource::ClaudeCodeOauthTokenFileDescriptor
             } else {
                 AuthTokenSource::CcrOauthTokenFile
@@ -967,7 +971,7 @@ pub fn get_anthropic_api_key_with_source(
     opts: GetAnthropicApiKeyOptions,
 ) -> AnthropicApiKeyWithSource {
     let config = crate::utils::config::load_global_config();
-    let get_env = |key: &str| std::env::var(key).ok();
+    let get_env = |key: &str| crate::utils::process_env::var(key);
     if crate::utils::env_utils::is_bare_mode() {
         if let Some(api_key) = env_value(&get_env, "ANTHROPIC_API_KEY") {
             return AnthropicApiKeyWithSource {
@@ -1071,29 +1075,29 @@ pub fn is_anthropic_auth_enabled() -> bool {
         return false;
     }
 
-    if std::env::var("ANTHROPIC_UNIX_SOCKET")
-        .ok()
-        .is_some_and(|value| !value.is_empty())
+    if crate::utils::process_env::var("ANTHROPIC_UNIX_SOCKET")
+        .truthy()
+        .is_some()
     {
-        return std::env::var("CLAUDE_CODE_OAUTH_TOKEN")
-            .ok()
-            .is_some_and(|value| !value.is_empty());
+        return crate::utils::process_env::var("CLAUDE_CODE_OAUTH_TOKEN")
+            .truthy()
+            .is_some();
     }
 
     let is_3p = crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_USE_BEDROCK").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_USE_BEDROCK").as_deref(),
     ) || crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_USE_VERTEX").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_USE_VERTEX").as_deref(),
     ) || crate::utils::env_utils::is_env_truthy(
-        std::env::var("CLAUDE_CODE_USE_FOUNDRY").ok().as_deref(),
+        crate::utils::process_env::var("CLAUDE_CODE_USE_FOUNDRY").as_deref(),
     );
-    let has_external_auth_token = std::env::var("ANTHROPIC_AUTH_TOKEN")
-        .ok()
-        .is_some_and(|value| !value.is_empty())
+    let has_external_auth_token = crate::utils::process_env::var("ANTHROPIC_AUTH_TOKEN")
+        .truthy()
+        .is_some()
         || get_configured_api_key_helper().is_some()
-        || std::env::var("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR")
-            .ok()
-            .is_some_and(|value| !value.is_empty());
+        || crate::utils::process_env::var("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR")
+            .truthy()
+            .is_some();
     let api_key_source = get_anthropic_api_key_with_source(GetAnthropicApiKeyOptions {
         skip_retrieving_key_from_api_key_helper: true,
     })
@@ -1168,30 +1172,7 @@ pub fn is_pro_subscriber() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    struct EnvGuard {
-        _env: crate::utils::env_utils::EnvVarGuard,
-    }
-
-    impl EnvGuard {
-        fn set_path(key: &'static str, value: &std::path::Path) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-
-        fn set_value(key: &'static str, value: &str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::set(key, value),
-            }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            Self {
-                _env: crate::utils::env_utils::EnvVarGuard::unset(key),
-            }
-        }
-    }
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     struct CurrentDirGuard {
         previous: std::path::PathBuf,
@@ -1258,19 +1239,19 @@ mod tests {
 
     #[test]
     fn anthropic_auth_enabled_follows_official_external_source_gate() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("auth-enabled");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_home = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
-        let _api_key = EnvGuard::unset("ANTHROPIC_API_KEY");
-        let _bedrock = EnvGuard::unset("CLAUDE_CODE_USE_BEDROCK");
-        let _vertex = EnvGuard::unset("CLAUDE_CODE_USE_VERTEX");
-        let _foundry = EnvGuard::unset("CLAUDE_CODE_USE_FOUNDRY");
-        let _remote = EnvGuard::unset("CLAUDE_CODE_REMOTE");
-        let _ci = EnvGuard::unset("CI");
-        let _node_env = EnvGuard::unset("NODE_ENV");
+        let _config_home = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
+        let _api_key = EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        let _bedrock = EnvVarGuard::unset("CLAUDE_CODE_USE_BEDROCK");
+        let _vertex = EnvVarGuard::unset("CLAUDE_CODE_USE_VERTEX");
+        let _foundry = EnvVarGuard::unset("CLAUDE_CODE_USE_FOUNDRY");
+        let _remote = EnvVarGuard::unset("CLAUDE_CODE_REMOTE");
+        let _ci = EnvVarGuard::unset("CI");
+        let _node_env = EnvVarGuard::unset("NODE_ENV");
 
         crate::utils::config::set_test_global_config(Some(GlobalConfig::default()));
         assert!(is_anthropic_auth_enabled());
@@ -1300,8 +1281,8 @@ mod tests {
 
     #[test]
     fn api_key_helper_bare_mode_uses_only_flag_settings_source() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
-        let _simple = EnvGuard::set_value("CLAUDE_CODE_SIMPLE", "1");
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
+        let _simple = EnvVarGuard::set("CLAUDE_CODE_SIMPLE", "1");
         clear_api_key_helper_cache();
         let dir = unique_temp_dir("bare-helper");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1320,7 +1301,7 @@ mod tests {
 
     #[test]
     fn project_api_key_helper_is_blocked_until_trust_in_interactive_sessions() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _env_guard = TEST_ENV_LOCK.lock().unwrap();
         clear_api_key_helper_cache();
         let dir = unique_temp_dir("project-helper-trust");
         let config_home = dir.join("config");
@@ -1337,7 +1318,7 @@ mod tests {
             format!(r#"{{"apiKeyHelper":"{command}"}}"#),
         )
         .unwrap();
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &config_home);
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &config_home);
         let _cwd_guard = CurrentDirGuard::set(&project);
         let _original_cwd_guard = OriginalCwdGuard::set(&project);
 
@@ -1359,13 +1340,13 @@ mod tests {
 
     #[test]
     fn api_key_helper_executes_caches_and_uses_official_failure_sentinel() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _ttl = EnvGuard::set_value("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "300000");
+        let _ttl = EnvVarGuard::set("CLAUDE_CODE_API_KEY_HELPER_TTL_MS", "300000");
         let dir = unique_temp_dir("helper-cache");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_home = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
+        let _config_home = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
         clear_api_key_helper_cache();
 
         let command = if cfg!(target_os = "windows") {
@@ -1411,16 +1392,16 @@ mod tests {
 
     #[test]
     fn api_key_with_source_preserves_official_precedence_without_helper_execution() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("api-key-precedence");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_home = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
-        let _api_key = EnvGuard::unset("ANTHROPIC_API_KEY");
-        let _homespace = EnvGuard::unset("COO_RUNNING_ON_HOMESPACE");
-        let _ci = EnvGuard::unset("CI");
-        let _node_env = EnvGuard::unset("NODE_ENV");
+        let _config_home = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
+        let _api_key = EnvVarGuard::unset("ANTHROPIC_API_KEY");
+        let _homespace = EnvVarGuard::unset("COO_RUNNING_ON_HOMESPACE");
+        let _ci = EnvVarGuard::unset("CI");
+        let _node_env = EnvVarGuard::unset("NODE_ENV");
         std::fs::write(
             dir.join("settings.json"),
             r#"{"apiKeyHelper":"helper --print"}"#,
@@ -1475,7 +1456,7 @@ mod tests {
     fn api_key_file_descriptor_reads_existing_fd_without_placeholder_or_write() {
         use std::os::fd::AsRawFd;
 
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let path = std::env::temp_dir().join(format!(
@@ -1489,7 +1470,7 @@ mod tests {
         std::fs::write(&path, " sk-ant-fd-readonly\n").unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let fd = file.as_raw_fd().to_string();
-        let _fd_guard = EnvGuard::set_value("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", &fd);
+        let _fd_guard = EnvVarGuard::set("CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR", &fd);
         crate::bootstrap::state::reset_auth_file_descriptor_caches_for_testing();
 
         let api_key = get_anthropic_api_key_with_source(GetAnthropicApiKeyOptions::default());
@@ -1510,13 +1491,13 @@ mod tests {
     fn oauth_file_descriptor_requires_readable_token_like_official() {
         use std::os::fd::AsRawFd;
 
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         crate::utils::config::set_test_global_config(Some(GlobalConfig::default()));
         // This case asserts the NOT-a-subscriber outcome, so it has to own that
         // premise: `is_claude_ai_subscriber` falls back to `.credentials.json`
-        // under `get_config_home()`, and the test harness seeds a logged-in
+        // under `get_claude_config_home_dir()`, and the test harness seeds a logged-in
         // identity there. Point the config home at an empty scratch dir for the
         // duration instead of relying on the developer being logged out.
         let scratch_home = std::env::temp_dir().join(format!(
@@ -1524,10 +1505,10 @@ mod tests {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&scratch_home).unwrap();
-        let _config = crate::utils::env_utils::EnvVarGuard::set("CLAUDE_CONFIG_DIR", &scratch_home);
+        let _config = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &scratch_home);
         {
             let _missing_guard =
-                EnvGuard::set_value("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "999999");
+                EnvVarGuard::set("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "999999");
             crate::bootstrap::state::reset_auth_file_descriptor_caches_for_testing();
             assert!(!is_claude_ai_subscriber());
         }
@@ -1544,7 +1525,7 @@ mod tests {
         std::fs::write(&path, " oauth-token\n").unwrap();
         let file = std::fs::File::open(&path).unwrap();
         let fd = file.as_raw_fd().to_string();
-        let _fd_guard = EnvGuard::set_value("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", &fd);
+        let _fd_guard = EnvVarGuard::set("CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", &fd);
         crate::bootstrap::state::reset_auth_file_descriptor_caches_for_testing();
 
         assert!(is_claude_ai_subscriber());
@@ -1557,7 +1538,7 @@ mod tests {
 
     #[test]
     fn plaintext_credentials_file_is_readonly_subscriber_source() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = std::env::temp_dir().join(format!(
@@ -1583,9 +1564,9 @@ mod tests {
         )
         .unwrap();
 
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
         crate::utils::config::set_test_global_config(Some(GlobalConfig::default()));
-        let get_env = |key: &str| std::env::var(key).ok();
+        let get_env = |key: &str| crate::utils::process_env::var(key);
         assert!(is_claude_ai_subscriber());
         assert_eq!(
             read_claude_ai_credentials_snapshot(&get_env)
@@ -1660,12 +1641,12 @@ mod tests {
 
     #[test]
     fn save_oauth_tokens_if_needed_prepares_official_merge_before_the_outlet_gate() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("prepare-oauth-save");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
         std::fs::write(
             dir.join(".credentials.json"),
             serde_json::json!({
@@ -1721,12 +1702,12 @@ mod tests {
 
     #[test]
     fn save_oauth_tokens_if_needed_skips_non_claude_and_inference_only_tokens_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("skip-oauth-save");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
         let credentials_path = dir.join(".credentials.json");
         let original = serde_json::json!({
             "claudeAiOauth": {
@@ -1776,13 +1757,13 @@ mod tests {
 
     #[test]
     fn blocked_oauth_save_preserves_credential_bytes_and_request_shape_caches() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("blocked-oauth-save");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
-        let _betas_guard = EnvGuard::set_value("ANTHROPIC_BETAS", "oauth-gate-cache-sentinel");
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
+        let _betas_guard = EnvVarGuard::set("ANTHROPIC_BETAS", "oauth-gate-cache-sentinel");
         let credentials_path = dir.join(".credentials.json");
         let original = br#"{"claudeAiOauth":{"accessToken":"old-access","refreshToken":"old-refresh","expiresAt":1,"scopes":["user:inference"]}}"#;
         std::fs::write(&credentials_path, original).unwrap();
@@ -1836,12 +1817,12 @@ mod tests {
 
     #[test]
     fn check_and_refresh_oauth_token_if_needed_matches_official_no_refresh_gates() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("oauth-check-gates");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
         let credentials_path = dir.join(".credentials.json");
         std::fs::write(
             &credentials_path,
@@ -1890,12 +1871,12 @@ mod tests {
 
     #[test]
     fn handle_oauth_401_error_matches_official_failed_token_comparison() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("oauth-401-compare");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_guard = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
+        let _config_guard = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
         let credentials_path = dir.join(".credentials.json");
         std::fs::write(
             &credentials_path,
@@ -1942,10 +1923,10 @@ mod tests {
 
     #[test]
     fn claude_ai_oauth_tokens_read_path_prefers_env_inference_token_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _oauth = EnvGuard::set_value("CLAUDE_CODE_OAUTH_TOKEN", "  env-oauth-token\n");
+        let _oauth = EnvVarGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "  env-oauth-token\n");
         let tokens =
             get_claude_ai_oauth_tokens().expect("env token should produce inference-only snapshot");
         assert_eq!(tokens.access_token, "  env-oauth-token\n");
@@ -1956,24 +1937,24 @@ mod tests {
 
     #[test]
     fn bare_mode_disables_claude_ai_oauth_token_read_path_like_official() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _simple = EnvGuard::set_value("CLAUDE_CODE_SIMPLE", "1");
-        let _oauth = EnvGuard::set_value("CLAUDE_CODE_OAUTH_TOKEN", "env-oauth-token");
+        let _simple = EnvVarGuard::set("CLAUDE_CODE_SIMPLE", "1");
+        let _oauth = EnvVarGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "env-oauth-token");
         assert!(get_claude_ai_oauth_tokens().is_none());
     }
 
     #[test]
     fn bare_mode_limits_api_key_sources_like_official_simple_mode() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _simple = EnvGuard::set_value("CLAUDE_CODE_SIMPLE", "1");
+        let _simple = EnvVarGuard::set("CLAUDE_CODE_SIMPLE", "1");
         let mut config = GlobalConfig::default();
         config.primary_api_key = Some("managed".to_string());
         crate::utils::config::set_test_global_config(Some(config));
-        let _api_key = EnvGuard::unset("ANTHROPIC_API_KEY");
+        let _api_key = EnvVarGuard::unset("ANTHROPIC_API_KEY");
 
         assert!(!is_anthropic_auth_enabled());
 
@@ -1990,11 +1971,11 @@ mod tests {
 
     #[test]
     fn anthropic_unix_socket_gate_matches_official_remote_proxy_auth() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let _socket = EnvGuard::set_value("ANTHROPIC_UNIX_SOCKET", "/tmp/claude.sock");
-        let _oauth = EnvGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
+        let _socket = EnvVarGuard::set("ANTHROPIC_UNIX_SOCKET", "/tmp/claude.sock");
+        let _oauth = EnvVarGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
 
         assert!(!is_anthropic_auth_enabled());
         crate::utils::process_env::set("CLAUDE_CODE_OAUTH_TOKEN", "oauth-placeholder");
@@ -2003,13 +1984,13 @@ mod tests {
 
     #[test]
     fn claude_ai_subscriber_does_not_treat_account_metadata_as_a_token() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("subscriber-account-metadata");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_home = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
-        let _oauth = EnvGuard::set_value("CLAUDE_CODE_OAUTH_TOKEN", "");
+        let _config_home = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
+        let _oauth = EnvVarGuard::set("CLAUDE_CODE_OAUTH_TOKEN", "");
         crate::bootstrap::state::reset_auth_file_descriptor_caches_for_testing();
         let mut config = GlobalConfig::default();
         crate::utils::config::set_test_global_config(Some(config.clone()));
@@ -2023,13 +2004,13 @@ mod tests {
 
     #[test]
     fn subscription_display_name_matches_official_get_subscription_name() {
-        let _env_guard = crate::utils::env_utils::TEST_ENV_LOCK
+        let _env_guard = TEST_ENV_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = unique_temp_dir("subscription-name");
         std::fs::create_dir_all(&dir).unwrap();
-        let _config_home = EnvGuard::set_path("CLAUDE_CONFIG_DIR", &dir);
-        let _oauth = EnvGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
+        let _config_home = EnvVarGuard::set("CLAUDE_CONFIG_DIR", &dir);
+        let _oauth = EnvVarGuard::unset("CLAUDE_CODE_OAUTH_TOKEN");
         crate::utils::config::set_test_global_config(Some(GlobalConfig::default()));
 
         assert_eq!(claude_ai_subscription_name(Some("max")), "Claude Max");

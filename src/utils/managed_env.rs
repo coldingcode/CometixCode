@@ -18,7 +18,7 @@ use std::collections::HashSet;
 use indexmap::IndexMap;
 use std::sync::RwLock;
 
-use crate::utils::process_env::{self, EnvSnapshot, EnvUpdate};
+use crate::utils::process_env::{self, EnvSnapshot, EnvUpdate, JsTruthy};
 use crate::utils::settings::{
     SettingSource, get_initial_settings, get_settings_for_source, is_setting_source_enabled,
 };
@@ -245,9 +245,7 @@ fn filter_settings_env(
     process: &EnvSnapshot,
 ) -> Vec<(String, String)> {
     // JS truthiness: an empty ANTHROPIC_UNIX_SOCKET disables the filter (:27).
-    let ssh_tunnel = process
-        .var("ANTHROPIC_UNIX_SOCKET")
-        .is_some_and(|value| !value.is_empty());
+    let ssh_tunnel = process.var("ANTHROPIC_UNIX_SOCKET").truthy().is_some();
     let host_managed =
         crate::utils::env_utils::is_env_truthy(process.var("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST"));
     // CC `withoutCcdSpawnEnvKeys` (:71-80) is a no-op until applySafe captured
@@ -342,19 +340,21 @@ pub fn apply_config_environment_variables() {
     apply_filtered(&mut update, global.env.as_ref());
     apply_filtered(&mut update, merged.env.as_deref());
 
-    // (:192-198) CC clears the CA-certs/mTLS/proxy caches and reconfigures the
-    // global agents inside this same synchronous pass. Those owners
-    // (`utils/caCerts.ts`, `utils/mtls.ts`, `utils/proxy.ts`) are not ported
-    // (MODULE_MAP: missing); when they land, prebuild their resources before
-    // this turn, commit the env, then apply the effects from the committed
-    // snapshot under the approved StoreTurn—not under the EnvUpdate lock.
     update.commit();
+
+    // (:192-198) Clear the caches so the agents are rebuilt from the new
+    // environment, then reconfigure them. They read files and the committed
+    // environment, so this runs after the commit, outside the EnvUpdate lock.
+    crate::utils::ca_certs::clear_ca_certs_cache();
+    crate::utils::mtls::clear_mtls_cache();
+    crate::utils::proxy::clear_proxy_cache();
+    crate::utils::proxy::configure_global_agents();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::env_utils::EnvVarGuard;
+    use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
     fn provider_managed_matches_set_and_prefix_case_insensitively() {
@@ -373,7 +373,7 @@ mod tests {
     /// Node `process.env` assignment normalization.
     #[test]
     fn settings_application_matches_official_object_assign_then_normalize_order() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         let _numeric = EnvVarGuard::unset("1");
         reset_ccd_spawn_env_keys_for_tests();
         let env = IndexMap::from([
@@ -390,7 +390,7 @@ mod tests {
 
     #[test]
     fn ssh_tunnel_filter_gates_on_socket_presence() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_ccd_spawn_env_keys_for_tests();
         let env: IndexMap<String, String> = [
             ("ANTHROPIC_API_KEY", "from-settings"),
@@ -421,7 +421,7 @@ mod tests {
 
     #[test]
     fn host_managed_filter_strips_provider_vars_only_when_truthy() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_ccd_spawn_env_keys_for_tests();
         let env: IndexMap<String, String> =
             [("ANTHROPIC_MODEL", "custom"), ("MAX_THINKING_TOKENS", "1")]
@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn ccd_spawn_keys_latch_once_and_shield_spawn_env() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_ccd_spawn_env_keys_for_tests();
         let _no_socket = EnvVarGuard::unset("ANTHROPIC_UNIX_SOCKET");
         let _no_host = EnvVarGuard::unset("CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST");
@@ -471,7 +471,7 @@ mod tests {
 
     #[test]
     fn ccd_capture_is_null_outside_claude_desktop() {
-        let _lock = crate::utils::env_utils::TEST_ENV_LOCK.lock().unwrap();
+        let _lock = TEST_ENV_LOCK.lock().unwrap();
         reset_ccd_spawn_env_keys_for_tests();
         let _entry = EnvVarGuard::set("CLAUDE_CODE_ENTRYPOINT", "cli");
 
