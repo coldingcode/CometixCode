@@ -4,7 +4,7 @@
 //! transport lifecycle and settings writes remain in `services/mcp/*`.
 
 use super::capabilities_section::CapabilitiesSection;
-use super::types::{ServerInfo, mcp_client_state_from_parts};
+use super::types::ServerInfo;
 use super::utils::reconnect_helpers::handle_reconnect_result;
 use crate::components::configurable_shortcut_hint::ConfigurableShortcutHint;
 use crate::components::custom_select::select::{Select, SelectLayout, SelectOptionData};
@@ -138,7 +138,7 @@ pub fn MCPStdioServerMenu<'a>(
                         let client_type = reconnect_mcp_server
                             .call(&server.name)
                             .await
-                            .map(|updated| updated.client.status)
+                            .map(|updated| updated.connection_type())
                             .unwrap_or_else(|| server.official_client_type());
                         pending_runtime_result.set(Some(
                             handle_reconnect_result(client_type, &server.name).message,
@@ -355,6 +355,7 @@ pub fn MCPStdioServerMenu<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::mcp::types::mcp_client_state_from_parts;
     use crate::services::mcp::client::McpConnectionDiscovery;
     use crate::services::mcp::types::{ConfigScope, ScopedMcpServerConfig, Transport};
     use crate::state::app_state_store::McpState;
@@ -409,9 +410,10 @@ mod tests {
         let menu_server = server(McpServerConnectionType::Connected);
         let config = menu_server.config.clone();
         let runtime_state = hooks.use_state(move || {
-            let mut runtime_server =
-                McpConnectionDiscovery::pending_with_config("docs", &config).server;
-            runtime_server.client.status = McpServerConnectionType::Connected;
+            let runtime_server =
+                crate::services::mcp::types::McpServerConnection::connected_for_test(
+                    "docs", config,
+                );
             let mut initial = crate::state::app_state_store::AppState::default();
             initial.mcp = Arc::new(McpState {
                 clients: vec![runtime_server],

@@ -56,7 +56,8 @@ const NO_MCP_RESOURCES_COPY: &str =
 
 /// List MCP resources from live connected clients.
 /// Maps to: CC `tools/ListMcpResourcesTool/ListMcpResourcesTool.ts` `call`
-/// using `ensureConnectedClient(client)` and `fetchResourcesForClient(fresh)`.
+/// (:66-98): every connected client, at once, through
+/// `fetchResourcesForClient(await ensureConnectedClient(client))`.
 pub(crate) async fn list_mcp_resources_output(
     input: &serde_json::Value,
     state: &crate::state::app_state_store::McpState,
@@ -72,7 +73,7 @@ pub(crate) async fn list_mcp_resources_output(
     let available_servers = state
         .clients
         .iter()
-        .map(|server| server.client.name.as_str())
+        .map(|server| server.name())
         .collect::<Vec<_>>();
 
     if let Some(server) = target_server {
@@ -84,34 +85,43 @@ pub(crate) async fn list_mcp_resources_output(
         }
     }
 
-    let mut output = Vec::new();
-    for server in state
-        .clients
-        .iter()
-        .filter(|server| {
-            server.client.status == crate::services::mcp::types::McpServerConnectionType::Connected
-        })
-        .filter(|server| target_server.is_none_or(|target| target == server.client.name))
-    {
-        // `fetch_mcp_resources_for_client` is LRU-cached (by server name) and
-        // already warm from startup prefetch. The cache is invalidated on close
-        // and on `resources/list_changed`, so results are never stale.
-        match crate::services::mcp::client::fetch_mcp_resources_for_client(&server.client.name)
-            .await
-        {
-            Ok(resources) => output.extend(resources.iter().map(|resource| McpResource {
-                uri: resource.uri.clone(),
-                name: resource.name.clone(),
-                mime_type: resource.mime_type.clone(),
-                description: resource.description.clone(),
-                server: server.client.name.clone(),
-            })),
-            Err(error) => {
-                tracing::warn!(server = %server.client.name, error = %error, "failed to refresh MCP resources for ListMcpResourcesTool")
-            }
-        }
-    }
-    Ok(output)
+    // `fetch_resources_for_client` is LRU-cached (by server name) and already
+    // warm from startup prefetch. The cache is invalidated on close and on
+    // `resources/list_changed`, so results are never stale.
+    // `ensure_connected_client` is a no-op when healthy (memo hit), but after
+    // a close it returns a fresh connection so the re-fetch succeeds.
+    let results = futures::future::join_all(
+        state
+            .clients
+            .iter()
+            .filter(|server| target_server.is_none_or(|target| target == server.name()))
+            .filter_map(|server| server.as_connected())
+            .map(|server| async move {
+                match crate::services::mcp::client::ensure_connected_client(server).await {
+                    Ok(fresh) => crate::services::mcp::client::fetch_resources_for_client(
+                        &crate::services::mcp::types::McpServerConnection::Connected(fresh),
+                    )
+                    .await
+                    .into_iter()
+                    .map(|resource| McpResource {
+                        uri: resource.uri,
+                        name: resource.name,
+                        mime_type: resource.mime_type,
+                        description: resource.description,
+                        server: server.name.clone(),
+                    })
+                    .collect(),
+                    // One server's reconnect failure doesn't sink the whole
+                    // result.
+                    Err(error) => {
+                        tracing::warn!(server = %server.name, error = %error, "failed to reconnect MCP server for ListMcpResourcesTool");
+                        Vec::new()
+                    }
+                }
+            }),
+    )
+    .await;
+    Ok(results.into_iter().flatten().collect())
 }
 
 /// Serializes [`Output`] to CC's exact `toolUseResult` wire shape —
@@ -370,23 +380,11 @@ mod tests {
     #[tokio::test]
     async fn list_mcp_resources_validates_target_and_skips_non_connected_clients_like_official() {
         let state = crate::state::app_state_store::McpState {
-            clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: "offline".to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Failed,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: Some("boom".to_string()),
-                },
-                config: None,
-                supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
-            }],
+            clients: vec![crate::services::mcp::types::McpServerConnection::failed(
+                "offline",
+                crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("offline"),
+                Some("boom".to_string()),
+            )],
             ..crate::state::app_state_store::McpState::default()
         };
 
@@ -407,10 +405,11 @@ mod tests {
     /// invalidated only by `onclose` and `resources/list_changed`. So the first
     /// call populates from the live peer and repeat calls are served from cache
     /// without another `resources/list` round trip.
-    #[cfg(feature = "mcp_runtime")]
     #[test]
     fn list_mcp_resources_tool_serves_lru_cached_resources_like_official() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
+        // The fetch caches hold fetches run on the process runtime.
+        crate::utils::process_runtime::initialize_test_process_runtime();
         let script_path = std::env::temp_dir().join(format!(
             "cometix-list-mcp-resources-live-{}.mjs",
             uuid::Uuid::new_v4()
@@ -484,34 +483,38 @@ rl.on('line', line => {
                     plugin_source: None,
                 };
                 let discovery =
-                    crate::services::mcp::client::connect_to_server(SERVER, &config).await;
+                    crate::services::mcp::client::reconnect_mcp_server_impl(SERVER, &config).await;
                 assert_eq!(
-                    discovery.server.client.status,
+                    discovery.server.connection_type(),
                     crate::services::mcp::types::McpServerConnectionType::Connected
                 );
 
+                assert!(
+                    discovery
+                        .server
+                        .as_connected()
+                        .is_some_and(|server| server.capabilities.resources.is_some()),
+                    "the fixture declares resources"
+                );
+
                 let state = crate::state::app_state_store::McpState {
-                    clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                        connection_id: None,
-                        client: discovery.server.client.clone(),
-                        config: Some(config.clone()),
-                        supports_resources: true,
-                        tools: Vec::new(),
-                        prompts: Vec::new(),
-                        resources: vec![crate::services::mcp::types::ServerResource {
+                    clients: vec![discovery.server.clone()],
+                    resources: std::collections::BTreeMap::from([(
+                        SERVER.to_string(),
+                        vec![crate::services::mcp::types::ServerResource {
                             server: SERVER.to_string(),
                             uri: "file:///tmp/stale.txt".to_string(),
                             name: "stale".to_string(),
                             description: Some("Stale cached resource".to_string()),
                             mime_type: Some("text/plain".to_string()),
                         }],
-                    }],
+                    )]),
                     ..crate::state::app_state_store::McpState::default()
                 };
 
-                // `connect_to_server` already warmed the memoized fetch, so the
-                // tool observes the startup prefetch rather than the stale
-                // AppState snapshot or a second `resources/list`.
+                // Connecting fetched through the memoized fetch, so the tool
+                // observes that prefetch rather than the stale AppState
+                // snapshot or a second `resources/list`.
                 let output = super::list_mcp_resources_output(
                     &serde_json::json!({ "server": SERVER }),
                     &state,
@@ -533,9 +536,10 @@ rl.on('line', line => {
                 // `resources/list_changed` is one of the two official
                 // invalidation points; after it the next fetch is fresh.
                 let refreshed =
-                    crate::services::mcp::client::refresh_mcp_resources_for_client(SERVER)
-                        .await
-                        .expect("refresh should bypass and repopulate the cache");
+                    crate::services::mcp::client::refresh_mcp_resources_for_client(
+                        &discovery.server,
+                    )
+                    .await;
                 assert_eq!(refreshed.len(), 1);
                 assert_eq!(refreshed[0].uri, "file:///tmp/call-2.txt");
 

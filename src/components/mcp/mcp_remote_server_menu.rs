@@ -4,7 +4,7 @@
 //! source-owned URL selection/browser dispatch and renders runtime snapshots.
 
 use super::capabilities_section::CapabilitiesSection;
-use super::types::{ServerInfo, mcp_client_state_from_parts};
+use super::types::ServerInfo;
 use super::utils::reconnect_helpers::handle_reconnect_result;
 use crate::components::configurable_shortcut_hint::ConfigurableShortcutHint;
 use crate::components::custom_select::select::{Select, SelectLayout, SelectOptionData};
@@ -321,7 +321,7 @@ pub fn MCPRemoteServerMenu<'a>(
                         let client_type = reconnect_mcp_server
                             .call(&server.name)
                             .await
-                            .map(|updated| updated.client.status)
+                            .map(|updated| updated.connection_type())
                             .unwrap_or_else(|| server.official_client_type());
                         pending_runtime_result.set(Some(
                             handle_reconnect_result(client_type, &server.name).message,
@@ -361,24 +361,19 @@ pub fn MCPRemoteServerMenu<'a>(
                             )));
                             return;
                         }
-                        crate::services::mcp::client::clear_server_cache(&server.name, None).await;
-                        {
-                            let base = runtime_mcp
-                                .current()
-                                .clients
-                                .into_iter()
-                                .find(|candidate| candidate.client.name == server.name)
-                                .unwrap_or_else(|| {
-                                    crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
-                                        &server.name,
-                                        &server.config,
-                                    )
-                                    .server
-                                });
-                            runtime_mcp.apply_server_update(
-                                crate::services::mcp::use_manage_mcp_connections::clear_authentication_server_update(&base),
-                            );
-                        }
+                        // CC `clearServerCache(server.name, { ...server.config, scope: server.scope })`.
+                        let server_ref = crate::services::mcp::types::ScopedMcpServerConfig {
+                            scope: server.scope,
+                            ..server.config.clone()
+                        };
+                        crate::services::mcp::client::clear_server_cache(&server.name, Some(&server_ref))
+                            .await;
+                        runtime_mcp.update(|mcp| {
+                            crate::services::mcp::use_manage_mcp_connections::clear_authentication_state(
+                                mcp,
+                                &server.name,
+                            )
+                        });
                         pending_runtime_result.set(Some(format!(
                             "Authentication cleared for {}.",
                             server.name
@@ -407,21 +402,33 @@ pub fn MCPRemoteServerMenu<'a>(
                                 let mut state = manual_callback_submit_state;
                                 state.set(Some(submit));
                             });
-                        match crate::services::mcp::use_manage_mcp_connections::authenticate_remote_mcp_server_once(
+                        let authenticated = crate::services::mcp::use_manage_mcp_connections::authenticate_remote_mcp_server_once(
                             &server.name,
                             &server.config,
                             server.is_authenticated.unwrap_or(false),
-                            is_effectively_authenticated(&server),
                             Some(on_authorization_url),
                             Some(on_waiting_for_callback),
                             Some(abort_handle.signal()),
                         )
-                        .await
-                        {
-                            Ok((updated, message)) => {
-                                runtime_mcp.apply_server_update(updated);
-                                pending_runtime_result.set(Some(message));
-                            }
+                        .await;
+                        match authenticated {
+                            // CC `:386` — `const result = await reconnectMcpServer(server.name)`;
+                            // the manager writes the result and gives the
+                            // connection its handlers.
+                            Ok(()) => match reconnect_mcp_server.call(&server.name).await {
+                                Some(updated) => pending_runtime_result.set(Some(
+                                    crate::services::mcp::use_manage_mcp_connections::remote_authentication_result_message(
+                                        updated.connection_type(),
+                                        &server.name,
+                                        is_effectively_authenticated(&server),
+                                    ),
+                                )),
+                                // CC's `reconnectMcpServer` throws `MCP server
+                                // ${serverName} not found` (`useManageMCPConnections.ts:1051-1053`),
+                                // which the catch shows.
+                                None => auth_error
+                                    .set(Some(format!("MCP server {} not found", server.name))),
+                            },
                             Err(error) => {
                                 if !crate::services::mcp::auth::is_authentication_cancelled_error(&error) {
                                     auth_error.set(Some(error.to_string()));
@@ -444,7 +451,7 @@ pub fn MCPRemoteServerMenu<'a>(
                         is_reconnecting.set(true);
                         let updated = reconnect_mcp_server.call(&server.name).await;
                         let success = updated.as_ref().is_some_and(|updated| {
-                            updated.client.status == McpServerConnectionType::Connected
+                            updated.connection_type() == McpServerConnectionType::Connected
                         });
                         if success {
                             pending_runtime_result.set(Some(format!(
@@ -452,7 +459,7 @@ pub fn MCPRemoteServerMenu<'a>(
                                 server.name
                             )));
                         } else if updated.as_ref().is_some_and(|updated| {
-                            updated.client.status == McpServerConnectionType::NeedsAuth
+                            updated.connection_type() == McpServerConnectionType::NeedsAuth
                         }) {
                             pending_runtime_result.set(Some(
                                 "Authentication successful, but server still requires authentication. You may need to manually restart Claude Code."
@@ -467,24 +474,19 @@ pub fn MCPRemoteServerMenu<'a>(
                         is_reconnecting.set(false);
                     }
                     RemoteServerMenuAction::ClaudeAiClearAuthentication => {
-                        crate::services::mcp::client::clear_server_cache(&server.name, None).await;
-                        {
-                            let base = runtime_mcp
-                                .current()
-                                .clients
-                                .into_iter()
-                                .find(|candidate| candidate.client.name == server.name)
-                                .unwrap_or_else(|| {
-                                    crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
-                                        &server.name,
-                                        &server.config,
-                                    )
-                                    .server
-                                });
-                            runtime_mcp.apply_server_update(
-                                crate::services::mcp::use_manage_mcp_connections::claude_ai_clear_authentication_server_update(&base),
-                            );
-                        }
+                        // CC `clearServerCache(server.name, { ...server.config, scope: server.scope })`.
+                        let server_ref = crate::services::mcp::types::ScopedMcpServerConfig {
+                            scope: server.scope,
+                            ..server.config.clone()
+                        };
+                        crate::services::mcp::client::clear_server_cache(&server.name, Some(&server_ref))
+                            .await;
+                        runtime_mcp.update(|mcp| {
+                            crate::services::mcp::use_manage_mcp_connections::claude_ai_clear_authentication_state(
+                                mcp,
+                                &server.name,
+                            )
+                        });
                         is_claude_ai_clearing_auth.set(false);
                         claude_ai_clear_auth_browser_opened.set(false);
                         pending_runtime_result.set(Some(format!(
@@ -983,6 +985,7 @@ pub fn MCPRemoteServerMenu<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::components::mcp::types::mcp_client_state_from_parts;
     use crate::services::mcp::client::McpConnectionDiscovery;
     use crate::services::mcp::types::{ConfigScope, ScopedMcpServerConfig};
     use crate::state::app_state_store::McpState;
@@ -1067,9 +1070,10 @@ mod tests {
         });
         let config = menu_server.config.clone();
         let runtime_state = hooks.use_state(move || {
-            let mut runtime_server =
-                McpConnectionDiscovery::pending_with_config("remote", &config).server;
-            runtime_server.client.status = McpServerConnectionType::Connected;
+            let runtime_server =
+                crate::services::mcp::types::McpServerConnection::connected_for_test(
+                    "remote", config,
+                );
             let mut initial = crate::state::app_state_store::AppState::default();
             initial.mcp = Arc::new(McpState {
                 clients: vec![runtime_server],

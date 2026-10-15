@@ -46,12 +46,10 @@ use crate::query::{
     PendingQueryMessage, QueryCommand, QueryEvent, QueryHandle, StopHookProgressEvent,
     deps::production_deps, spawn_query,
 };
-use crate::services::mcp::client::{McpPromptCommandSnapshot, respond_to_mcp_elicitation};
 use crate::services::mcp::elicitation_handler::{
     ElicitationAction, ElicitationRequestParams, ElicitationWaitingDismissAction,
-    url_retry_waiting_dismiss_result,
+    respond_to_mcp_elicitation, url_retry_waiting_dismiss_result,
 };
-use crate::services::mcp::types::McpPromptSnapshot;
 use crate::services::tools::tool_execution::{
     check_permissions_and_call_tool, check_permissions_and_call_tool_with_response,
 };
@@ -683,6 +681,33 @@ fn build_repl_process_user_input_context(
     context
 }
 
+/// Maps to CC `REPL.tsx:3562-3575`, the head of `onQuery` when it queries:
+/// the IDE integration is prepared for the new prompt from the fresh
+/// clients — the diagnostic tracker's query start, and
+/// `void closeOpenDiffs(ideClient)`.
+fn prepare_ide_integration_for_query(
+    fresh_clients: &[crate::services::mcp::types::McpServerConnection],
+) {
+    crate::services::diagnostic_tracking::handle_query_start(fresh_clients);
+    if let (Some(ide_client), Some(handle)) = (
+        crate::utils::ide::get_connected_ide_client(fresh_clients),
+        crate::utils::process_runtime::runtime_handle_for_detached_work(),
+    ) {
+        let ide_client = ide_client.clone();
+        handle.spawn(async move { crate::utils::ide::close_open_diffs(&ide_client).await });
+    }
+}
+
+/// Runs `diagnosticTracker.shutdown()` when dropped: the cleanup CC's REPL
+/// returns from its mount effect (`REPL.tsx:5456-5459`).
+struct DiagnosticTrackerShutdown;
+
+impl Drop for DiagnosticTrackerShutdown {
+    fn drop(&mut self) {
+        crate::services::diagnostic_tracking::shutdown();
+    }
+}
+
 /// Maps to CC `REPL.tsx`'s `hasInterruptibleToolInProgress` ref setter.  The
 /// query actor clones `ToolUseContext`, so an `Arc<AtomicBool>` gives the
 /// synchronous prompt submit callback the same live value without routing a
@@ -788,6 +813,7 @@ fn apply_repl_query_turn_context(
     if let Some(mcp_state) = mcp_state {
         params.tool_use_context.mcp_state = mcp_state;
     }
+    prepare_ide_integration_for_query(&params.tool_use_context.mcp_state.clients);
     // The MCP-prompt path's context never met the builder, so give it the
     // builder-once fields first; everything below is per-turn and shared.
     if let Some(loaded_nested_memory_paths) = shell_context_seed {
@@ -1589,9 +1615,9 @@ struct SpeculationAcceptanceOutcome {
 struct McpPromptSlashCommandSubmit {
     input: String,
     turn_id: String,
-    command: McpPromptCommandSnapshot,
-    server_name: String,
-    prompt: McpPromptSnapshot,
+    /// The `mcp.commands` entry, which carries the client it was fetched from
+    /// and the server's own prompt name (CC's command closes over both).
+    command: crate::commands::Command,
     args: String,
     tool_permission_context: ToolPermissionContext,
 }
@@ -3626,7 +3652,7 @@ fn build_repl_query_prompt_contexts(
     let mcp_names: Vec<&str> = mcp_state
         .clients
         .iter()
-        .map(|server| server.client.name.as_str())
+        .map(|server| server.name())
         .collect();
     let scratchpad_dir = crate::utils::permissions::filesystem::is_scratchpad_enabled()
         .then(crate::utils::permissions::filesystem::get_scratchpad_dir);
@@ -4271,6 +4297,10 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
         },
         (),
     );
+    // Maps to: CC `screens/REPL.tsx:5456-5459`, the same effect's unmount
+    // cleanup `void diagnosticTracker.shutdown()`; held in hook state so it
+    // runs when this component drops (`_sandbox_ask_registration` precedent).
+    let _diagnostic_tracker_shutdown = hooks.use_state(|| DiagnosticTrackerShutdown);
 
     let prompt_submit = hooks.use_const({
         let commands = commands.clone();
@@ -4520,6 +4550,9 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                         max_turns: None,
                         tool_use_context,
                     };
+                    // `onQuery([])` prepares the IDE integration too, from
+                    // the store's clients (`REPL.tsx:3566-3569`).
+                    prepare_ide_integration_for_query(&app_store.get().mcp.clients);
                     stream_mode.set(SpinnerMode::Responding);
                     response_length_ref.set(0);
                     active_query.set(Some(spawn_query(params, production_deps())));
@@ -4534,13 +4567,9 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     // Maps to: CC REPL.tsx:1239-1242 `useIdeSelection(mcp.clients,
     // setIDESelection)`. CC upstream quirk preserved (do NOT "fix"): REPL
     // passes `mcp.clients` — NOT the merged `mcpClients` — so only the
-    // live-managed MCP connections ever carry a selection handler. Cometix
-    // registers the sink with the live connection registry
-    // (`CONNECTED_CLIENTS`), which holds exactly those live-managed
-    // connections; entry removal drops the per-connection sink clone
-    // (useIdeSelection.ts:148 "No cleanup needed") and identity changes send
-    // the CC-shaped reset object through this channel
-    // (useIdeSelection.ts:73-83).
+    // live-managed MCP connections ever carry a selection handler. CC passes
+    // an empty list for a remote session, which this port has not built. The
+    // hook's `onSelect` is this channel, drained into the state below.
     //
     // SEAM (recorded, not implemented in this slice):
     // - CC feeds `ideSelection` into handlePromptSubmit → processUserInput →
@@ -4551,10 +4580,13 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
     //   the strict connected gate exists here.
     let ide_selection_channel =
         hooks.use_const(|| std::sync::Arc::new(async_channel::unbounded::<IdeSelection>()));
-    let _ide_selection_sink_registration = hooks.use_const({
-        let sink = ide_selection_channel.0.clone();
-        move || crate::services::mcp::client::register_ide_selection_sink(sink)
-    });
+    let mcp_clients =
+        crate::state::app_state::use_app_state(&mut hooks, |state| state.mcp.clients.clone());
+    crate::hooks::use_ide_selection::use_ide_selection(
+        &mut hooks,
+        &mcp_clients,
+        ide_selection_channel.0.clone(),
+    );
     let ide_selection_rx = ide_selection_channel.1.clone();
     hooks.use_future(async move {
         // Live State handle captured by the recv loop (no snapshot): each
@@ -5828,10 +5860,20 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
                 Arc::clone(&has_interruptible_tool_in_progress);
             let set_in_progress_tool_use_ids = set_in_progress_tool_use_ids.clone();
             async move {
+                // `find_mcp_prompt_command` only yields bound commands.
+                let Some(binding) = submit.command.mcp_prompt.clone() else {
+                    return;
+                };
+                let arg_names = submit
+                    .command
+                    .arg_names
+                    .iter()
+                    .map(|name| name.to_string())
+                    .collect::<Vec<_>>();
                 let blocks = match crate::services::mcp::client::get_mcp_prompt_for_command(
-                &submit.server_name,
-                &submit.prompt.name,
-                &submit.prompt.arg_names,
+                &binding.connection,
+                &binding.prompt_name,
+                &arg_names,
                 &submit.args,
             )
             .await
@@ -7125,24 +7167,16 @@ pub fn Repl(props: &ReplProps, mut hooks: Hooks) -> impl Into<AnyElement<'static
             .map(|context| context.current())
             .unwrap_or_default();
         if let Some(parsed) = crate::utils::slash_command_parsing::parse_slash_command(&text) {
-            if let Some((server_name, prompt)) =
-                crate::services::mcp::client::resolve_mcp_prompt_command_invocation(
-                    &parsed.name,
-                    &runtime_mcp_state_for_submit,
-                )
-            {
+            if let Some(command) = crate::services::mcp::client::find_mcp_prompt_command(
+                &parsed.name,
+                &commands_for_submit,
+            ) {
                 // MCP prompt slash commands dispatch a query now (REPL.tsx:4525).
                 clear_ide_selection_for_submit();
-                let command = crate::services::mcp::client::mcp_prompt_command_snapshot(
-                    &server_name,
-                    &prompt,
-                );
                 mcp_prompt_submit_action(McpPromptSlashCommandSubmit {
                     input: text,
                     turn_id: Uuid::new_v4().to_string(),
-                    command,
-                    server_name,
-                    prompt,
+                    command: command.clone(),
                     args: parsed.args,
                     tool_permission_context: tool_permission_context_for_submit,
                 });
@@ -10411,13 +10445,13 @@ mod tests {
                 }
                 let current = store.get();
                 if let Some(client) = current.mcp.clients.iter().find(|client| {
-                    client.client.name == name
-                        && client.client.status
+                    client.name() == name
+                        && client.connection_type()
                             == crate::services::mcp::types::McpServerConnectionType::Failed
                 }) {
                     assert_eq!(
-                        client.config.as_ref(),
-                        Some(&server),
+                        client.config(),
+                        &server,
                         "actual manager must receive the launcher config"
                     );
                     // Native SDK transport is owned externally and rejects a
@@ -10425,7 +10459,7 @@ mod tests {
                     // callback (not transient pending) to prove both effects ran,
                     // without a network service, subprocess, or model request.
                     assert_eq!(
-                        client.client.status,
+                        client.connection_type(),
                         crate::services::mcp::types::McpServerConnectionType::Failed
                     );
                     break;
@@ -12750,6 +12784,87 @@ mod tests {
         assert_eq!(shell_params.system_prompt, builder_params.system_prompt);
         assert_eq!(shell_params.user_context, builder_params.user_context);
         assert_eq!(shell_params.system_context, builder_params.system_context);
+    }
+
+    /// CC `REPL.tsx:3562-3575`: a query start hands the fresh clients to
+    /// `diagnosticTracker.handleQueryStart`, which keeps the IDE client, and
+    /// sends that client `closeAllDiffTabs`.
+    #[test]
+    fn query_turn_context_prepares_the_ide_integration_from_the_fresh_clients() {
+        let _guard = TEST_ENV_LOCK.lock().unwrap();
+        crate::utils::process_runtime::initialize_test_process_runtime();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                use crate::services::mcp::client::session_http_fixture::{
+                    SESSION_NOT_FOUND, SessionHttpFixture,
+                };
+                let fixture = SessionHttpFixture::spawn(|_, _| false, SESSION_NOT_FOUND).await;
+                let ide =
+                    crate::services::mcp::client::connect_to_server("ide", &fixture.config()).await;
+                let called =
+                    |tool: &str| fixture.tool_calls().iter().any(|call| call["name"] == tool);
+                crate::services::diagnostic_tracking::shutdown();
+
+                let store = crate::state::store::AppStore::new(
+                    crate::state::app_state_store::AppState::default(),
+                    None,
+                );
+                let mut params = crate::query::QueryParams {
+                    turn_id: "turn-1".to_string(),
+                    input: "hi".to_string(),
+                    messages: Vec::new(),
+                    model_messages: Vec::new(),
+                    system_prompt: Vec::new(),
+                    user_context: std::collections::BTreeMap::new(),
+                    system_context: std::collections::BTreeMap::new(),
+                    query_source: crate::constants::query_source::QuerySource::Prompt,
+                    token_budget: None,
+                    task_budget: None,
+                    max_turns: None,
+                    tool_use_context: ToolUseContext::with_permission_context(
+                        ToolPermissionContext::default(),
+                    ),
+                };
+                let _ = apply_repl_query_turn_context(
+                    &mut params,
+                    &store,
+                    ToolPermissionContext::default(),
+                    &[],
+                    crate::utils::tool_result_storage::ContentReplacementState::new(),
+                    &ResumeRestoreStores::default(),
+                    Some(crate::state::app_state_store::McpState {
+                        clients: vec![ide],
+                        ..Default::default()
+                    }),
+                    None,
+                    &[],
+                    &crate::utils::system_prompt::CliSystemPromptOverrides::default(),
+                    None,
+                    &crate::tool::InteractivePermissionSink::default(),
+                    &Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                    &crate::tool::SetInProgressToolUseIds::default(),
+                    &crate::utils::thinking::ThinkingConfig::Adaptive,
+                    None,
+                );
+
+                // `void closeOpenDiffs(ideClient)` runs detached.
+                tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                    while !called("closeAllDiffTabs") {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .expect("closeAllDiffTabs reaches the IDE client");
+                // The tracker kept the IDE client.
+                crate::services::diagnostic_tracking::before_file_edited("/tmp/edited.rs").await;
+                assert!(called("getDiagnostics"));
+
+                crate::services::diagnostic_tracking::shutdown();
+                crate::services::mcp::client::clear_server_cache("ide", None).await;
+            });
     }
 
     /// The `Agent(x,y)` frontmatter restriction has gone missing three times

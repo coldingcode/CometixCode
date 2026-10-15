@@ -16,15 +16,11 @@
 //! (P5 G10).
 
 use iocraft::prelude::*;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::services::mcp::config::all_configured_mcp_servers_readonly;
-use crate::services::mcp::types::ScopedMcpServerConfig;
-use crate::services::mcp::types::{McpServerConnectionType, McpServerSnapshot};
+use crate::services::mcp::types::{McpServerConnection, McpServerConnectionType};
 use crate::state::app_state_store::McpWriter;
 use crate::state::store::AppStore;
-use crate::utils::config::{ProjectConfig, load_global_config, normalize_project_path};
 
 /// Maps to: CC `MCPConnectionManagerProps` (`:47-51`) — `dynamicMcpConfig` and
 /// `isStrictMcpConfig` are props at the source too, carried here inside
@@ -145,7 +141,7 @@ pub struct ReconnectMcpServer(McpConnectionContext);
 
 impl ReconnectMcpServer {
     /// Maps to: CC `reconnectMcpServer(serverName)`.
-    pub async fn call(&self, server_name: &str) -> Option<McpServerSnapshot> {
+    pub async fn call(&self, server_name: &str) -> Option<McpServerConnection> {
         reconnect_mcp_server_from_manager(server_name, self.0.runtime_mcp.clone()?).await
     }
 }
@@ -156,7 +152,7 @@ pub struct ToggleMcpServer(McpConnectionContext);
 
 impl ToggleMcpServer {
     /// Maps to: CC `toggleMcpServer(serverName)` — `Err` is the source's throw.
-    pub async fn call(&self, server_name: &str) -> anyhow::Result<Option<McpServerSnapshot>> {
+    pub async fn call(&self, server_name: &str) -> anyhow::Result<Option<McpServerConnection>> {
         let Some(runtime_mcp) = self.0.runtime_mcp.clone() else {
             return Ok(None);
         };
@@ -184,71 +180,30 @@ pub fn use_mcp_toggle_enabled(hooks: &mut Hooks) -> ToggleMcpServer {
     )
 }
 
-/// Maps to: CC `MCPConnectionManager` reconnect context callback resolving the
-/// active project config before delegating to `useManageMCPConnections`.
-/// Reads `getGlobalConfig()`-equivalent cached config directly; globalConfig
-/// is not part of CC AppState.
-pub fn project_config_from_global_config() -> ProjectConfig {
-    std::env::current_dir()
-        .ok()
-        .map(|cwd| {
-            let key = normalize_project_path(&cwd.to_string_lossy());
-            crate::utils::config::load_global_config()
-                .projects
-                .get(&key)
-                .cloned()
-                .unwrap_or_default()
-        })
-        .unwrap_or_default()
-}
-
-/// Maps to: CC `MCPConnectionManager` callback using the configured server map
-/// from `useManageMCPConnections(...)` when the AppState row lacks config.
-pub fn configured_server_from_global_config(server_name: &str) -> Option<ScopedMcpServerConfig> {
-    let project_config = project_config_from_global_config();
-    all_configured_mcp_servers_readonly(
-        &crate::utils::config::load_global_config(),
-        &project_config,
-    )
-    .remove(server_name)
-}
-
-fn resolve_server_config(
-    server_name: &str,
-    server: &McpServerSnapshot,
-) -> Option<ScopedMcpServerConfig> {
-    server
-        .config
-        .clone()
-        .or_else(|| configured_server_from_global_config(server_name))
-}
-
 /// Maps to: CC `useMcpReconnect()` returning `context.reconnectMcpServer`.
 pub async fn reconnect_mcp_server_from_manager(
     server_name: &str,
     runtime_mcp: McpWriter,
-) -> Option<McpServerSnapshot> {
+) -> Option<McpServerConnection> {
     let current = runtime_mcp.current();
     let runtime_server = current
         .clients
         .iter()
-        .find(|server| server.client.name == server_name)?;
-    let config = resolve_server_config(server_name, runtime_server)?;
+        .find(|server| server.name() == server_name)?;
+    let config = runtime_server.config().clone();
 
     runtime_mcp.apply_client_update(
-        crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
-            server_name,
-            &config,
-        )
-        .server,
+        crate::services::mcp::client::McpConnectionDiscovery::pending(server_name, &config).server,
     );
     let server = crate::services::mcp::use_manage_mcp_connections::reconnect_mcp_server_once(
         server_name,
         &config,
     )
     .await;
-    runtime_mcp.apply_server_update(server.clone());
-    Some(server.server)
+    // CC `onConnectionAttempt(result)` (`useManageMCPConnections.ts:1064`).
+    let client = server.server.clone();
+    crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(server, &runtime_mcp);
+    Some(client)
 }
 
 /// Maps to: CC `useMcpToggleEnabled()` returning `context.toggleMcpServer`.
@@ -269,26 +224,21 @@ pub async fn reconnect_mcp_server_from_manager(
 pub async fn toggle_mcp_server_from_manager(
     server_name: &str,
     runtime_mcp: McpWriter,
-) -> anyhow::Result<Option<McpServerSnapshot>> {
+) -> anyhow::Result<Option<McpServerConnection>> {
     let current = runtime_mcp.current();
     let Some(runtime_server) = current
         .clients
         .iter()
-        .find(|server| server.client.name == server_name)
+        .find(|server| server.name() == server_name)
     else {
         return Ok(None);
     };
-    let Some(config) = resolve_server_config(server_name, runtime_server) else {
-        return Ok(None);
-    };
+    let config = runtime_server.config().clone();
 
-    if runtime_server.client.status == McpServerConnectionType::Disabled {
+    if runtime_server.connection_type() == McpServerConnectionType::Disabled {
         runtime_mcp.apply_client_update(
-            crate::services::mcp::client::McpConnectionDiscovery::pending_with_config(
-                server_name,
-                &config,
-            )
-            .server,
+            crate::services::mcp::client::McpConnectionDiscovery::pending(server_name, &config)
+                .server,
         );
     }
 
@@ -300,14 +250,21 @@ pub async fn toggle_mcp_server_from_manager(
     .await
     {
         Ok(server) => {
-            runtime_mcp.apply_server_update(server.clone());
-            Ok(Some(server.server))
+            // CC `onConnectionAttempt(result)` after an enable's reconnect
+            // (`useManageMCPConnections.ts:1122`); a disable's record is not
+            // connected and gets no handlers.
+            let client = server.server.clone();
+            crate::services::mcp::use_manage_mcp_connections::on_connection_attempt(
+                server,
+                &runtime_mcp,
+            );
+            Ok(Some(client))
         }
         Err(error) => {
             // The pending row installed above must not be left hanging when the
             // toggle threw; the source's catch path leaves AppState as the
             // manager last wrote it, which for a throw is the failed client.
-            runtime_mcp.apply_server_update(
+            runtime_mcp.apply_client_update(
                 crate::services::mcp::client::McpConnectionDiscovery::failed(
                     server_name,
                     &config,
@@ -334,5 +291,42 @@ mod tests {
             USE_MCP_TOGGLE_ENABLED_CONTEXT_ERROR,
             "useMcpToggleEnabled must be used within MCPConnectionManager"
         );
+    }
+
+    /// CC `reconnectMcpServer` hands its result to `onConnectionAttempt`
+    /// (`useManageMCPConnections.ts:1062-1064`), which assigns the
+    /// connected client's `onclose` (`:333`).
+    #[test]
+    fn a_manual_reconnect_assigns_the_connections_onclose() {
+        let _guard = crate::utils::test_env::TEST_ENV_LOCK.lock().unwrap();
+        let fixture = crate::services::mcp::client::counting_fixture::CountingFixture::new();
+        crate::utils::process_runtime::initialize_test_process_runtime();
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                const SERVER: &str = "manager-reconnect-stdio-fixture";
+                let store = crate::state::store::AppStore::new(
+                    crate::state::app_state_store::AppState::default(),
+                    None,
+                );
+                let writer = McpWriter::new(store);
+                writer.apply_client_update(
+                    crate::services::mcp::client::McpConnectionDiscovery::pending(
+                        SERVER,
+                        &fixture.config(&[]),
+                    )
+                    .server,
+                );
+
+                let server = reconnect_mcp_server_from_manager(SERVER, writer)
+                    .await
+                    .expect("the server is in the state");
+                let client = &server.as_connected().expect("connected").client;
+                assert!(client.onclose().is_some());
+
+                crate::services::mcp::client::clear_server_cache(SERVER, None).await;
+            });
     }
 }

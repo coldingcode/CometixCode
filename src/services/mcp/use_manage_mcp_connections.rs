@@ -19,14 +19,13 @@ use super::client::{
 };
 use super::config::{is_mcp_server_disabled, set_mcp_server_enabled};
 use super::types::{
-    McpPromptSnapshot, McpServerConnectionType, McpServerSnapshot, McpToolSnapshot,
-    ScopedMcpServerConfig, ServerResource, Transport,
+    ConnectedMcpServer, McpServerConnection, McpServerConnectionType, ScopedMcpServerConfig,
+    Transport,
 };
 use crate::state::app_state_store::{McpState, McpWriter};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::LazyLock;
 use std::sync::atomic::Ordering;
-use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 /// Maps to: CC `useManageMCPConnections.ts:95#getErrorKey`.
@@ -91,22 +90,23 @@ pub const INITIAL_BACKOFF_MS: u64 = 1_000;
 /// Maps to: CC `services/mcp/useManageMCPConnections.ts#MAX_BACKOFF_MS`.
 pub const MAX_BACKOFF_MS: u64 = 30_000;
 
-/// Maps to: CC `services/mcp/useManageMCPConnections.ts#getTransportDisplayName`.
-/// Maps to CC `useManageMCPConnections.ts` creating
-/// `AppState.channelPermissionCallbacks` only when channels and
-/// `isChannelPermissionRelayEnabled()` are both enabled. The callbacks live in
+/// Maps to: CC `useManageMCPConnections.ts:168-200`: the channel permission
+/// callbacks exist in a build with `KAIROS` or `KAIROS_CHANNELS`, and go into
+/// `AppState.channelPermissionCallbacks` only while
+/// `isChannelPermissionRelayEnabled()`. The callbacks live in
 /// `AppState.channel_permission_callbacks`; this is the startup seed.
 pub fn channel_permission_callbacks_from_official_gates()
 -> Option<crate::services::mcp::channel_permissions::ChannelPermissionCallbacks> {
-    let channels_enabled = crate::utils::feature_flags::feature_enabled(
-        crate::utils::feature_flags::FeatureFlag::ChannelsEnabled,
-    );
+    use crate::utils::feature_flags::{FeatureFlag, feature_enabled};
+    let channels_built =
+        feature_enabled(FeatureFlag::Kairos) || feature_enabled(FeatureFlag::KairosChannels);
     let relay_enabled =
         crate::services::mcp::channel_permissions::is_channel_permission_relay_enabled();
-    (channels_enabled && relay_enabled)
+    (channels_built && relay_enabled)
         .then(crate::services::mcp::channel_permissions::ChannelPermissionCallbacks::default)
 }
 
+/// Maps to: CC `services/mcp/useManageMCPConnections.ts#getTransportDisplayName`.
 pub fn get_transport_display_name(transport: Transport) -> &'static str {
     match transport {
         Transport::Http => "HTTP",
@@ -133,45 +133,56 @@ pub fn reconnect_backoff_ms(attempt: u32) -> u64 {
 /// Maps to: CC `updateServer({ ...client, type: 'pending', reconnectAttempt,
 /// maxReconnectAttempts })` inside `reconnectWithBackoff`.
 pub fn pending_reconnect_server_update(
-    server: &McpServerSnapshot,
+    server: &McpServerConnection,
     attempt: u32,
-) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.client.status = McpServerConnectionType::Pending;
-    updated.client.reconnect_attempt = Some(attempt);
-    updated.client.max_reconnect_attempts = Some(MAX_RECONNECT_ATTEMPTS);
-    updated.client.error = None;
-    updated
+) -> McpServerConnection {
+    McpServerConnection::Pending(super::types::PendingMcpServer {
+        name: server.name().to_owned(),
+        config: server.config().clone(),
+        reconnect_attempt: Some(attempt),
+        max_reconnect_attempts: Some(MAX_RECONNECT_ATTEMPTS),
+    })
 }
 
 /// Maps to: CC `updateServer({ ...client, type: 'failed' })` reconnect final
-/// failure branch. `updateServer` clears tools/commands/resources for failed
-/// clients, so the aggregate runtime snapshot clears capabilities here too.
-pub fn failed_reconnect_server_update(server: &McpServerSnapshot) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.client.status = McpServerConnectionType::Failed;
-    updated.client.reconnect_attempt = None;
-    updated.client.max_reconnect_attempts = None;
-    updated.client.error = None;
-    updated.tools.clear();
-    updated.prompts.clear();
-    updated.resources.clear();
-    updated
+/// failure branch. The flush clears a failed client's tools and commands; its
+/// resources key stays (`useManageMCPConnections.ts:270-277`).
+pub fn failed_reconnect_server_update(server: &McpServerConnection) -> McpServerConnection {
+    McpServerConnection::failed(server.name(), server.config().clone(), None)
 }
 
-/// Maps to: CC `MCPRemoteServerMenu.tsx#handleClearAuth` AppState update:
-/// mark the regular remote client failed and remove that server's tools,
-/// prompt commands, and resources after revoking tokens and clearing cache.
-pub fn clear_authentication_server_update(server: &McpServerSnapshot) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.client.status = McpServerConnectionType::Failed;
-    updated.client.reconnect_attempt = None;
-    updated.client.max_reconnect_attempts = None;
-    updated.client.error = None;
-    updated.tools.clear();
-    updated.prompts.clear();
-    updated.resources.clear();
-    updated
+/// The `setAppState` both of `MCPRemoteServerMenu`'s clear-auth paths make:
+/// the server's existing client takes the new type and keeps its other fields
+/// (`clients.map(c => ... { ...c, type })`, never an append), and its tools,
+/// commands and resources go (`excludeToolsByServer`,
+/// `excludeCommandsByServer`, `excludeResourcesByServer`).
+fn exclude_server_after_clearing_auth(
+    state: &mut McpState,
+    server_name: &str,
+    retype: fn(&McpServerConnection) -> McpServerConnection,
+) {
+    for server in &mut state.clients {
+        if server.name() == server_name {
+            *server = retype(server);
+        }
+    }
+    state.tools = super::utils::exclude_tools_by_server(&state.tools, server_name);
+    state.commands = super::utils::exclude_commands_by_server(&state.commands, server_name);
+    state.resources = super::utils::exclude_resources_by_server(&state.resources, server_name);
+}
+
+/// Maps to: CC `MCPRemoteServerMenu.tsx:443-469` `handleClearAuth`'s
+/// `setAppState`, after the tokens are revoked and the cache cleared: the
+/// client is marked failed ("a misnomer here") and loses its capabilities.
+pub fn clear_authentication_state(state: &mut McpState, server_name: &str) {
+    exclude_server_after_clearing_auth(state, server_name, |server| {
+        // `{ ...c, type: 'failed' }` keeps an error only a failed `c` had.
+        let error = match server {
+            McpServerConnection::Failed(failed) => failed.error.clone(),
+            _ => None,
+        };
+        McpServerConnection::failed(server.name(), server.config().clone(), error)
+    });
 }
 
 /// Maps to CC `MCPRemoteServerMenu.tsx#handleAuthenticate` result copy.
@@ -193,18 +204,19 @@ pub fn remote_authentication_result_message(
     }
 }
 
-/// Maps to CC `MCPRemoteServerMenu.tsx#handleAuthenticate` side-effect order:
-/// preserve step-up OAuth state for re-auth, run the MCP OAuth service flow,
-/// then reconnect the server through the MCP connection manager.
+/// Maps to CC `MCPRemoteServerMenu.tsx#handleAuthenticate`'s OAuth half
+/// (`:361-380`): preserve step-up OAuth state for re-auth, then run the MCP
+/// OAuth service flow. The reconnect after it is the menu's, through the
+/// connection manager (`:386` `reconnectMcpServer`), whose
+/// `onConnectionAttempt` gives the new connection its handlers.
 pub async fn authenticate_remote_mcp_server_once(
     server_name: &str,
     config: &ScopedMcpServerConfig,
     was_authenticated: bool,
-    was_effectively_authenticated: bool,
     on_authorization_url: Option<super::auth::McpAuthorizationUrlCallback>,
     on_waiting_for_callback: Option<super::auth::McpWaitingForCallbackCallback>,
     abort_signal: Option<super::auth::McpOAuthAbortSignal>,
-) -> anyhow::Result<(McpConnectionDiscovery, String)> {
+) -> anyhow::Result<()> {
     if was_authenticated {
         super::auth::revoke_server_tokens(server_name, config, true).await?;
     }
@@ -220,65 +232,17 @@ pub async fn authenticate_remote_mcp_server_once(
         },
     )
     .await?;
-
-    let updated = reconnect_mcp_server_once(server_name, config).await;
-    let message = remote_authentication_result_message(
-        updated.server.client.status,
-        server_name,
-        was_effectively_authenticated,
-    );
-    Ok((updated, message))
+    Ok(())
 }
 
-/// Maps to CC `MCPRemoteServerMenu.tsx#handleClaudeAIClearAuthComplete` AppState
-/// update: mark the Claude.ai proxy client as needs-auth and remove tools,
-/// prompt commands, and resources.
-pub fn claude_ai_clear_authentication_server_update(
-    server: &McpServerSnapshot,
-) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.client.status = McpServerConnectionType::NeedsAuth;
-    updated.client.reconnect_attempt = None;
-    updated.client.max_reconnect_attempts = None;
-    updated.client.error = None;
-    updated.tools.clear();
-    updated.prompts.clear();
-    updated.resources.clear();
-    updated
-}
-
-/// Maps to: CC `updateServer({ ...client, tools: newTools })` in the
-/// `tools/list_changed` notification handler.
-pub fn tools_list_changed_server_update(
-    server: &McpServerSnapshot,
-    tools: Vec<McpToolSnapshot>,
-) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.tools = tools;
-    updated
-}
-
-/// Maps to: CC `updateServer({ ...client, commands: [...] })` in the
-/// `prompts/list_changed` notification handler. Cometix stores MCP prompt
-/// commands in `McpServerSnapshot.prompts`.
-pub fn prompts_list_changed_server_update(
-    server: &McpServerSnapshot,
-    prompts: Vec<McpPromptSnapshot>,
-) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.prompts = prompts;
-    updated
-}
-
-/// Maps to: CC `updateServer({ ...client, resources: newResources })` in the
-/// non-`MCP_SKILLS` `resources/list_changed` branch.
-pub fn resources_list_changed_server_update(
-    server: &McpServerSnapshot,
-    resources: Vec<ServerResource>,
-) -> McpServerSnapshot {
-    let mut updated = server.clone();
-    updated.resources = resources;
-    updated
+/// Maps to: CC `MCPRemoteServerMenu.tsx:166-190`
+/// `handleClaudeAIClearAuthComplete`'s `setAppState`, after the cache is
+/// cleared: the claude.ai proxy client becomes needs-auth and loses its
+/// capabilities.
+pub fn claude_ai_clear_authentication_state(state: &mut McpState, server_name: &str) {
+    exclude_server_after_clearing_auth(state, server_name, |server| {
+        McpServerConnection::needs_auth(server.name(), server.config().clone())
+    });
 }
 
 /// Maps to: CC `client.client.onclose` branch ordering: disabled servers stop,
@@ -308,13 +272,13 @@ fn reconnect_base_server(
     name: &str,
     config: &ScopedMcpServerConfig,
     runtime_mcp: McpWriter,
-) -> McpServerSnapshot {
+) -> McpServerConnection {
     runtime_mcp
         .current()
         .clients
         .into_iter()
-        .find(|server| server.client.name == name)
-        .unwrap_or_else(|| McpConnectionDiscovery::pending_with_config(name, config).server)
+        .find(|server| server.name() == name)
+        .unwrap_or_else(|| McpConnectionDiscovery::pending(name, config).server)
 }
 
 /// Maps to: CC `reconnectTimersRef.current.get(name)` cancellation before
@@ -329,170 +293,232 @@ pub fn cancel_pending_mcp_reconnect(name: &str) {
     }
 }
 
-/// Maps to: CC `client.client.onclose` branch that either marks stdio/sdk
-/// clients failed or starts `reconnectWithBackoff` for remote transports.
+/// Maps to: CC `client.client.onclose` (`useManageMCPConnections.ts:333-468`):
+/// a disabled server is left alone, stdio/sdk clients are marked failed, and
+/// remote transports start `reconnectWithBackoff`.
 pub async fn handle_mcp_server_closed_event(
     name: String,
     config: ScopedMcpServerConfig,
     runtime_mcp: McpWriter,
 ) {
-    clear_server_cache(&name, None).await;
+    // CC's handler opens with `clearServerCache(client.name, client.config)`
+    // (`useManageMCPConnections.ts:336`), unawaited. Assigning this handler
+    // (`:333`) replaced `connectToServer`'s own `onclose` wrapper
+    // (`client.ts:1374`), so for the REPL's connections that call is what
+    // deletes the closed connection's memo entry and the name's fetch caches.
+    // The close watcher running this `onclose` has already done both for
+    // exactly that connection; clearing the key again here could only close a
+    // newer connection made under it since.
     match closed_server_reconnect_decision(config.transport, is_mcp_server_disabled(&name)) {
-        ClosedServerReconnectDecision::SkipDisabled => {}
+        ClosedServerReconnectDecision::SkipDisabled => {
+            crate::utils::log::log_mcp_debug(
+                &name,
+                "Server is disabled, skipping automatic reconnection",
+            );
+        }
         ClosedServerReconnectDecision::MarkFailed => {
             let base = reconnect_base_server(&name, &config, runtime_mcp.clone());
-            runtime_mcp.apply_server_update(failed_reconnect_server_update(&base));
+            runtime_mcp.apply_client_update(failed_reconnect_server_update(&base));
         }
         ClosedServerReconnectDecision::StartAutomaticReconnect => {
+            crate::utils::log::log_mcp_debug(
+                &name,
+                &format!(
+                    "{} transport closed/disconnected, attempting automatic reconnection",
+                    get_transport_display_name(config.transport)
+                ),
+            );
             start_automatic_mcp_reconnect(name, config, runtime_mcp).await;
         }
     }
 }
 
-/// Resolves the full-client base a list_changed update rides on. CC's
-/// notification handler closure captures the connection-time client and sends
-/// `updateServer({ ...client, <dimension> })` — that captured snapshot is
-/// always `type: 'connected'`, so the flush replaces the record with a
-/// connected client even if it mutated (pending/disabled) in the meantime,
-/// and the flush's disabled/failed clearing rule
-/// (`useManageMCPConnections.ts:232-243`) is unreachable on this path. The
-/// Rust routing layer carries only the server name, so the base is resolved
-/// from the store at apply time with the status FORCED back to Connected to
-/// preserve both properties; a missing client is resynthesized likewise so
-/// the append-when-missing semantics (:250-253) survive the
-/// stale-notification race. Carrying the true connection-time snapshot
-/// end-to-end remains an explicit seam for the MCP producer parity batch.
-fn resolve_list_changed_client_base(name: &str, runtime_mcp: &McpWriter) -> McpServerSnapshot {
-    let mut server = runtime_mcp
-        .current()
-        .clients
-        .into_iter()
-        .find(|server| server.client.name == name)
-        .unwrap_or_else(|| McpConnectionDiscovery::pending(name).server);
-    server.client.status = McpServerConnectionType::Connected;
-    server
-}
+// The list_changed handlers below send the connection the list was refetched
+// from, as CC's do with the `client` their closure captured
+// (`updateServer({ ...client, <dimension> })`). That record is always
+// connected, so the flush replaces the server's record with it even if it
+// went pending or disabled meanwhile, and appends it if it is missing
+// (`useManageMCPConnections.ts:232-253`).
 
 /// Maps to: CC `ToolListChangedNotificationSchema` handler in
 /// `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`
 /// (`updateServer({ ...client, tools: newTools })`, :656).
-pub async fn handle_mcp_tools_list_changed_event(name: String, runtime_mcp: McpWriter) {
-    match refresh_mcp_tools_for_client(&name).await {
-        Ok(tools) => {
-            let mut update = resolve_list_changed_client_base(&name, &runtime_mcp);
-            update.tools = tools;
-            runtime_mcp.apply_tools_list_changed(update);
-        }
-        Err(error) => {
-            tracing::warn!(server = %name, error = %error, "failed to refresh MCP tools after list_changed notification")
-        }
-    }
+pub async fn handle_mcp_tools_list_changed_event(
+    client: McpServerConnection,
+    runtime_mcp: McpWriter,
+) {
+    let tools = refresh_mcp_tools_for_client(&client).await;
+    runtime_mcp.apply_server_update(McpPendingUpdate {
+        server: client,
+        tools: Some(tools),
+        commands: None,
+        resources: None,
+    });
 }
 
 /// Maps to: CC `PromptListChangedNotificationSchema` handler in
 /// `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`
 /// (`updateServer({ ...client, commands: [...] })`, :688-691).
-pub async fn handle_mcp_prompts_list_changed_event(name: String, runtime_mcp: McpWriter) {
-    match refresh_mcp_prompts_for_client(&name).await {
-        Ok(prompts) => {
-            let mut update = resolve_list_changed_client_base(&name, &runtime_mcp);
-            update.prompts = prompts;
-            runtime_mcp.apply_prompts_list_changed(update);
-        }
-        Err(error) => {
-            tracing::warn!(server = %name, error = %error, "failed to refresh MCP prompts after list_changed notification")
-        }
-    }
+pub async fn handle_mcp_prompts_list_changed_event(
+    client: McpServerConnection,
+    runtime_mcp: McpWriter,
+) {
+    let commands = refresh_mcp_prompts_for_client(&client).await;
+    runtime_mcp.apply_server_update(McpPendingUpdate {
+        server: client,
+        tools: None,
+        commands: Some(commands),
+        resources: None,
+    });
 }
 
-/// Maps to: CC `ResourceListChangedNotificationSchema` handler in the
-/// non-`MCP_SKILLS` branch (`updateServer({ ...client, resources })`, :741).
-/// MCP skill refresh/index invalidation remains tied to the separate Skill
-/// runtime parity item.
-pub async fn handle_mcp_resources_list_changed_event(name: String, runtime_mcp: McpWriter) {
-    match refresh_mcp_resources_for_client(&name).await {
-        Ok(resources) => {
-            let mut update = resolve_list_changed_client_base(&name, &runtime_mcp);
-            update.resources = resources;
-            runtime_mcp.apply_resources_list_changed(update);
-        }
-        Err(error) => {
-            tracing::warn!(server = %name, error = %error, "failed to refresh MCP resources after list_changed notification")
-        }
+/// Maps to: CC `ResourceListChangedNotificationSchema` handler
+/// (`useManageMCPConnections.ts:705-751`). With `MCP_SKILLS`, the build CC
+/// ships, the prompts are refetched alongside the resources and written
+/// with them (`:718-738`); the MCP skill producer is a stub in the source
+/// (`skills/mcpSkills.ts`), so its share of the commands is empty, and the
+/// skill index clear is `EXPERIMENTAL_SKILL_SEARCH`'s, which is off.
+pub async fn handle_mcp_resources_list_changed_event(
+    client: McpServerConnection,
+    runtime_mcp: McpWriter,
+) {
+    if crate::utils::feature_flags::feature_enabled(
+        crate::utils::feature_flags::FeatureFlag::McpSkills,
+    ) {
+        let (resources, commands) = tokio::join!(
+            refresh_mcp_resources_for_client(&client),
+            refresh_mcp_prompts_for_client(&client),
+        );
+        runtime_mcp.apply_server_update(McpPendingUpdate {
+            server: client,
+            tools: None,
+            commands: Some(commands),
+            resources: Some(resources),
+        });
+        return;
     }
+    let resources = refresh_mcp_resources_for_client(&client).await;
+    runtime_mcp.apply_server_update(McpPendingUpdate {
+        server: client,
+        tools: None,
+        commands: None,
+        resources: Some(resources),
+    });
 }
 
-/// Maps to: CC `useManageMCPConnections.ts` channel notification handler after
-/// `gateChannelServer(...)` returns `register`.
-pub fn handle_channel_message_notification_with_context(
-    server_name: &str,
-    content: &str,
-    meta: Option<&BTreeMap<String, String>>,
-    has_channel_capability: bool,
-    plugin_source: Option<&str>,
+/// Maps to: CC `useManageMCPConnections.ts:470-614`, the channel block of
+/// `onConnectionAttempt`: `gateChannelServer(client.name,
+/// client.capabilities, client.config.pluginSource)` decides when the client
+/// connects whether it gets channel handlers. Registered, its channel
+/// messages are queued, and — if the server declared
+/// `claude/channel/permission` — its permission replies resolve the
+/// session's pending relays (`channelPermCallbacksRef.current`, here
+/// `callbacks`, the same shared object). Skipped, any handlers an earlier
+/// connect registered are removed, so a demotion takes effect.
+///
+/// CC also raises a toast once per skip kind (`:578-611`); it is not ported,
+/// since nothing here reaches the notifications, and the block runs only
+/// with `KAIROS` or `KAIROS_CHANNELS`, both off.
+pub(crate) fn install_channel_handlers(
+    connected: &ConnectedMcpServer,
     context: &ChannelRuntimeGateContext,
-) -> ChannelGateResult {
+    callbacks: Option<ChannelPermissionCallbacks>,
+) {
+    use super::channel_notification::{
+        CHANNEL_EXPERIMENTAL_CAPABILITY, CHANNEL_MESSAGE_NOTIFICATION_METHOD,
+        CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY, CHANNEL_PERMISSION_METHOD,
+        parse_channel_message_notification_params, parse_channel_permission_notification_params,
+    };
+    use futures::FutureExt as _;
+    let declares = |capability: &str| {
+        connected
+            .capabilities
+            .experimental
+            .as_ref()
+            .is_some_and(|experimental| experimental.contains_key(capability))
+    };
     let gate = gate_channel_server_from_context(
-        server_name,
-        has_channel_capability,
+        &connected.name,
+        declares(CHANNEL_EXPERIMENTAL_CAPABILITY),
         context.channels_enabled,
         context.has_claude_ai_oauth,
         context.subscription.as_deref(),
         context.policy_channels_enabled,
         &context.session_channels,
-        plugin_source,
+        connected.config.plugin_source.as_deref(),
         &context.allowlist,
     );
-    if gate == ChannelGateResult::Register {
-        enqueue_channel_message_notification(server_name, content, meta);
+    let client = &connected.client;
+    match gate {
+        ChannelGateResult::Register => {
+            crate::utils::log::log_mcp_debug(&connected.name, "Channel notifications registered");
+            let name = connected.name.clone();
+            client.set_notification_handler(CHANNEL_MESSAGE_NOTIFICATION_METHOD, move |params| {
+                match parse_channel_message_notification_params(params.as_ref()) {
+                    Ok(parsed) => {
+                        // CC `content.slice(0, 80)`: UTF-16 code units.
+                        let preview = String::from_utf16_lossy(
+                            &parsed.content.encode_utf16().take(80).collect::<Vec<_>>(),
+                        );
+                        crate::utils::log::log_mcp_debug(
+                            &name,
+                            &format!("notifications/claude/channel: {preview}"),
+                        );
+                        enqueue_channel_message_notification(
+                            &name,
+                            &parsed.content,
+                            parsed.meta.as_ref(),
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(server = %name, error = %error, "invalid MCP channel notification");
+                    }
+                }
+                futures::future::ready(()).boxed()
+            });
+            if declares(CHANNEL_PERMISSION_EXPERIMENTAL_CAPABILITY) {
+                let name = connected.name.clone();
+                client.set_notification_handler(CHANNEL_PERMISSION_METHOD, move |params| {
+                    match parse_channel_permission_notification_params(params.as_ref()) {
+                        Ok(parsed) => {
+                            let resolved =
+                                super::channel_permissions::handle_channel_permission_notification(
+                                    callbacks.as_ref(),
+                                    &parsed.request_id,
+                                    parsed.behavior,
+                                    &name,
+                                );
+                            crate::utils::log::log_mcp_debug(
+                                &name,
+                                &format!(
+                                    "notifications/claude/channel/permission: {} → {} ({})",
+                                    parsed.request_id,
+                                    parsed.behavior.as_str(),
+                                    if resolved {
+                                        "matched pending"
+                                    } else {
+                                        "no pending entry — stale or unknown ID"
+                                    }
+                                ),
+                            );
+                        }
+                        Err(error) => {
+                            tracing::warn!(server = %name, error = %error, "invalid MCP channel permission notification");
+                        }
+                    }
+                    futures::future::ready(()).boxed()
+                });
+            }
+        }
+        ChannelGateResult::Skip { reason, .. } => {
+            client.remove_notification_handler(CHANNEL_MESSAGE_NOTIFICATION_METHOD);
+            client.remove_notification_handler(CHANNEL_PERMISSION_METHOD);
+            crate::utils::log::log_mcp_debug(
+                &connected.name,
+                &format!("Channel notifications skipped: {reason}"),
+            );
+        }
     }
-    gate
-}
-
-/// Maps to: CC `gateChannelServer(...)` runtime reads and enqueue side effect
-/// inside `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`.
-pub fn handle_channel_message_notification_event(
-    server_name: &str,
-    content: &str,
-    meta: Option<&BTreeMap<String, String>>,
-    has_channel_capability: bool,
-    plugin_source: Option<&str>,
-) -> ChannelGateResult {
-    let policy_settings = crate::utils::settings::get_settings_for_source(
-        crate::utils::settings::constants::SettingSource::Policy,
-    );
-    let context = channel_gate_context_from_readonly_runtime(policy_settings.as_ref());
-    handle_channel_message_notification_with_context(
-        server_name,
-        content,
-        meta,
-        has_channel_capability,
-        plugin_source,
-        &context,
-    )
-}
-
-/// Maps to: CC `useManageMCPConnections.ts` channel permission notification
-/// handler registered under `CHANNEL_PERMISSION_METHOD`.
-pub fn handle_channel_permission_notification_event(
-    callbacks: Option<&crate::services::mcp::channel_permissions::ChannelPermissionCallbacks>,
-    server_name: &str,
-    request_id: &str,
-    behavior: crate::services::mcp::channel_permissions::ChannelPermissionBehavior,
-    has_permission_capability: bool,
-) -> Option<bool> {
-    if !has_permission_capability {
-        tracing::debug!(server = %server_name, request_id = %request_id, "MCP channel permission notification skipped: missing capability");
-        return None;
-    }
-    Some(
-        crate::services::mcp::channel_permissions::handle_channel_permission_notification(
-            callbacks,
-            request_id,
-            behavior,
-            server_name,
-        ),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -500,13 +526,120 @@ pub fn handle_channel_permission_notification_event(
 //
 // Claude Code registers `onclose` / `setNotificationHandler` closures inside
 // `onConnectionAttempt` that call `updateServer` / `setAppState` directly.
-// Cometix keeps that ownership here: App mounts [`OnConnectionAttemptHandlers`],
-// and the rmcp client handler invokes the `emit_*` entry points below.
+// The elicitation, `onclose`, channel and list_changed handlers are assigned
+// on the client itself here too ([`install_connection_handlers`]). App still
+// mounts [`OnConnectionAttemptHandlers`] for what CC reaches through the
+// session rather than a connection: the channel relay callbacks, and the
+// queue push for a tool call's URL elicitation (`emit_elicitation_requested`).
 // IDE `selection_changed` is REPL-owned (CC `useIdeSelection`): the REPL
-// threads its per-connection selection sender through this registry via
-// [`set_ide_selection_sink`]; `replace_cached_client` clones it into each new
-// "ide" connection entry (CC `client.setNotificationHandler(...)` per client).
+// registers its handler on the IDE client itself
+// (`hooks::use_ide_selection::use_ide_selection`).
 // ---------------------------------------------------------------------------
+
+/// Maps to: CC `onConnectionAttempt(result)` (`useManageMCPConnections.ts:
+/// 310-763`) where the session writes the result at once — the automatic
+/// reconnect, the manager's reconnect and enable: the connected client gets
+/// its handlers, then `updateServer`. The initial connect batches the write
+/// instead (`McpPendingUpdates::on_connection_attempt`).
+///
+/// Only the connections the session connects, reconnects or enables go
+/// through it; an agent's, one `ensureConnectedClient` makes and one the
+/// auth tool reconnects do not, and have no handlers.
+pub(crate) fn on_connection_attempt(result: McpConnectionDiscovery, writer: &McpWriter) {
+    install_connection_handlers(&result.server, writer);
+    writer.apply_server_update(result);
+}
+
+/// Maps to: CC what `onConnectionAttempt` installs on a connected client
+/// (`useManageMCPConnections.ts:326-753`): its elicitation handlers
+/// (`registerElicitationHandler`, `:327-331`), its `onclose`
+/// (`client.client.onclose = () => { ... }`, `:333-468`), the channel
+/// handlers its gate allows (`:470-614`, [`install_channel_handlers`]), and a
+/// list_changed handler per list the server declared can change
+/// (`:616-751`). The handlers capture the writer where CC's capture
+/// `updateServer`; the writer applies its updates at once, CC's queue
+/// batches them.
+fn install_connection_handlers(server: &McpServerConnection, writer: &McpWriter) {
+    use crate::utils::feature_flags::{FeatureFlag, feature_enabled};
+    use futures::FutureExt as _;
+    use rmcp::model::ConstString as _;
+    let Some(connected) = server.as_connected() else {
+        return;
+    };
+    // Maps to: CC `:327-331`, in place of `connectToServer`'s default.
+    super::elicitation_handler::register_elicitation_handler(
+        &connected.client,
+        &connected.name,
+        writer,
+    );
+    {
+        let (name, config, writer) = (
+            connected.name.clone(),
+            connected.config.clone(),
+            writer.clone(),
+        );
+        connected.client.set_onclose(move || {
+            handle_mcp_server_closed_event(name.clone(), config.clone(), writer.clone()).boxed()
+        });
+    }
+
+    // Maps to: CC `:470-614`, built with `feature('KAIROS') ||
+    // feature('KAIROS_CHANNELS')`.
+    if feature_enabled(FeatureFlag::Kairos) || feature_enabled(FeatureFlag::KairosChannels) {
+        let policy_settings = crate::utils::settings::get_settings_for_source(
+            crate::utils::settings::constants::SettingSource::Policy,
+        );
+        install_channel_handlers(
+            connected,
+            &channel_gate_context_from_readonly_runtime(policy_settings.as_ref()),
+            with_connection_handlers(|hooks| hooks.channel_permission_callbacks.clone()).flatten(),
+        );
+    }
+
+    // Maps to: CC `:616-751`: a handler for each list the server declared
+    // can change, refreshing it on the client it closed over. The handler
+    // lives on that client, so it holds it weakly.
+    let capabilities = &connected.capabilities;
+    let lists: [(bool, &str, &'static str, ListChangedHandler); 3] = [
+        (
+            declares_tools_list_changed(capabilities),
+            rmcp::model::ToolListChangedNotificationMethod::VALUE,
+            "Received tools/list_changed notification, refreshing tools",
+            |client, writer| handle_mcp_tools_list_changed_event(client, writer).boxed(),
+        ),
+        (
+            declares_prompts_list_changed(capabilities),
+            rmcp::model::PromptListChangedNotificationMethod::VALUE,
+            "Received prompts/list_changed notification, refreshing prompts",
+            |client, writer| handle_mcp_prompts_list_changed_event(client, writer).boxed(),
+        ),
+        (
+            declares_resources_list_changed(capabilities),
+            rmcp::model::ResourceListChangedNotificationMethod::VALUE,
+            "Received resources/list_changed notification, refreshing resources",
+            |client, writer| handle_mcp_resources_list_changed_event(client, writer).boxed(),
+        ),
+    ];
+    for (declared, method, message, refresh) in lists {
+        if !declared {
+            continue;
+        }
+        let (client, writer) = (connected.client.downgrade(), writer.clone());
+        connected.client.set_notification_handler(method, move |_| {
+            match client.connected_record() {
+                Some(client) => {
+                    crate::utils::log::log_mcp_debug(client.name(), message);
+                    refresh(client, writer.clone())
+                }
+                None => futures::future::ready(()).boxed(),
+            }
+        });
+    }
+}
+
+/// The body of a list_changed handler: refetch on `client`, write with it.
+type ListChangedHandler =
+    fn(McpServerConnection, McpWriter) -> futures::future::BoxFuture<'static, ()>;
 
 use crate::services::mcp::elicitation_handler::ElicitationRequestEvent;
 use std::collections::VecDeque;
@@ -520,42 +653,16 @@ static CONNECTION_ATTEMPT_HANDLERS: OnceLock<StdMutex<ConnectionAttemptRegistry>
 #[derive(Default)]
 struct ConnectionAttemptRegistry {
     handlers: Option<OnConnectionAttemptHandlers>,
-    /// Maps to: CC `useIdeSelection(mcp.clients, setIDESelection)` — the
-    /// REPL-owned selection sender. Stored here only as the threading path;
-    /// the live per-connection sink is the clone captured by each "ide"
-    /// entry in `CONNECTED_CLIENTS` (dropped with the entry — CC
-    /// useIdeSelection.ts:148 "No cleanup needed").
-    ide_selection_sink:
-        Option<async_channel::Sender<crate::hooks::use_ide_selection::IdeSelection>>,
 }
 
 fn connection_attempt_handlers_slot() -> &'static StdMutex<ConnectionAttemptRegistry> {
     CONNECTION_ATTEMPT_HANDLERS.get_or_init(|| StdMutex::new(ConnectionAttemptRegistry::default()))
 }
 
-/// Maps to: CC `useIdeSelection` re-running its effect with the latest
-/// `onSelect`: replaces the sender future "ide" connections will capture.
-pub(crate) fn set_ide_selection_sink(
-    sink: async_channel::Sender<crate::hooks::use_ide_selection::IdeSelection>,
-) {
-    connection_attempt_handlers_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .ide_selection_sink = Some(sink);
-}
-
-/// Sender a newly cached connection should capture (None until a REPL mounts).
-pub(crate) fn current_ide_selection_sink()
--> Option<async_channel::Sender<crate::hooks::use_ide_selection::IdeSelection>> {
-    connection_attempt_handlers_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .ide_selection_sink
-        .clone()
-}
-
-/// Live writers captured like CC `onConnectionAttempt` closures
-/// (`updateServer` / `setAppState`).
+/// The session-level handles the MCP layer reaches outside a connection's
+/// own handlers: the channel relay callbacks (CC
+/// `channelPermCallbacksRef`), and the writer for a tool call's URL
+/// elicitation queue push (CC the caller's `setAppState`).
 #[derive(Clone)]
 pub struct OnConnectionAttemptHandlers {
     mcp: McpWriter,
@@ -573,80 +680,12 @@ impl OnConnectionAttemptHandlers {
         }
     }
 
-    /// Maps to: CC `client.client.onclose` body in `onConnectionAttempt`.
-    pub async fn on_server_closed(&self, name: String, config: ScopedMcpServerConfig) {
-        handle_mcp_server_closed_event(name, config, self.mcp.clone()).await;
-    }
-
-    /// Maps to: CC `ToolListChangedNotificationSchema` handler.
-    pub async fn on_tools_list_changed(&self, name: String) {
-        handle_mcp_tools_list_changed_event(name, self.mcp.clone()).await;
-    }
-
-    /// Maps to: CC `PromptListChangedNotificationSchema` handler.
-    pub async fn on_prompts_list_changed(&self, name: String) {
-        handle_mcp_prompts_list_changed_event(name, self.mcp.clone()).await;
-    }
-
-    /// Maps to: CC `ResourceListChangedNotificationSchema` handler.
-    pub async fn on_resources_list_changed(&self, name: String) {
-        handle_mcp_resources_list_changed_event(name, self.mcp.clone()).await;
-    }
-
-    /// Maps to: CC channel message notification handler in `onConnectionAttempt`.
-    pub fn on_channel_message_received(
-        &self,
-        name: &str,
-        content: &str,
-        meta: Option<&std::collections::BTreeMap<String, String>>,
-        has_channel_capability: bool,
-        plugin_source: Option<&str>,
-    ) {
-        let gate = handle_channel_message_notification_event(
-            name,
-            content,
-            meta,
-            has_channel_capability,
-            plugin_source,
-        );
-        if let ChannelGateResult::Skip { reason, .. } = gate {
-            tracing::debug!(server = %name, reason = %reason, "MCP channel notification skipped");
-        }
-    }
-
-    /// Maps to: CC channel permission notification handler in `onConnectionAttempt`.
-    pub fn on_channel_permission_received(
-        &self,
-        name: &str,
-        request_id: &str,
-        behavior: crate::services::mcp::channel_permissions::ChannelPermissionBehavior,
-        has_permission_capability: bool,
-    ) {
-        let Some(resolved) = handle_channel_permission_notification_event(
-            self.channel_permission_callbacks.as_ref(),
-            name,
-            request_id,
-            behavior,
-            has_permission_capability,
-        ) else {
-            return;
-        };
-        tracing::debug!(
-            server = %name,
-            request_id = %request_id,
-            resolved = resolved,
-            "MCP channel permission notification received"
-        );
-    }
-
-    /// Maps to: CC `registerElicitationHandler` → `setAppState` queue push.
+    /// Maps to: CC `callMCPToolWithUrlElicitationRetry`'s REPL branch
+    /// (`client.ts:2948-2997`, the `setAppState` at `:2964-2995`): the queue
+    /// push for a tool call's -32042 URL elicitation, which comes with the
+    /// tool call's context rather than a connection's handler.
     pub fn on_elicitation_requested(&self, event: ElicitationRequestEvent) {
         self.mcp.push_elicitation_event(event);
-    }
-
-    /// Maps to: CC elicitation-complete notification → `setAppState` queue update.
-    pub fn on_elicitation_completed(&self, name: &str, elicitation_id: &str) {
-        self.mcp.mark_elicitation_complete(name, elicitation_id);
     }
 }
 
@@ -658,13 +697,6 @@ pub fn register_on_connection_attempt_handlers(hooks: OnConnectionAttemptHandler
         .handlers = Some(hooks);
 }
 
-pub fn clear_on_connection_attempt_handlers() {
-    connection_attempt_handlers_slot()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .handlers = None;
-}
-
 fn with_connection_handlers<R>(f: impl FnOnce(&OnConnectionAttemptHandlers) -> R) -> Option<R> {
     let guard = connection_attempt_handlers_slot()
         .lock()
@@ -672,52 +704,12 @@ fn with_connection_handlers<R>(f: impl FnOnce(&OnConnectionAttemptHandlers) -> R
     guard.handlers.as_ref().map(f)
 }
 
-async fn with_connection_handlers_async<R, Fut>(
-    f: impl FnOnce(OnConnectionAttemptHandlers) -> Fut,
-) -> Option<R>
-where
-    Fut: std::future::Future<Output = R>,
-{
-    let hooks = {
-        let guard = connection_attempt_handlers_slot()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        guard.handlers.clone()
-    };
-    if let Some(hooks) = hooks {
-        Some(f(hooks).await)
-    } else {
-        None
-    }
-}
-
-// --- emit helpers used by the rmcp client handler (CC setNotificationHandler bodies) ---
-
-pub(crate) async fn emit_server_closed(name: String, config: ScopedMcpServerConfig) {
-    let handled = with_connection_handlers_async({
-        let name = name.clone();
-        let config = config.clone();
-        |hooks| async move { hooks.on_server_closed(name, config).await }
-    })
-    .await
-    .is_some();
-    if handled {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ServerClosed { name, config }).await;
-}
+// --- list_changed registration gates, and the URL elicitation queue push ---
 
 /// Maps to: CC `useManageMCPConnections.ts:618`
-/// `if (client.capabilities?.tools?.listChanged)`.
-///
-/// At the source this gates handler REGISTRATION — a server that never declared
-/// the capability simply has no handler installed. rmcp installs its handler
-/// trait methods unconditionally, so the gate has to be evaluated per
-/// notification instead. The predicate lives here rather than at the rmcp
-/// handler in `client.rs` because the decision is this file's: `client.rs` is
-/// the transport seam that happens to receive the notification, and
-/// `useManageMCPConnections.ts` is what CC gives the choice to.
-#[cfg(feature = "mcp_runtime")]
+/// `if (client.capabilities?.tools?.listChanged)`: it gates the handler's
+/// registration — a server that never declared the capability has none
+/// ([`install_connection_handlers`]).
 pub(crate) fn declares_tools_list_changed(capabilities: &rmcp::model::ServerCapabilities) -> bool {
     capabilities
         .tools
@@ -727,9 +719,8 @@ pub(crate) fn declares_tools_list_changed(capabilities: &rmcp::model::ServerCapa
 }
 
 /// Maps to: CC `useManageMCPConnections.ts:667`
-/// `if (client.capabilities?.prompts?.listChanged)` — see
-/// [`declares_tools_list_changed`] for why the gate moved inside.
-#[cfg(feature = "mcp_runtime")]
+/// `if (client.capabilities?.prompts?.listChanged)`, the prompts handler's
+/// registration gate.
 pub(crate) fn declares_prompts_list_changed(
     capabilities: &rmcp::model::ServerCapabilities,
 ) -> bool {
@@ -741,13 +732,12 @@ pub(crate) fn declares_prompts_list_changed(
 }
 
 /// Maps to: CC `useManageMCPConnections.ts:705`
-/// `if (client.capabilities?.resources?.listChanged)` — see
-/// [`declares_tools_list_changed`] for why the gate moved inside.
+/// `if (client.capabilities?.resources?.listChanged)`, the resources
+/// handler's registration gate.
 ///
 /// Note this is the `listChanged` sub-capability, NOT `!!capabilities.resources`
-/// (CC `client.ts:2169`), which is a separate question already answered by
-/// `McpServerSnapshot::supports_resources`.
-#[cfg(feature = "mcp_runtime")]
+/// (CC `client.ts:2169`), which is a separate question: a connected record's
+/// `capabilities.resources`.
 pub(crate) fn declares_resources_list_changed(
     capabilities: &rmcp::model::ServerCapabilities,
 ) -> bool {
@@ -758,104 +748,6 @@ pub(crate) fn declares_resources_list_changed(
         .unwrap_or(false)
 }
 
-pub(crate) async fn emit_tools_list_changed(name: String) {
-    let handled = with_connection_handlers_async({
-        let name = name.clone();
-        |hooks| async move { hooks.on_tools_list_changed(name).await }
-    })
-    .await
-    .is_some();
-    if handled {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ToolsListChanged { name }).await;
-}
-
-pub(crate) async fn emit_prompts_list_changed(name: String) {
-    let handled = with_connection_handlers_async({
-        let name = name.clone();
-        |hooks| async move { hooks.on_prompts_list_changed(name).await }
-    })
-    .await
-    .is_some();
-    if handled {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::PromptsListChanged { name }).await;
-}
-
-pub(crate) async fn emit_resources_list_changed(name: String) {
-    let handled = with_connection_handlers_async({
-        let name = name.clone();
-        |hooks| async move { hooks.on_resources_list_changed(name).await }
-    })
-    .await
-    .is_some();
-    if handled {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ResourcesListChanged { name }).await;
-}
-
-pub(crate) async fn emit_channel_message_received(
-    name: String,
-    content: String,
-    meta: Option<std::collections::BTreeMap<String, String>>,
-    has_channel_capability: bool,
-    plugin_source: Option<String>,
-) {
-    if with_connection_handlers(|hooks| {
-        hooks.on_channel_message_received(
-            &name,
-            &content,
-            meta.as_ref(),
-            has_channel_capability,
-            plugin_source.as_deref(),
-        );
-    })
-    .is_some()
-    {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ChannelMessageReceived {
-        name,
-        content,
-        meta,
-        has_channel_capability,
-        plugin_source,
-    })
-    .await;
-}
-
-pub(crate) async fn emit_channel_permission_received(
-    name: String,
-    request_id: String,
-    behavior: crate::services::mcp::channel_permissions::ChannelPermissionBehavior,
-    has_permission_capability: bool,
-) {
-    if with_connection_handlers(|hooks| {
-        hooks.on_channel_permission_received(
-            &name,
-            &request_id,
-            behavior,
-            has_permission_capability,
-        );
-    })
-    .is_some()
-    {
-        return;
-    }
-    observe_for_test(
-        McpConnectionCallbackObservation::ChannelPermissionReceived {
-            name,
-            request_id,
-            behavior,
-            has_permission_capability,
-        },
-    )
-    .await;
-}
-
 pub(crate) async fn emit_elicitation_requested(event: ElicitationRequestEvent) {
     if with_connection_handlers(|hooks| hooks.on_elicitation_requested(event.clone())).is_some() {
         return;
@@ -863,56 +755,11 @@ pub(crate) async fn emit_elicitation_requested(event: ElicitationRequestEvent) {
     observe_for_test(McpConnectionCallbackObservation::ElicitationRequested { event }).await;
 }
 
-pub(crate) async fn emit_elicitation_completed(name: String, elicitation_id: String) {
-    if with_connection_handlers(|hooks| hooks.on_elicitation_completed(&name, &elicitation_id))
-        .is_some()
-    {
-        return;
-    }
-    observe_for_test(McpConnectionCallbackObservation::ElicitationCompleted {
-        name,
-        elicitation_id,
-    })
-    .await;
-}
-
 /// Observation queue used only when App has not registered session hooks
 /// (unit tests that exercise the rmcp client without mounting App).
 #[derive(Clone, Debug, PartialEq)]
 pub enum McpConnectionCallbackObservation {
-    ServerClosed {
-        name: String,
-        config: ScopedMcpServerConfig,
-    },
-    ToolsListChanged {
-        name: String,
-    },
-    PromptsListChanged {
-        name: String,
-    },
-    ResourcesListChanged {
-        name: String,
-    },
-    ChannelMessageReceived {
-        name: String,
-        content: String,
-        meta: Option<std::collections::BTreeMap<String, String>>,
-        has_channel_capability: bool,
-        plugin_source: Option<String>,
-    },
-    ChannelPermissionReceived {
-        name: String,
-        request_id: String,
-        behavior: crate::services::mcp::channel_permissions::ChannelPermissionBehavior,
-        has_permission_capability: bool,
-    },
-    ElicitationRequested {
-        event: ElicitationRequestEvent,
-    },
-    ElicitationCompleted {
-        name: String,
-        elicitation_id: String,
-    },
+    ElicitationRequested { event: ElicitationRequestEvent },
 }
 
 static TEST_OBSERVATIONS: OnceLock<AsyncMutex<VecDeque<McpConnectionCallbackObservation>>> =
@@ -922,8 +769,15 @@ fn test_observations() -> &'static AsyncMutex<VecDeque<McpConnectionCallbackObse
     TEST_OBSERVATIONS.get_or_init(|| AsyncMutex::new(VecDeque::new()))
 }
 
+/// Queued in test builds only. A production run without App's hooks is a
+/// print run, where CC hands a URL elicitation to the SDK host's
+/// `handleElicitation` (`print.ts:2189`) instead of a queue: the event is
+/// dropped there rather than kept unread.
 async fn observe_for_test(observation: McpConnectionCallbackObservation) {
+    #[cfg(test)]
     test_observations().lock().await.push_back(observation);
+    #[cfg(not(test))]
+    drop(observation);
 }
 
 /// Drain unhandled MCP session callback observations (tests without App hooks).
@@ -953,7 +807,8 @@ fn schedule_mcp_reconnect_timer(
 }
 
 /// Maps to: CC `reconnectWithBackoff` in
-/// `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`.
+/// `services/mcp/useManageMCPConnections.ts#onConnectionAttempt`
+/// (`:371-464`), debug logs included.
 pub async fn start_automatic_mcp_reconnect(
     name: String,
     config: ScopedMcpServerConfig,
@@ -966,10 +821,15 @@ pub async fn start_automatic_mcp_reconnect(
     crate::utils::process_runtime::runtime_handle_for_detached_work()
         .expect("MCP process runtime")
         .spawn(async move {
+            let transport_type = get_transport_display_name(config.transport);
             for attempt in 1..=MAX_RECONNECT_ATTEMPTS {
                 {
                     let _turn = crate::state::store::enter_store_turn_segment();
                     if is_mcp_server_disabled(&name) {
+                        crate::utils::log::log_mcp_debug(
+                            &name,
+                            "Server disabled during reconnection, stopping retry",
+                        );
                         RECONNECT_TASKS
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
@@ -980,20 +840,56 @@ pub async fn start_automatic_mcp_reconnect(
                     runtime_mcp
                         .apply_client_update(pending_reconnect_server_update(&base, attempt));
                 }
+                let reconnect_start = std::time::Instant::now();
                 let result = reconnect_mcp_server_impl(&name, &config).await;
+                let elapsed = reconnect_start.elapsed().as_millis();
                 let resume = {
                     let _turn = crate::state::store::enter_store_turn_segment();
-                    if result.server.client.status == McpServerConnectionType::Connected
+                    let status = result.server.connection_type();
+                    if status == McpServerConnectionType::Connected {
+                        crate::utils::log::log_mcp_debug(
+                            &name,
+                            &format!(
+                                "{transport_type} reconnection successful after {elapsed}ms (attempt {attempt})"
+                            ),
+                        );
+                    } else {
+                        crate::utils::log::log_mcp_debug(
+                            &name,
+                            &format!(
+                                "{transport_type} reconnection attempt {attempt} completed with status: {}",
+                                status.as_str()
+                            ),
+                        );
+                        if attempt == MAX_RECONNECT_ATTEMPTS {
+                            crate::utils::log::log_mcp_debug(
+                                &name,
+                                &format!(
+                                    "Max reconnection attempts ({MAX_RECONNECT_ATTEMPTS}) reached, giving up"
+                                ),
+                            );
+                        }
+                    }
+                    if status == McpServerConnectionType::Connected
                         || attempt == MAX_RECONNECT_ATTEMPTS
                     {
                         RECONNECT_TASKS
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .remove(&name);
-                        runtime_mcp.apply_server_update(result);
+                        // CC `onConnectionAttempt(result)` (`:408`, `:424`).
+                        on_connection_attempt(result, &runtime_mcp);
                         return;
                     }
-                    schedule_mcp_reconnect_timer(&name, reconnect_backoff_ms(attempt))
+                    let backoff_ms = reconnect_backoff_ms(attempt);
+                    crate::utils::log::log_mcp_debug(
+                        &name,
+                        &format!(
+                            "Scheduling reconnection attempt {} in {backoff_ms}ms",
+                            attempt + 1
+                        ),
+                    );
+                    schedule_mcp_reconnect_timer(&name, backoff_ms)
                 };
                 // Aborted timer drops its resolver. Source remains suspended at
                 // this await forever; native disposal releases the inert frame.
@@ -1007,8 +903,8 @@ pub async fn start_automatic_mcp_reconnect(
 /// Maps to: CC `useManageMCPConnections.ts#initializeServersAsPending`
 /// stale-client cleanup guard: only connected clients have an active runtime
 /// connection/cache to cancel after removing stale AppState entries.
-pub fn stale_mcp_server_needs_cache_cleanup(server: &McpServerSnapshot) -> bool {
-    server.client.status == McpServerConnectionType::Connected
+pub fn stale_mcp_server_needs_cache_cleanup(server: &McpServerConnection) -> bool {
+    server.connection_type() == McpServerConnectionType::Connected
 }
 
 /// Maps to: CC `useManageMCPConnections.ts#initializeServersAsPending` stale
@@ -1016,12 +912,12 @@ pub fn stale_mcp_server_needs_cache_cleanup(server: &McpServerSnapshot) -> bool 
 /// The writer detaches the captured client identity before invoking this helper;
 /// cache lookup occurs synchronously and cancellation completes asynchronously.
 pub fn cleanup_stale_mcp_clients(
-    stale: &[McpServerSnapshot],
+    stale: &[McpServerConnection],
 ) -> impl std::future::Future<Output = ()> + Send + 'static {
     let cleanups = stale
         .iter()
         .filter(|server| stale_mcp_server_needs_cache_cleanup(server))
-        .map(|server| clear_server_cache(&server.client.name, server.config.as_ref()))
+        .map(|server| clear_server_cache(server.name(), Some(server.config())))
         .collect::<Vec<_>>();
     async move {
         futures::future::join_all(cleanups).await;
@@ -1035,7 +931,7 @@ pub struct InitializeServersAsPendingResult {
     pub state: McpState,
     /// Stale clients are returned for service-boundary cleanup by the caller,
     /// matching CC's `clearServerCache` fire-and-forget loop.
-    pub stale: Vec<McpServerSnapshot>,
+    pub stale: Vec<McpServerConnection>,
     /// Names of the servers this call added. Maps to: CC `newClients`
     /// (`useManageMCPConnections.ts:816-825`). Its emptiness is half of the
     /// source's `return prevState` guard at `:826-828`.
@@ -1050,13 +946,13 @@ pub fn initialize_servers_as_pending(
     let stale_result = super::utils::exclude_stale_plugin_clients(current_state, configs);
     // Source timer guards run synchronously inside the initialization updater.
     for server in &stale_result.stale {
-        cancel_pending_mcp_reconnect(&server.client.name);
+        cancel_pending_mcp_reconnect(server.name());
     }
     let mut state = stale_result.state;
     let existing_names = state
         .clients
         .iter()
-        .map(|server| server.client.name.clone())
+        .map(|server| server.name().to_owned())
         .collect::<std::collections::BTreeSet<_>>();
     let mut new_clients = Vec::new();
     for (name, config) in crate::utils::process_env::ecmascript_object_entries(configs)
@@ -1066,23 +962,18 @@ pub fn initialize_servers_as_pending(
         let server = if is_mcp_server_disabled(name) {
             McpConnectionDiscovery::disabled(name, config).server
         } else {
-            McpConnectionDiscovery::pending_with_config(name, config).server
+            McpConnectionDiscovery::pending(name, config).server
         };
         new_clients.push(name.to_owned());
-        apply_mcp_server_update(&mut state, server);
+        // CC `:833` `clients: [...mcpWithoutStale.clients, ...newClients]`:
+        // appended as they are, through no flush.
+        state.clients.push(server);
     }
     InitializeServersAsPendingResult {
         state,
         stale: stale_result.stale,
         new_clients,
     }
-}
-
-/// Maps to: CC `useManageMCPConnections(...)` initial pending AppState update.
-pub fn pending_mcp_state_from_configs(
-    configs: &indexmap::IndexMap<String, ScopedMcpServerConfig>,
-) -> McpState {
-    initialize_servers_as_pending(&McpState::default(), configs).state
 }
 
 /// Maps to: CC `useManageMCPConnections.ts:207#MCP_BATCH_FLUSH_MS`.
@@ -1110,6 +1001,14 @@ impl McpPendingUpdates {
             writer,
             state: Default::default(),
         }
+    }
+
+    /// Maps to: CC `onConnectionAttempt` (`useManageMCPConnections.ts:
+    /// 310-763`) for the initial connect: the connected client gets its
+    /// handlers, and the result is batched into `updateServer`.
+    fn on_connection_attempt(&self, discovery: McpConnectionDiscovery) {
+        install_connection_handlers(&discovery.server, &self.writer);
+        self.update_server(discovery);
     }
 
     /// Maps to: CC `useManageMCPConnections.ts:297#updateServer`.
@@ -1411,7 +1310,7 @@ async fn load_and_connect_mcp_configs(
         let local_pending = pending.clone();
         runtime.spawn(async move {
             get_mcp_tools_commands_and_resources(
-                |discovery| local_pending.update_server(discovery),
+                |discovery| local_pending.on_connection_attempt(discovery),
                 &enabled,
             )
             .await;
@@ -1441,13 +1340,13 @@ async fn load_and_connect_mcp_configs(
                         .mcp
                         .clients
                         .iter()
-                        .any(|client| client.client.name == *name)
+                        .any(|client| client.name() == *name)
                 })
                 .map(|(name, config)| {
                     if is_mcp_server_disabled(name) {
                         McpConnectionDiscovery::disabled(name, config).server
                     } else {
-                        McpConnectionDiscovery::pending_with_config(name, config).server
+                        McpConnectionDiscovery::pending(name, config).server
                     }
                 })
                 .collect();
@@ -1470,7 +1369,7 @@ async fn load_and_connect_mcp_configs(
             .collect();
         runtime.spawn(async move {
             get_mcp_tools_commands_and_resources(
-                |discovery| pending.update_server(discovery),
+                |discovery| pending.on_connection_attempt(discovery),
                 &enabled,
             )
             .await;
@@ -1664,7 +1563,7 @@ pub async fn reconnect_mcp_server_once(
 /// Optional dimensions preserve the source distinction between absent and empty.
 #[derive(Clone, Debug)]
 pub struct McpPendingUpdate {
-    pub server: McpServerSnapshot,
+    pub server: McpServerConnection,
     pub tools: Option<Vec<crate::types::tools::Tool>>,
     pub commands: Option<Vec<crate::commands::Command>>,
     pub resources: Option<Vec<super::types::ServerResource>>,
@@ -1681,58 +1580,27 @@ impl From<McpConnectionDiscovery> for McpPendingUpdate {
     }
 }
 
-// Native full-snapshot callers provide all dimensions; callback callers retain
-// their actual supplied tools (including the source-positioned resource helpers).
-impl From<McpServerSnapshot> for McpPendingUpdate {
-    fn from(server: McpServerSnapshot) -> Self {
-        Self {
-            tools: Some(super::client::mcp_tools_for_server_snapshot(&server)),
-            commands: Some(super::client::mcp_commands_for_server_snapshot(&server)),
-            resources: Some(server.resources.clone()),
-            server,
-        }
-    }
-}
-
-/// Maps to: CC `useManageMCPConnections.ts#flushPendingUpdates`.
+/// Maps to: CC `useManageMCPConnections.ts:216-291#flushPendingUpdates`, the
+/// body of its loop for one update.
 pub fn apply_mcp_server_update(state: &mut McpState, update: impl Into<McpPendingUpdate>) {
     let McpPendingUpdate {
-        mut server,
+        server,
         mut tools,
         mut commands,
         mut resources,
     } = update.into();
-    let name = server.client.name.clone();
+    let name = server.name().to_owned();
+    // `:232-243`: a disabled or failed client clears what it does not supply.
     if matches!(
-        server.client.status,
+        server.connection_type(),
         McpServerConnectionType::Disabled | McpServerConnectionType::Failed
     ) {
         tools.get_or_insert_with(Vec::new);
         commands.get_or_insert_with(Vec::new);
         resources.get_or_insert_with(Vec::new);
     }
-    // Snapshots retain native remote capability caches. Undefined callback
-    // dimensions preserve existing caches; for a new client they contribute
-    // no cache. A forced empty dimension also clears its native cache.
-    let previous = state
-        .clients
-        .iter()
-        .find(|client| client.client.name == name);
-    if tools.is_none() {
-        server.tools = previous.map(|p| p.tools.clone()).unwrap_or_default();
-    } else if tools.as_ref().is_some_and(Vec::is_empty) {
-        server.tools.clear();
-    }
-    if commands.is_none() {
-        server.prompts = previous.map(|p| p.prompts.clone()).unwrap_or_default();
-    } else if commands.as_ref().is_some_and(Vec::is_empty) {
-        server.prompts.clear();
-    }
-    if resources.is_none() {
-        server.resources = previous.map(|p| p.resources.clone()).unwrap_or_default();
-    } else {
-        server.resources = resources.as_ref().unwrap().clone();
-    }
+    // `:255-268`: `undefined` keeps a dimension; otherwise the server's tools
+    // (by prefix) and commands (by `commandBelongsToServer`) are replaced.
     if let Some(tools) = tools {
         let prefix = format!(
             "mcp__{}__",
@@ -1757,7 +1625,7 @@ pub fn apply_mcp_server_update(state: &mut McpState, update: impl Into<McpPendin
     if let Some(previous) = state
         .clients
         .iter_mut()
-        .find(|client| client.client.name == name)
+        .find(|client| client.name() == name)
     {
         *previous = server;
     } else {
@@ -1766,7 +1634,7 @@ pub fn apply_mcp_server_update(state: &mut McpState, update: impl Into<McpPendin
 }
 
 /// Maps to: CC `updateServer({...client})`, with absent capability dimensions.
-pub fn apply_mcp_client_update(state: &mut McpState, server: McpServerSnapshot) {
+pub fn apply_mcp_client_update(state: &mut McpState, server: McpServerConnection) {
     apply_mcp_server_update(
         state,
         McpPendingUpdate {
@@ -1774,48 +1642,6 @@ pub fn apply_mcp_client_update(state: &mut McpState, server: McpServerSnapshot) 
             tools: None,
             commands: None,
             resources: None,
-        },
-    );
-}
-
-/// Maps to: CC `useManageMCPConnections.ts#tools/list_changed` updateServer.
-pub fn apply_mcp_tools_list_changed(state: &mut McpState, server: McpServerSnapshot) {
-    let tools = Some(super::client::mcp_tools_for_server_snapshot(&server));
-    apply_mcp_server_update(
-        state,
-        McpPendingUpdate {
-            server,
-            tools,
-            commands: None,
-            resources: None,
-        },
-    );
-}
-
-/// Maps to: CC `useManageMCPConnections.ts#prompts/list_changed` updateServer.
-pub fn apply_mcp_prompts_list_changed(state: &mut McpState, server: McpServerSnapshot) {
-    let commands = Some(super::client::mcp_commands_for_server_snapshot(&server));
-    apply_mcp_server_update(
-        state,
-        McpPendingUpdate {
-            server,
-            tools: None,
-            commands,
-            resources: None,
-        },
-    );
-}
-
-/// Maps to: CC `useManageMCPConnections.ts#resources/list_changed` updateServer.
-pub fn apply_mcp_resources_list_changed(state: &mut McpState, server: McpServerSnapshot) {
-    let resources = Some(server.resources.clone());
-    apply_mcp_server_update(
-        state,
-        McpPendingUpdate {
-            server,
-            tools: None,
-            commands: None,
-            resources,
         },
     );
 }
@@ -1827,18 +1653,17 @@ pub async fn toggle_mcp_server_once(
     config: &ScopedMcpServerConfig,
 ) -> anyhow::Result<McpConnectionDiscovery> {
     cancel_pending_mcp_reconnect(name);
-    let client = current_state
+    let server = current_state
         .clients
         .iter()
-        .find(|server| server.client.name == name)
-        .map(|server| &server.client)
+        .find(|server| server.name() == name)
         .ok_or_else(|| anyhow::anyhow!("MCP server {name} not found"))?;
-    let is_currently_disabled = client.status == McpServerConnectionType::Disabled;
+    let is_currently_disabled = server.connection_type() == McpServerConnectionType::Disabled;
 
     if !is_currently_disabled {
         set_mcp_server_enabled(name, false)?;
-        if client.status == McpServerConnectionType::Connected {
-            clear_server_cache(name, None).await;
+        if server.connection_type() == McpServerConnectionType::Connected {
+            clear_server_cache(name, Some(server.config())).await;
         }
         return Ok(McpConnectionDiscovery::disabled(name, config));
     }
@@ -1850,7 +1675,9 @@ pub async fn toggle_mcp_server_once(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::mcp::types::{ConfigScope, ScopedMcpServerConfig, Transport};
+    use crate::services::mcp::types::{
+        ConfigScope, ScopedMcpServerConfig, ServerResource, Transport,
+    };
     use crate::utils::test_env::{EnvVarGuard, TEST_ENV_LOCK};
 
     #[test]
@@ -2050,10 +1877,12 @@ mod tests {
             state
                 .resources
                 .insert("b".into(), vec![resource("b", "other")]);
-            let mut server = McpConnectionDiscovery::pending("a").server;
-            if label == "failed" {
-                server.client.status = McpServerConnectionType::Failed;
-            }
+            let config = stdio_config("a");
+            let server = if label == "failed" {
+                McpServerConnection::failed("a", config, None)
+            } else {
+                McpServerConnection::pending("a", config)
+            };
             let resources = match label {
                 "empty" => Some(vec![]),
                 "nonempty" => Some(vec![resource("a", "new")]),
@@ -2095,12 +1924,10 @@ mod tests {
     fn callback_tool_order_is_retained_without_global_helper_reconstruction() {
         let mut state = McpState::default();
         let helper = crate::tools::list_mcp_resources_tool::list_mcp_resources_tool_schema();
-        let mut first = McpConnectionDiscovery::pending("a");
-        first.server.client.status = McpServerConnectionType::Connected;
+        let mut first = McpConnectionDiscovery::from(connected_server("a"));
         first.tools = vec![helper.clone()];
         apply_mcp_server_update(&mut state, first);
-        let mut second = McpConnectionDiscovery::pending("b");
-        second.server.client.status = McpServerConnectionType::Connected;
+        let mut second = McpConnectionDiscovery::from(connected_server("b"));
         let mut remote = helper.clone();
         remote.name = "mcp__b__remote".into();
         second.tools = vec![remote];
@@ -2113,7 +1940,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [helper.name.as_str(), "mcp__b__remote"]
         );
-        let mut repeated = McpConnectionDiscovery::pending("c");
+        let mut repeated = McpConnectionDiscovery::pending("c", &stdio_config("c"));
         repeated.tools = vec![helper.clone()];
         apply_mcp_server_update(&mut state, repeated);
         assert_eq!(
@@ -2121,7 +1948,10 @@ mod tests {
             2,
             "interactive source does not uniqBy native helpers across invocations"
         );
-        apply_mcp_client_update(&mut state, McpConnectionDiscovery::pending("b").server);
+        apply_mcp_client_update(
+            &mut state,
+            McpConnectionDiscovery::pending("b", &stdio_config("b")).server,
+        );
         assert_eq!(
             state.tools.len(),
             3,
@@ -2135,8 +1965,8 @@ mod tests {
         let mut app = crate::state::app_state_store::AppState::default();
         app.mcp = std::sync::Arc::new(McpState {
             clients: vec![
-                McpConnectionDiscovery::pending("slow").server,
-                McpConnectionDiscovery::pending("fast").server,
+                McpConnectionDiscovery::pending("slow", &stdio_config("slow")).server,
+                McpConnectionDiscovery::pending("fast", &stdio_config("fast")).server,
             ],
             ..Default::default()
         });
@@ -2161,10 +1991,11 @@ mod tests {
                 async move {
                     started_tx.send(name).await.unwrap();
                     gate.await.unwrap();
-                    pending.update_server(
-                        McpConnectionDiscovery::failed(name, &stdio_config(name), "controlled")
-                            .server,
-                    );
+                    pending.update_server(McpConnectionDiscovery::failed(
+                        name,
+                        &stdio_config(name),
+                        "controlled",
+                    ));
                 }
             },
         );
@@ -2180,11 +2011,11 @@ mod tests {
             let first = changed_rx.recv().await.unwrap();
             assert!(released_at.elapsed() >= std::time::Duration::from_millis(MCP_BATCH_FLUSH_MS));
             assert_eq!(
-                first.clients[0].client.status,
+                first.clients[0].connection_type(),
                 McpServerConnectionType::Pending
             );
             assert_eq!(
-                first.clients[1].client.status,
+                first.clients[1].connection_type(),
                 McpServerConnectionType::Failed
             );
             assert_eq!(
@@ -2202,7 +2033,7 @@ mod tests {
         // Source cleanup cancels the pending timer and synchronously flushes.
         drop(owner);
         assert_eq!(
-            writer.current().clients[0].client.status,
+            writer.current().clients[0].connection_type(),
             McpServerConnectionType::Failed
         );
         assert_eq!(store.revision(), 2);
@@ -2230,8 +2061,10 @@ mod tests {
         crate::utils::process_runtime::process_runtime_handle()
             .unwrap()
             .spawn(async move {
-                process_pending.update_server(McpConnectionDiscovery::pending("z").server);
-                process_pending.update_server(McpConnectionDiscovery::pending("a").server);
+                process_pending
+                    .update_server(McpConnectionDiscovery::pending("z", &stdio_config("z")));
+                process_pending
+                    .update_server(McpConnectionDiscovery::pending("a", &stdio_config("a")));
                 completed.send(()).unwrap();
             });
         observed.await.unwrap();
@@ -2248,7 +2081,7 @@ mod tests {
                 .current()
                 .clients
                 .iter()
-                .map(|server| server.client.name.as_str())
+                .map(|server| server.name())
                 .collect::<Vec<_>>(),
             ["z", "a"]
         );
@@ -2264,7 +2097,7 @@ mod tests {
         );
         let pending = McpPendingUpdates::new(McpWriter::new(store.clone()));
         let turn = crate::state::store::enter_store_turn_segment();
-        pending.update_server(McpConnectionDiscovery::pending("old").server);
+        pending.update_server(McpConnectionDiscovery::pending("old", &stdio_config("old")));
         let generation = pending.state.lock().unwrap().timer.as_ref().unwrap().0;
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (finished_tx, finished_rx) = std::sync::mpsc::channel();
@@ -2286,7 +2119,7 @@ mod tests {
         // McpWriter, allowing a newer flush to overtake the detached old batch.
         assert_eq!(pending.state.lock().unwrap().updates.len(), 1);
         assert!(pending.state.lock().unwrap().timer.is_some());
-        pending.update_server(McpConnectionDiscovery::pending("new").server);
+        pending.update_server(McpConnectionDiscovery::pending("new", &stdio_config("new")));
         drop(turn);
         finished_rx
             .recv_timeout(std::time::Duration::from_secs(1))
@@ -2299,7 +2132,7 @@ mod tests {
                 .current()
                 .clients
                 .iter()
-                .map(|server| server.client.name.as_str())
+                .map(|server| server.name())
                 .collect::<Vec<_>>(),
             ["old", "new"]
         );
@@ -2320,13 +2153,19 @@ mod tests {
             if !fired.swap(true, Ordering::SeqCst) {
                 // Real synchronous store listener reentry must not deadlock
                 // on the pending-data mutex or lose the newly armed timer.
-                callback_pending.update_server(McpConnectionDiscovery::pending("reentrant").server);
+                callback_pending.update_server(McpConnectionDiscovery::pending(
+                    "reentrant",
+                    &stdio_config("reentrant"),
+                ));
             }
         }));
         let (finished, observed) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let _turn = crate::state::store::enter_store_turn_segment();
-            pending.update_server(McpConnectionDiscovery::pending("first").server);
+            pending.update_server(McpConnectionDiscovery::pending(
+                "first",
+                &stdio_config("first"),
+            ));
             let canceled_generation = pending.state.lock().unwrap().timer.as_ref().unwrap().0;
             pending.cleanup();
             assert_eq!(store.revision(), 1);
@@ -2350,7 +2189,7 @@ mod tests {
                     .current()
                     .clients
                     .iter()
-                    .map(|server| server.client.name.as_str())
+                    .map(|server| server.name())
                     .collect::<Vec<_>>(),
                 ["first", "reentrant"]
             );
@@ -2383,7 +2222,10 @@ mod tests {
         }));
         runtime.block_on(async {
             // Register inside the runtime so Instant::now uses its paused clock.
-            pending.update_server(McpConnectionDiscovery::pending("delayed-poll").server);
+            pending.update_server(McpConnectionDiscovery::pending(
+                "delayed-poll",
+                &stdio_config("delayed-poll"),
+            ));
             tokio::time::advance(std::time::Duration::from_millis(MCP_BATCH_FLUSH_MS + 10)).await;
             tokio::time::timeout(std::time::Duration::from_millis(8), changed_rx.recv())
                 .await
@@ -2416,7 +2258,6 @@ mod tests {
     /// `client.capabilities?.X?.listChanged`, so BOTH an absent capability and
     /// a declared capability without the sub-flag are falsy, and only an
     /// explicit `true` registers the handler.
-    #[cfg(feature = "mcp_runtime")]
     #[test]
     fn list_changed_gates_match_official_optional_chaining() {
         use rmcp::model::{
@@ -2558,74 +2399,32 @@ mod tests {
     }
 
     #[test]
-    fn channel_permission_notification_event_resolves_session_callbacks_and_skips_stale() {
-        let callbacks =
-            crate::services::mcp::channel_permissions::ChannelPermissionCallbacks::default();
-        let (tx, rx) = async_channel::bounded(1);
-        let _unsubscribe = callbacks.on_response("abcde", move |response| {
-            tx.try_send(response).unwrap();
-        });
-
-        assert_eq!(
-            handle_channel_permission_notification_event(
-                Some(&callbacks),
-                "telegram",
-                "ABCDE",
-                crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Allow,
-                true,
-            ),
-            Some(true)
-        );
-        let response = rx.try_recv().unwrap();
-        assert_eq!(
-            response.behavior,
-            crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Allow
-        );
-        assert_eq!(response.from_server, "telegram");
-        assert_eq!(
-            handle_channel_permission_notification_event(
-                Some(&callbacks),
-                "telegram",
-                "abcde",
-                crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Deny,
-                true,
-            ),
-            Some(false)
-        );
-        assert_eq!(
-            handle_channel_permission_notification_event(
-                Some(&callbacks),
-                "telegram",
-                "abcde",
-                crate::services::mcp::channel_permissions::ChannelPermissionBehavior::Deny,
-                false,
-            ),
-            None
-        );
-    }
-
-    #[test]
-    fn pending_mcp_state_from_configs_matches_official_initial_pending_clients() {
+    fn initialize_servers_as_pending_from_empty_matches_official_initial_pending_clients() {
         with_isolated_config(|_| {
             let configs = indexmap::IndexMap::from([
                 ("docs".to_string(), stdio_config("docs-mcp")),
                 ("ide".to_string(), stdio_config("ide-mcp")),
             ]);
-            let state = pending_mcp_state_from_configs(&configs);
+            let state = initialize_servers_as_pending(&McpState::default(), &configs).state;
             assert_eq!(state.clients.len(), 2);
-            assert_eq!(state.clients[0].client.name, "docs");
+            assert_eq!(state.clients[0].name(), "docs");
             assert_eq!(
-                state.clients[0].client.status,
+                state.clients[0].connection_type(),
                 McpServerConnectionType::Pending
             );
             assert_eq!(
-                state.clients[0]
-                    .config
-                    .as_ref()
-                    .and_then(|config| config.command.as_deref()),
+                state.clients[0].config().command.as_deref(),
                 Some("docs-mcp")
             );
-            assert_eq!(state.clients[1].client.ide_name.as_deref(), Some("IDE"));
+            // CC's pending row is `{ name, type: 'pending', config }`: the
+            // record keeps the config's `ideName` as is, and `/ide` supplies
+            // the "IDE" label when it is absent.
+            assert_eq!(state.clients[1].name(), "ide");
+            assert_eq!(
+                state.clients[1].connection_type(),
+                McpServerConnectionType::Pending
+            );
+            assert_eq!(state.clients[1].config().ide_name, None);
         });
     }
 
@@ -2650,17 +2449,12 @@ mod tests {
                     .state
                     .clients
                     .iter()
-                    .map(|server| server.client.name.as_str())
+                    .map(|server| server.name())
                     .collect::<Vec<_>>(),
                 ["2", "9", "z", "a"]
             );
             assert_eq!(
-                result.state.clients[2]
-                    .config
-                    .as_ref()
-                    .unwrap()
-                    .command
-                    .as_deref(),
+                result.state.clients[2].config().command.as_deref(),
                 Some("new")
             );
         });
@@ -2691,9 +2485,9 @@ mod tests {
 
             let configs =
                 indexmap::IndexMap::from([("docs".to_string(), stdio_config("docs-mcp"))]);
-            let state = pending_mcp_state_from_configs(&configs);
+            let state = initialize_servers_as_pending(&McpState::default(), &configs).state;
             assert_eq!(
-                state.clients[0].client.status,
+                state.clients[0].connection_type(),
                 McpServerConnectionType::Disabled
             );
         });
@@ -2710,10 +2504,9 @@ mod tests {
 
             let current_state = McpState {
                 clients: vec![
-                    McpConnectionDiscovery::pending_with_config("removed-plugin", &removed_plugin)
-                        .server,
-                    McpConnectionDiscovery::pending_with_config("docs", &changed_old).server,
-                    McpConnectionDiscovery::pending_with_config("kept", &kept).server,
+                    McpConnectionDiscovery::pending("removed-plugin", &removed_plugin).server,
+                    McpConnectionDiscovery::pending("docs", &changed_old).server,
+                    McpConnectionDiscovery::pending("kept", &kept).server,
                 ],
                 ..McpState::default()
             };
@@ -2728,7 +2521,7 @@ mod tests {
                 result
                     .stale
                     .iter()
-                    .map(|server| server.client.name.as_str())
+                    .map(|server| server.name())
                     .collect::<Vec<_>>(),
                 vec!["removed-plugin", "docs"]
             );
@@ -2737,7 +2530,7 @@ mod tests {
                     .state
                     .clients
                     .iter()
-                    .map(|server| server.client.name.as_str())
+                    .map(|server| server.name())
                     .collect::<Vec<_>>(),
                 vec!["kept", "docs", "new"]
             );
@@ -2745,15 +2538,10 @@ mod tests {
                 .state
                 .clients
                 .iter()
-                .find(|server| server.client.name == "docs")
+                .find(|server| server.name() == "docs")
                 .unwrap();
-            assert_eq!(
-                docs.config
-                    .as_ref()
-                    .and_then(|config| config.command.as_deref()),
-                Some("docs-new")
-            );
-            assert_eq!(docs.client.status, McpServerConnectionType::Pending);
+            assert_eq!(docs.config().command.as_deref(), Some("docs-new"));
+            assert_eq!(docs.connection_type(), McpServerConnectionType::Pending);
         });
     }
 
@@ -2790,16 +2578,13 @@ mod tests {
     #[test]
     fn stale_mcp_cleanup_guard_matches_official_connected_only_cache_clear() {
         let config = stdio_config("docs-mcp");
-        let mut connected = McpConnectionDiscovery::pending_with_config("docs", &config).server;
-        connected.client.status = McpServerConnectionType::Connected;
+        let connected = McpServerConnection::connected_for_test("docs", config.clone());
         assert!(stale_mcp_server_needs_cache_cleanup(&connected));
 
-        let mut pending = connected.clone();
-        pending.client.status = McpServerConnectionType::Pending;
+        let pending = McpServerConnection::pending("docs", config.clone());
         assert!(!stale_mcp_server_needs_cache_cleanup(&pending));
 
-        let mut failed = connected;
-        failed.client.status = McpServerConnectionType::Failed;
+        let failed = McpServerConnection::failed("docs", config, None);
         assert!(!stale_mcp_server_needs_cache_cleanup(&failed));
     }
 
@@ -2839,64 +2624,192 @@ mod tests {
         );
     }
 
+    /// An `mcp.tools` entry for `server`, as `fetchToolsForClient` makes it.
+    fn flat_tool(server: &str, name: &str) -> crate::types::tools::Tool {
+        crate::services::mcp::client::mcp_tool_for_test(
+            server,
+            serde_json::json!({"name": name, "inputSchema": {"type": "object"}}),
+        )
+    }
+
+    /// An `mcp.commands` entry for `server`, as `fetchCommandsForClient`
+    /// makes it.
+    fn flat_command(server: &str, prompt: &str) -> crate::commands::Command {
+        crate::services::mcp::client::mcp_command_for_test(server, prompt, None, &[])
+    }
+
+    fn flat_resource(server: &str, uri: &str) -> ServerResource {
+        ServerResource {
+            server: server.to_string(),
+            uri: uri.to_string(),
+            name: uri.to_string(),
+            description: None,
+            mime_type: None,
+        }
+    }
+
+    fn connected_server(name: &str) -> McpServerConnection {
+        McpServerConnection::connected_for_test(name, stdio_config(name))
+    }
+
+    fn server_update(
+        server: McpServerConnection,
+        tools: Option<Vec<crate::types::tools::Tool>>,
+        commands: Option<Vec<crate::commands::Command>>,
+        resources: Option<Vec<ServerResource>>,
+    ) -> McpPendingUpdate {
+        McpPendingUpdate {
+            server,
+            tools,
+            commands,
+            resources,
+        }
+    }
+
+    fn tool_names(state: &McpState) -> Vec<&str> {
+        state.tools.iter().map(|tool| tool.name.as_str()).collect()
+    }
+
+    fn command_names(state: &McpState) -> Vec<&str> {
+        state
+            .commands
+            .iter()
+            .map(|command| command.name.as_ref())
+            .collect()
+    }
+
+    /// `docs` connected with one tool, prompt command and resource.
+    fn docs_state() -> McpState {
+        let mut state = McpState::default();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("docs"),
+                Some(vec![flat_tool("docs", "search")]),
+                Some(vec![flat_command("docs", "prompt")]),
+                Some(vec![flat_resource("docs", "docs://one")]),
+            ),
+        );
+        state
+    }
+
+    /// CC's reconnect loop writes `{ ...client, type: 'pending',
+    /// reconnectAttempt, maxReconnectAttempts }` and, on giving up,
+    /// `{ ...client, type: 'failed' }`, both through `updateServer` with no
+    /// capability dimensions. The flush keeps a pending client's capabilities
+    /// and clears a failed one's tools and commands; its resources key stays
+    /// (`useManageMCPConnections.ts:270-277` spreads the old map before
+    /// `omit(old, name)`).
     #[test]
     fn reconnect_pending_and_failed_updates_match_official_update_server_semantics() {
-        let config = stdio_config("docs-mcp");
-        let mut server = McpConnectionDiscovery::pending_with_config("docs", &config).server;
-        server.client.status = McpServerConnectionType::Connected;
-        server
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "search".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({ "type": "object" }),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        server
-            .prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "prompt".to_string(),
-                description: None,
-                arg_names: Vec::new(),
-            });
-        server
-            .resources
-            .push(crate::services::mcp::types::ServerResource {
-                server: "docs".to_string(),
-                uri: "docs://one".to_string(),
-                name: "one".to_string(),
-                description: None,
-                mime_type: None,
-            });
+        let mut state = docs_state();
+        let server = state.clients[0].clone();
+
+        // `reconnectAttempt` / `maxReconnectAttempts`, which only a pending
+        // record carries.
+        let reconnect_attempts = |server: &McpServerConnection| match server {
+            McpServerConnection::Pending(pending) => {
+                (pending.reconnect_attempt, pending.max_reconnect_attempts)
+            }
+            _ => (None, None),
+        };
 
         let pending = pending_reconnect_server_update(&server, 2);
-        assert_eq!(pending.client.status, McpServerConnectionType::Pending);
-        assert_eq!(pending.client.reconnect_attempt, Some(2));
+        assert_eq!(pending.connection_type(), McpServerConnectionType::Pending);
         assert_eq!(
-            pending.client.max_reconnect_attempts,
-            Some(MAX_RECONNECT_ATTEMPTS)
+            reconnect_attempts(&pending),
+            (Some(2), Some(MAX_RECONNECT_ATTEMPTS))
         );
-        assert_eq!(pending.tools.len(), 1);
-        assert_eq!(pending.prompts.len(), 1);
-        assert_eq!(pending.resources.len(), 1);
+        apply_mcp_client_update(&mut state, pending);
+        assert_eq!(tool_names(&state), vec!["mcp__docs__search"]);
+        assert_eq!(command_names(&state), vec!["mcp__docs__prompt"]);
+        assert_eq!(state.resources["docs"].len(), 1);
 
         let failed = failed_reconnect_server_update(&server);
-        assert_eq!(failed.client.status, McpServerConnectionType::Failed);
-        assert_eq!(failed.client.reconnect_attempt, None);
-        assert!(failed.tools.is_empty());
-        assert!(failed.prompts.is_empty());
-        assert!(failed.resources.is_empty());
+        assert_eq!(failed.connection_type(), McpServerConnectionType::Failed);
+        assert_eq!(reconnect_attempts(&failed), (None, None));
+        apply_mcp_client_update(&mut state, failed);
+        assert_eq!(
+            state.clients[0].connection_type(),
+            McpServerConnectionType::Failed
+        );
+        assert!(state.tools.is_empty());
+        assert!(state.commands.is_empty());
+        assert_eq!(state.resources["docs"].len(), 1);
+    }
 
-        let cleared = clear_authentication_server_update(&server);
-        assert_eq!(cleared.client.status, McpServerConnectionType::Failed);
-        assert_eq!(cleared.client.reconnect_attempt, None);
-        assert_eq!(cleared.client.max_reconnect_attempts, None);
-        assert!(cleared.tools.is_empty());
-        assert!(cleared.prompts.is_empty());
-        assert!(cleared.resources.is_empty());
+    /// The flush's `rawX ?? []` (`useManageMCPConnections.ts:232-243`) only
+    /// fills an absent dimension: a disabled or failed update that supplies
+    /// one writes what it supplies.
+    #[test]
+    fn disabled_and_failed_updates_write_the_dimensions_they_supply() {
+        let mut state = docs_state();
+        let failed = McpServerConnection::failed("docs", stdio_config("docs"), None);
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                failed,
+                Some(vec![flat_tool("docs", "authenticate")]),
+                None,
+                Some(vec![flat_resource("docs", "docs://two")]),
+            ),
+        );
+        assert_eq!(tool_names(&state), vec!["mcp__docs__authenticate"]);
+        assert!(state.commands.is_empty());
+        assert_eq!(state.resources["docs"][0].uri, "docs://two");
+
+        let disabled = McpServerConnection::disabled("docs", stdio_config("docs"));
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                disabled,
+                None,
+                Some(vec![flat_command("docs", "kept")]),
+                None,
+            ),
+        );
+        assert!(state.tools.is_empty());
+        assert_eq!(command_names(&state), vec!["mcp__docs__kept"]);
+        assert_eq!(state.resources["docs"][0].uri, "docs://two");
+    }
+
+    /// CC `MCPRemoteServerMenu.tsx:166-190` and `:443-469` write
+    /// `AppState.mcp` directly: the existing client changes type (never
+    /// appended), and `exclude*ByServer` drop its tools, commands and resources
+    /// key — unlike the flush, which keeps the key.
+    #[test]
+    fn clear_auth_states_match_official_menu_set_app_state() {
+        let mut state = docs_state();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("other"),
+                Some(vec![flat_tool("other", "keep")]),
+                Some(vec![flat_command("other", "keep")]),
+                Some(vec![flat_resource("other", "other://keep")]),
+            ),
+        );
+
+        clear_authentication_state(&mut state, "docs");
+        assert_eq!(
+            state.clients[0].connection_type(),
+            McpServerConnectionType::Failed
+        );
+        assert_eq!(tool_names(&state), vec!["mcp__other__keep"]);
+        assert_eq!(command_names(&state), vec!["mcp__other__keep"]);
+        assert!(!state.resources.contains_key("docs"));
+        assert!(state.resources.contains_key("other"));
+
+        claude_ai_clear_authentication_state(&mut state, "other");
+        assert_eq!(
+            state.clients[1].connection_type(),
+            McpServerConnectionType::NeedsAuth
+        );
+        assert!(state.tools.is_empty());
+        assert!(state.resources.is_empty());
+
+        claude_ai_clear_authentication_state(&mut state, "absent");
+        assert_eq!(state.clients.len(), 2, "`clients.map` never appends");
     }
 
     #[test]
@@ -2920,177 +2833,56 @@ mod tests {
     }
 
     #[test]
-    fn claude_ai_clear_update_matches_official_menu_state() {
-        let mut server = McpConnectionDiscovery::pending_with_config(
-            "claudeai",
-            &claude_ai_proxy_config(Some("mcpsrv_abc")),
-        )
-        .server;
-        server.client.status = McpServerConnectionType::Connected;
-        server
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "tool".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        let cleared = claude_ai_clear_authentication_server_update(&server);
-        assert_eq!(cleared.client.status, McpServerConnectionType::NeedsAuth);
-        assert!(cleared.tools.is_empty());
-    }
-
-    #[test]
-    fn list_changed_update_helpers_match_official_update_server_semantics() {
-        let config = stdio_config("docs-mcp");
-        let mut server = McpConnectionDiscovery::pending_with_config("docs", &config).server;
-        server.client.status = McpServerConnectionType::Connected;
-        let old_tool = crate::services::mcp::types::McpToolSnapshot {
-            name: "old-tool".to_string(),
-            display_name: None,
-            description: None,
-            input_schema: serde_json::json!({ "type": "object" }),
-            read_only_hint: true,
-            destructive_hint: false,
-            open_world_hint: false,
-        };
-        let old_prompt = crate::services::mcp::types::McpPromptSnapshot {
-            name: "old-prompt".to_string(),
-            description: None,
-            arg_names: Vec::new(),
-        };
-        let old_resource = crate::services::mcp::types::ServerResource {
-            server: "docs".to_string(),
-            uri: "docs://old".to_string(),
-            name: "old-resource".to_string(),
-            description: None,
-            mime_type: None,
-        };
-        server.tools = vec![old_tool.clone()];
-        server.prompts = vec![old_prompt.clone()];
-        server.resources = vec![old_resource.clone()];
-
-        let new_tool = crate::services::mcp::types::McpToolSnapshot {
-            name: "new-tool".to_string(),
-            ..old_tool.clone()
-        };
-        let tool_update = tools_list_changed_server_update(&server, vec![new_tool.clone()]);
-        assert_eq!(tool_update.tools, vec![new_tool]);
-        assert_eq!(tool_update.prompts, vec![old_prompt.clone()]);
-        assert_eq!(tool_update.resources, vec![old_resource.clone()]);
-        assert_eq!(
-            tool_update.client.status,
-            McpServerConnectionType::Connected
-        );
-
-        let new_prompt = crate::services::mcp::types::McpPromptSnapshot {
-            name: "new-prompt".to_string(),
-            description: Some("fresh".to_string()),
-            arg_names: vec!["arg".to_string()],
-        };
-        let prompt_update = prompts_list_changed_server_update(&server, vec![new_prompt.clone()]);
-        assert_eq!(prompt_update.tools, vec![old_tool.clone()]);
-        assert_eq!(prompt_update.prompts, vec![new_prompt]);
-        assert_eq!(prompt_update.resources, vec![old_resource.clone()]);
-
-        let new_resource = crate::services::mcp::types::ServerResource {
-            server: "docs".to_string(),
-            uri: "docs://new".to_string(),
-            name: "new-resource".to_string(),
-            description: Some("fresh".to_string()),
-            mime_type: Some("text/plain".to_string()),
-        };
-        let resource_update =
-            resources_list_changed_server_update(&server, vec![new_resource.clone()]);
-        assert_eq!(resource_update.tools, vec![old_tool]);
-        assert_eq!(resource_update.prompts, vec![old_prompt]);
-        assert_eq!(resource_update.resources, vec![new_resource]);
-    }
-
-    #[test]
     fn apply_mcp_server_update_replaces_in_place_like_official_updated_clients() {
         let mut state = McpState {
             clients: vec![
-                McpConnectionDiscovery::pending("alpha").server,
-                McpConnectionDiscovery::pending("zeta").server,
+                McpConnectionDiscovery::pending("alpha", &stdio_config("alpha")).server,
+                McpConnectionDiscovery::pending("zeta", &stdio_config("zeta")).server,
             ],
             ..Default::default()
         };
         apply_mcp_server_update(
             &mut state,
-            McpConnectionDiscovery::failed("alpha", &stdio_config("alpha"), "boom").server,
+            McpConnectionDiscovery::failed("alpha", &stdio_config("alpha"), "boom"),
         );
-        assert_eq!(state.clients[0].client.name, "alpha");
+        assert_eq!(state.clients[0].name(), "alpha");
         assert_eq!(
-            state.clients[0].client.status,
+            state.clients[0].connection_type(),
             McpServerConnectionType::Failed
         );
-        assert_eq!(state.clients[1].client.name, "zeta");
+        assert_eq!(state.clients[1].name(), "zeta");
     }
 
     #[test]
     fn server_update_replaces_only_its_flat_entries_and_appends_fresh_capabilities() {
-        let mut alpha = McpConnectionDiscovery::pending("alpha").server;
-        alpha.client.status = McpServerConnectionType::Connected;
-        alpha
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "old".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: false,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        alpha
-            .prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "old-prompt".to_string(),
-                description: None,
-                arg_names: Vec::new(),
-            });
-        alpha
-            .resources
-            .push(crate::services::mcp::types::ServerResource {
-                server: "alpha".to_string(),
-                uri: "alpha://old".to_string(),
-                name: "old".to_string(),
-                description: None,
-                mime_type: None,
-            });
-
-        let mut beta = McpConnectionDiscovery::pending("beta").server;
-        beta.client.status = McpServerConnectionType::Connected;
-        beta.tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "keep".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: false,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        beta.prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "keep-prompt".to_string(),
-                description: None,
-                arg_names: Vec::new(),
-            });
-
-        let mut state = McpState {
-            clients: vec![alpha.clone(), beta],
-            ..McpState::default()
-        };
-        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
-        alpha.tools[0].name = "new".to_string();
-        alpha.prompts[0].name = "new-prompt".to_string();
-        alpha.resources[0].uri = "alpha://new".to_string();
-        apply_mcp_server_update(&mut state, alpha);
+        let mut state = McpState::default();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("alpha"),
+                Some(vec![flat_tool("alpha", "old")]),
+                Some(vec![flat_command("alpha", "old-prompt")]),
+                Some(vec![flat_resource("alpha", "alpha://old")]),
+            ),
+        );
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("beta"),
+                Some(vec![flat_tool("beta", "keep")]),
+                Some(vec![flat_command("beta", "keep-prompt")]),
+                None,
+            ),
+        );
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("alpha"),
+                Some(vec![flat_tool("alpha", "new")]),
+                Some(vec![flat_command("alpha", "new-prompt")]),
+                Some(vec![flat_resource("alpha", "alpha://new")]),
+            ),
+        );
 
         assert_eq!(
             state
@@ -3109,27 +2901,21 @@ mod tests {
             vec!["mcp__beta__keep-prompt", "mcp__alpha__new-prompt"]
         );
         assert_eq!(state.resources["alpha"][0].uri, "alpha://new");
-        assert_eq!(state.clients[0].client.name, "alpha");
-        assert_eq!(state.clients[1].client.name, "beta");
+        assert_eq!(state.clients[0].name(), "alpha");
+        assert_eq!(state.clients[1].name(), "beta");
 
         let commands_before_tools_patch = state
             .commands
             .iter()
             .map(|command| command.name.to_string())
             .collect::<Vec<_>>();
-        // CC updateServer({ ...client, tools }): the update carries the full
-        // captured client with the refreshed tools list.
-        let mut alpha_tools_update = state.clients[0].clone();
-        alpha_tools_update.tools = vec![crate::services::mcp::types::McpToolSnapshot {
-            name: "newer".to_string(),
-            display_name: None,
-            description: None,
-            input_schema: serde_json::json!({"type":"object"}),
-            read_only_hint: false,
-            destructive_hint: false,
-            open_world_hint: false,
-        }];
-        apply_mcp_tools_list_changed(&mut state, alpha_tools_update);
+        // CC updateServer({ ...client, tools }): the captured client with the
+        // refreshed tools, every other dimension absent.
+        let alpha = state.clients[0].clone();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(alpha, Some(vec![flat_tool("alpha", "newer")]), None, None),
+        );
         assert_eq!(
             state
                 .tools
@@ -3154,13 +2940,16 @@ mod tests {
             .iter()
             .map(|tool| tool.name.clone())
             .collect::<Vec<_>>();
-        let mut alpha_prompts_update = state.clients[0].clone();
-        alpha_prompts_update.prompts = vec![crate::services::mcp::types::McpPromptSnapshot {
-            name: "newer-prompt".to_string(),
-            description: None,
-            arg_names: Vec::new(),
-        }];
-        apply_mcp_prompts_list_changed(&mut state, alpha_prompts_update);
+        let alpha = state.clients[0].clone();
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                alpha,
+                None,
+                Some(vec![flat_command("alpha", "newer-prompt")]),
+                None,
+            ),
+        );
         assert_eq!(
             state
                 .tools
@@ -3178,7 +2967,7 @@ mod tests {
         let pending = pending_reconnect_server_update(&state.clients[0], 1);
         apply_mcp_client_update(&mut state, pending);
         assert_eq!(
-            state.clients[0].client.status,
+            state.clients[0].connection_type(),
             McpServerConnectionType::Pending
         );
         assert_eq!(state.tools, tools_before_pending);
@@ -3192,34 +2981,24 @@ mod tests {
         // `mcp.clients` is APPENDED (`[...mcp.clients, client]`) — never
         // skipped. The update's other dimensions stay `undefined` (no
         // commands/resources contribution for the appended client).
-        let mut existing = McpConnectionDiscovery::pending("alpha").server;
-        existing.client.status = McpServerConnectionType::Connected;
-        let mut state = McpState {
-            clients: vec![existing],
-            ..McpState::default()
-        };
-        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut state);
+        let mut state = McpState::default();
+        apply_mcp_client_update(&mut state, connected_server("alpha"));
 
-        let mut gamma = McpConnectionDiscovery::pending("gamma").server;
-        gamma.client.status = McpServerConnectionType::Connected;
-        gamma
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "fresh".to_string(),
-                display_name: None,
-                description: None,
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: false,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        apply_mcp_tools_list_changed(&mut state, gamma);
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("gamma"),
+                Some(vec![flat_tool("gamma", "fresh")]),
+                None,
+                None,
+            ),
+        );
 
         assert_eq!(
             state
                 .clients
                 .iter()
-                .map(|server| server.client.name.as_str())
+                .map(|server| server.name())
                 .collect::<Vec<_>>(),
             vec!["alpha", "gamma"],
             "missing client must be appended, preserving existing order"
@@ -3230,60 +3009,50 @@ mod tests {
                 .iter()
                 .any(|tool| tool.name == "mcp__gamma__fresh")
         );
-        let appended = &state.clients[1];
-        assert!(appended.prompts.is_empty());
-        assert!(appended.resources.is_empty());
         assert!(
             state.commands.is_empty(),
             "undefined dimensions must not contribute aggregates"
         );
+        assert!(!state.resources.contains_key("gamma"));
 
         // prompts/list_changed for another unknown client appends likewise.
         let tools_before_delta = state.tools.clone();
-        let mut delta = McpConnectionDiscovery::pending("delta").server;
-        delta.client.status = McpServerConnectionType::Connected;
-        delta
-            .prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "fresh-prompt".to_string(),
-                description: None,
-                arg_names: Vec::new(),
-            });
-        apply_mcp_prompts_list_changed(&mut state, delta);
-        assert_eq!(state.clients[2].client.name, "delta");
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("delta"),
+                None,
+                Some(vec![flat_command("delta", "fresh-prompt")]),
+                None,
+            ),
+        );
+        assert_eq!(state.clients[2].name(), "delta");
         assert!(
             state
                 .commands
                 .iter()
                 .any(|command| command.name.as_ref() == "mcp__delta__fresh-prompt")
         );
-        assert!(state.clients[2].tools.is_empty());
-        assert!(state.clients[2].resources.is_empty());
         assert_eq!(
             state.tools, tools_before_delta,
             "prompts append must not move tool aggregates"
         );
         assert!(!state.resources.contains_key("delta"));
 
-        // resources/list_changed appends and projects the resources map.
+        // resources/list_changed appends and writes the resources map.
         let tools_before_epsilon = state.tools.clone();
         let commands_before_epsilon = state.commands.clone();
-        let mut epsilon = McpConnectionDiscovery::pending("epsilon").server;
-        epsilon.client.status = McpServerConnectionType::Connected;
-        epsilon
-            .resources
-            .push(crate::services::mcp::types::ServerResource {
-                server: "epsilon".to_string(),
-                uri: "epsilon://fresh".to_string(),
-                name: "fresh".to_string(),
-                description: None,
-                mime_type: None,
-            });
-        apply_mcp_resources_list_changed(&mut state, epsilon);
-        assert_eq!(state.clients[3].client.name, "epsilon");
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected_server("epsilon"),
+                None,
+                None,
+                Some(vec![flat_resource("epsilon", "epsilon://fresh")]),
+            ),
+        );
+        assert_eq!(state.clients[3].name(), "epsilon");
         assert_eq!(state.resources["epsilon"][0].uri, "epsilon://fresh");
-        assert!(state.clients[3].tools.is_empty());
-        assert!(state.clients[3].prompts.is_empty());
         assert_eq!(
             state.tools, tools_before_epsilon,
             "resources append must not move tool aggregates"
@@ -3297,110 +3066,35 @@ mod tests {
     #[test]
     fn pending_start_is_nonblocking_and_connection_updates_flat_capability_arrays() {
         let configs = indexmap::IndexMap::from([("docs".to_string(), stdio_config("docs"))]);
-        let mut state = pending_mcp_state_from_configs(&configs);
+        let mut state = initialize_servers_as_pending(&McpState::default(), &configs).state;
         assert_eq!(state.clients.len(), 1);
         assert!(state.tools.is_empty());
         assert!(state.commands.is_empty());
 
-        let mut connected =
-            McpConnectionDiscovery::pending_with_config("docs", &configs["docs"]).server;
-        connected.client.status = McpServerConnectionType::Connected;
-        connected
-            .tools
-            .push(crate::services::mcp::types::McpToolSnapshot {
-                name: "search".to_string(),
-                display_name: None,
-                description: Some("Search docs".to_string()),
-                input_schema: serde_json::json!({"type": "object"}),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            });
-        connected
-            .prompts
-            .push(crate::services::mcp::types::McpPromptSnapshot {
-                name: "summarize".to_string(),
-                description: Some("Summarize docs".to_string()),
-                arg_names: Vec::new(),
-            });
-        connected
-            .resources
-            .push(crate::services::mcp::types::ServerResource {
-                server: "docs".to_string(),
-                uri: "docs://guide".to_string(),
-                name: "guide".to_string(),
-                description: None,
-                mime_type: Some("text/plain".to_string()),
-            });
-        apply_mcp_server_update(&mut state, connected);
+        // CC `onConnectionAttempt({ client, tools, commands, resources })`.
+        let connected = McpServerConnection::connected_for_test("docs", configs["docs"].clone());
+        apply_mcp_server_update(
+            &mut state,
+            server_update(
+                connected,
+                Some(vec![flat_tool("docs", "search")]),
+                Some(vec![flat_command("docs", "summarize")]),
+                Some(vec![flat_resource("docs", "docs://guide")]),
+            ),
+        );
         assert_eq!(state.tools[0].name, "mcp__docs__search");
         assert_eq!(state.commands[0].name, "mcp__docs__summarize");
         assert_eq!(state.resources["docs"][0].uri, "docs://guide");
 
         apply_mcp_server_update(
             &mut state,
-            McpConnectionDiscovery::failed("docs", &configs["docs"], "offline").server,
+            McpConnectionDiscovery::failed("docs", &configs["docs"], "offline"),
         );
         assert!(state.tools.is_empty());
         assert!(state.commands.is_empty());
         // Actual source spreads old resources before omit(old, name), so the
         // failed update clears tool/command contributions but retains this key.
         assert_eq!(state.resources["docs"][0].uri, "docs://guide");
-    }
-
-    #[test]
-    fn channel_message_notification_handler_gates_and_enqueues_like_official() {
-        let _queue_lock = crate::utils::message_queue_manager::TEST_QUEUE_LOCK
-            .lock()
-            .unwrap();
-        crate::utils::message_queue_manager::clear_command_queue();
-        let context = ChannelRuntimeGateContext {
-            channels_enabled: true,
-            has_claude_ai_oauth: true,
-            subscription: Some("max".to_string()),
-            policy_channels_enabled: None,
-            session_channels: vec![crate::bootstrap::state::ChannelEntry::server(
-                "planner", true,
-            )],
-            allowlist: crate::services::mcp::channel_notification::EffectiveChannelAllowlist {
-                entries: Vec::new(),
-                source: crate::services::mcp::channel_notification::ChannelAllowlistSource::Ledger,
-            },
-        };
-        let mut meta = BTreeMap::new();
-        meta.insert("thread_ts".to_string(), "1".to_string());
-        let gate = handle_channel_message_notification_with_context(
-            "planner",
-            "hello",
-            Some(&meta),
-            true,
-            None,
-            &context,
-        );
-        assert_eq!(gate, ChannelGateResult::Register);
-        let queue = crate::utils::message_queue_manager::get_command_queue();
-        assert_eq!(queue.len(), 1);
-        assert_eq!(queue[0].mode, "prompt");
-        assert!(queue[0].is_meta);
-        assert!(queue[0].skip_slash_commands);
-        assert!(
-            queue[0]
-                .value
-                .contains("<channel source=\"planner\" thread_ts=\"1\">")
-        );
-
-        crate::utils::message_queue_manager::clear_command_queue();
-        let skipped = handle_channel_message_notification_with_context(
-            "planner", "hello", None, false, None, &context,
-        );
-        assert!(matches!(
-            skipped,
-            ChannelGateResult::Skip {
-                kind: crate::services::mcp::channel_notification::ChannelGateSkipKind::Capability,
-                ..
-            }
-        ));
-        assert!(crate::utils::message_queue_manager::get_command_queue().is_empty());
     }
 
     #[test]
@@ -3413,8 +3107,7 @@ mod tests {
             let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
 
             let config = stdio_config("docs-mcp");
-            let mut server = McpConnectionDiscovery::pending_with_config("docs", &config).server;
-            server.client.status = McpServerConnectionType::Connected;
+            let server = McpServerConnection::connected_for_test("docs", config.clone());
             let state = McpState {
                 clients: vec![server],
                 ..McpState::default()
@@ -3426,10 +3119,147 @@ mod tests {
                 .unwrap();
 
             assert_eq!(
-                updated.server.client.status,
+                updated.server.connection_type(),
                 McpServerConnectionType::Disabled
             );
             assert!(crate::services::mcp::config::is_mcp_server_disabled("docs"));
+        });
+    }
+
+    /// Records every `log_mcp_debug` line as `debug:<server>:<message>`.
+    fn record_mcp_debug_logs() -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use std::sync::Arc;
+        crate::utils::log::_reset_error_log_for_testing();
+        let logs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let debug = logs.clone();
+        crate::utils::log::attach_error_log_sink(crate::utils::log::ErrorLogSink {
+            log_error: Arc::new(|_| Ok(())),
+            log_mcp_error: Arc::new(|_, _| Ok(())),
+            log_mcp_debug: Arc::new(move |server, message| {
+                debug
+                    .lock()
+                    .unwrap()
+                    .push(format!("debug:{server}:{message}"));
+                Ok(())
+            }),
+            get_errors_path: Arc::new(|| Ok(std::path::PathBuf::new())),
+            get_mcp_logs_path: Arc::new(|_| Ok(std::path::PathBuf::new())),
+        })
+        .unwrap();
+        logs
+    }
+
+    fn wait_for_log(logs: &std::sync::Mutex<Vec<String>>, line: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !logs.lock().unwrap().iter().any(|logged| logged == line) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "never logged {line:?}; logged {:#?}",
+                logs.lock().unwrap()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// The debug lines CC's `onclose` and `reconnectWithBackoff` write
+    /// (`useManageMCPConnections.ts:346-453`): the remote transport closing,
+    /// an attempt's outcome, the next attempt's backoff, a server disabled
+    /// mid-retry, and a disabled server that closes; and neither a success
+    /// nor a give-up line for a failed attempt that is not the last.
+    #[test]
+    fn closed_remote_server_logs_its_automatic_reconnection_like_official() {
+        with_isolated_config(|temp_dir| {
+            let project_dir = temp_dir.join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let _cwd_guard = ProjectCwdGuard::enter(&project_dir);
+            let _session_write = EnvVarGuard::set("SESSION_WRITE_ENABLED", "1");
+            let _write = EnvVarGuard::set("COMETIX_WRITE_ENABLED", "1");
+            crate::utils::process_runtime::initialize_test_process_runtime();
+            let logs = record_mcp_debug_logs();
+
+            // The server holds the first connection it gets until the test
+            // lets go, and drops every later one: the first attempt fails only
+            // once the server has been disabled, whatever the load.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (accepted, first_accepted) = std::sync::mpsc::channel();
+            let (release, released) = std::sync::mpsc::channel::<()>();
+            std::thread::spawn(move || {
+                let mut first = true;
+                for stream in listener.incoming() {
+                    let Ok(stream) = stream else { break };
+                    if std::mem::take(&mut first) {
+                        let _ = accepted.send(());
+                        let _ = released.recv();
+                    }
+                    drop(stream);
+                }
+            });
+
+            let name = "docs-remote";
+            let mut config = stdio_config("unused");
+            config.transport = Transport::Http;
+            config.command = None;
+            config.url = Some(format!("http://127.0.0.1:{port}/mcp"));
+            let writer = McpWriter::new(crate::state::store::AppStore::new(
+                crate::state::app_state_store::AppState::default(),
+                None,
+            ));
+            let line = |message: &str| format!("debug:{name}:{message}");
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+
+            runtime.block_on(handle_mcp_server_closed_event(
+                name.to_string(),
+                config.clone(),
+                writer.clone(),
+            ));
+            wait_for_log(
+                &logs,
+                &line("HTTP transport closed/disconnected, attempting automatic reconnection"),
+            );
+
+            // Disabled while the first attempt is in flight: it still
+            // completes, and the loop stops before the second.
+            first_accepted
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the first attempt connects");
+            set_mcp_server_enabled(name, false).unwrap();
+            release.send(()).unwrap();
+            wait_for_log(
+                &logs,
+                &line("HTTP reconnection attempt 1 completed with status: failed"),
+            );
+            wait_for_log(&logs, &line("Scheduling reconnection attempt 2 in 1000ms"));
+            wait_for_log(
+                &logs,
+                &line("Server disabled during reconnection, stopping retry"),
+            );
+            for absent in [
+                "attempt 2 completed",
+                "(attempt 2)",
+                "reconnection successful",
+                "Max reconnection attempts",
+            ] {
+                assert!(
+                    !logs
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .any(|logged| logged.contains(absent)),
+                    "logged {absent:?}: {:#?}",
+                    logs.lock().unwrap()
+                );
+            }
+
+            runtime.block_on(handle_mcp_server_closed_event(
+                name.to_string(),
+                config,
+                writer,
+            ));
+            wait_for_log(
+                &logs,
+                &line("Server is disabled, skipping automatic reconnection"),
+            );
         });
     }
 }

@@ -17,9 +17,7 @@
 
 use std::sync::Arc;
 
-use crate::services::mcp::types::{
-    McpClientSnapshot, McpServerConnectionType, McpServerSnapshot, ServerResource,
-};
+use crate::services::mcp::types::{McpServerConnection, McpServerConnectionType, ServerResource};
 use crate::tool::ToolPermissionContext;
 
 /// Maps to: CC `AppState.expandedView: 'none' | 'tasks' | 'teammates'`.
@@ -105,6 +103,16 @@ impl ElicitationState {
         );
         self.queue = queue;
         found
+    }
+
+    /// The request `request_id` of `server_name` leaves the queue: CC's
+    /// dialog cancels a request whose `signal` aborts
+    /// (`ElicitationDialog.tsx:193-209`), which then leaves the queue.
+    pub fn remove(&mut self, server_name: &str, request_id: &str) -> bool {
+        let before = self.queue.len();
+        self.queue
+            .retain(|event| !(event.server_name == server_name && event.request_id == request_id));
+        self.queue.len() != before
     }
 
     /// Maps to: CC `prev.elicitation.queue.slice(1)` after response/dismiss.
@@ -301,19 +309,10 @@ impl TaskState {
 pub struct McpState {
     /// Maps to: CC `AppStateStore.ts:183` / `getDefaultAppState:517`.
     pub plugin_reconnect_key: u64,
-    pub clients: Vec<McpServerSnapshot>,
+    pub clients: Vec<McpServerConnection>,
     pub tools: Vec<crate::types::tools::Tool>,
     pub commands: Vec<crate::commands::Command>,
     pub resources: std::collections::BTreeMap<String, Vec<ServerResource>>,
-}
-
-impl McpState {
-    pub fn client_snapshots(&self) -> Vec<McpClientSnapshot> {
-        self.clients
-            .iter()
-            .map(|server| server.client.clone())
-            .collect()
-    }
 }
 
 /// Maps to: CC AppStateStore.ts:185-217 inline plugins state.
@@ -367,17 +366,6 @@ impl McpWriter {
         (*self.store.get().mcp).clone()
     }
 
-    /// Whole-`AppState.mcp` replacement. **Test-only** — every production
-    /// writer goes through `initialize_servers_as_pending` (startup) or
-    /// `apply_server_update` / `apply_client_update` (resolved, per server),
-    /// because `PORTING.md:430` forbids full-clients reprojection: it destroys
-    /// the per-server update order and prompt-cache stability CC preserves
-    /// through `updateServer` patches.
-    #[cfg(test)]
-    pub fn set_current(&self, state: McpState) {
-        self.store.replace_with(|app| app.mcp = Arc::new(state));
-    }
-
     /// Maps to: CC `useManageMCPConnections.ts:782-838` — the initialization
     /// `setAppState`. It MERGES newly-configured servers into the existing
     /// client list (`:833` `clients: [...mcpWithoutStale.clients,
@@ -386,17 +374,16 @@ impl McpWriter {
     /// service-boundary cleanup, mirroring CC's `clearServerCache`
     /// fire-and-forget loop.
     ///
-    /// Replaces `set_current(pending_mcp_state_from_configs(...))`, which built
-    /// the pending list from an EMPTY state and then overwrote the whole
-    /// `AppState.mcp`. That dropped already-resolved capabilities, and because
-    /// it was unconditional a re-seed with identical configs produced a
-    /// revision bump, an `on_change`, and a listener pass the source does not
-    /// produce — exactly what the strict/dynamic startup path does when its
-    /// synchronous seed is followed by the async one.
+    /// Building the pending list from an empty state and overwriting the
+    /// whole `AppState.mcp` instead would drop already-resolved capabilities,
+    /// and a re-seed with identical configs would produce a revision bump, an
+    /// `on_change`, and a listener pass the source does not produce — exactly
+    /// what the strict/dynamic startup path does when its synchronous seed is
+    /// followed by the async one.
     pub fn initialize_servers_as_pending(
         &self,
         configs: &indexmap::IndexMap<String, crate::services::mcp::types::ScopedMcpServerConfig>,
-    ) -> Vec<McpServerSnapshot> {
+    ) -> Vec<McpServerConnection> {
         self.store.set_state(|prev| {
             let result =
                 crate::services::mcp::use_manage_mcp_connections::initialize_servers_as_pending(
@@ -405,17 +392,14 @@ impl McpWriter {
             // Detach before publishing replacement pending state; an old
             // transport closing during async cache cleanup must not reconnect.
             for stale in &result.stale {
-                if stale.client.status == McpServerConnectionType::Connected {
-                    crate::services::mcp::client::detach_mcp_close_handler(
-                        &stale.client.name,
-                        stale.connection_id,
-                    );
+                if let Some(connected) = stale.as_connected() {
+                    connected.client.clear_onclose();
                 }
             }
             if result
                 .stale
                 .iter()
-                .any(|server| server.client.status == McpServerConnectionType::Connected)
+                .any(|server| server.connection_type() == McpServerConnectionType::Connected)
             {
                 let cleanup =
                     crate::services::mcp::use_manage_mcp_connections::cleanup_stale_mcp_clients(
@@ -493,58 +477,24 @@ impl McpWriter {
         });
     }
 
+    /// Maps to: CC `setAppState(prev => ({ ...prev, mcp: ... }))` writers
+    /// that rewrite `AppState.mcp` directly rather than through
+    /// `updateServer` (`MCPRemoteServerMenu.tsx`'s clear-auth paths).
+    pub fn update(&self, mutator: impl FnOnce(&mut McpState)) {
+        self.store.replace_with(|app| {
+            let mut state = (*app.mcp).clone();
+            mutator(&mut state);
+            app.mcp = Arc::new(state);
+        });
+    }
+
     /// Maps to an official client-only `updateServer` patch (for example a
     /// reconnecting `pending` status) that preserves existing capabilities.
-    pub fn apply_client_update(&self, server: McpServerSnapshot) {
+    pub fn apply_client_update(&self, server: McpServerConnection) {
         self.store.replace_with(|app| {
             let mut state = (*app.mcp).clone();
             crate::services::mcp::use_manage_mcp_connections::apply_mcp_client_update(
                 &mut state, server,
-            );
-            app.mcp = Arc::new(state);
-        });
-    }
-
-    /// Maps to MCP tools/list_changed `updateServer({ ...client, tools })`
-    /// (CC `useManageMCPConnections.ts:656`); unrelated command/resource
-    /// ordering is preserved.
-    ///
-    /// The update carries the FULL client captured by the notification
-    /// handler; CC's batched flush (:222-289) has NO `return prevState`
-    /// branch — a missing client is APPENDED (:250-253) and a fresh root is
-    /// always installed. (2026-08-02 2nd addendum: the earlier F-A1
-    /// "return prevState" provenance here was false and is retracted.)
-    pub fn apply_tools_list_changed(&self, update: McpServerSnapshot) {
-        self.store.replace_with(|app| {
-            let mut state = (*app.mcp).clone();
-            crate::services::mcp::use_manage_mcp_connections::apply_mcp_tools_list_changed(
-                &mut state, update,
-            );
-            app.mcp = Arc::new(state);
-        });
-    }
-
-    /// Maps to MCP prompts/list_changed `updateServer({ ...client, commands })`
-    /// (CC `useManageMCPConnections.ts:688-691`); same full-client
-    /// append-when-missing flush semantics as tools above.
-    pub fn apply_prompts_list_changed(&self, update: McpServerSnapshot) {
-        self.store.replace_with(|app| {
-            let mut state = (*app.mcp).clone();
-            crate::services::mcp::use_manage_mcp_connections::apply_mcp_prompts_list_changed(
-                &mut state, update,
-            );
-            app.mcp = Arc::new(state);
-        });
-    }
-
-    /// Maps to MCP resources/list_changed `updateServer({ ...client, resources })`
-    /// (CC `useManageMCPConnections.ts:741`, non-`MCP_SKILLS` branch); same
-    /// full-client append-when-missing flush semantics as tools above.
-    pub fn apply_resources_list_changed(&self, update: McpServerSnapshot) {
-        self.store.replace_with(|app| {
-            let mut state = (*app.mcp).clone();
-            crate::services::mcp::use_manage_mcp_connections::apply_mcp_resources_list_changed(
-                &mut state, update,
             );
             app.mcp = Arc::new(state);
         });
@@ -559,6 +509,22 @@ impl McpWriter {
             let mut state = (*app.elicitation).clone();
             state.push_event(event);
             app.elicitation = Arc::new(state);
+        });
+    }
+
+    /// A cancelled request leaves the dialog queue ([`ElicitationState::remove`]).
+    pub fn remove_elicitation_event(&self, server_name: &str, request_id: &str) {
+        self.store.set_state(|prev| {
+            let mut state = (*prev.elicitation).clone();
+            if !state.remove(server_name, request_id) {
+                return crate::state::store::UpdateDecision::Same(());
+            }
+            let mut next = (**prev).clone();
+            next.elicitation = Arc::new(state);
+            crate::state::store::UpdateDecision::Replace {
+                next: Arc::new(next),
+                result: (),
+            }
         });
     }
 
@@ -581,10 +547,11 @@ impl McpWriter {
             }
         });
         if !found {
-            tracing::debug!(
-                server = %name,
-                elicitation_id = %elicitation_id,
-                "Ignoring completion notification for unknown elicitation"
+            crate::utils::log::log_mcp_debug(
+                name,
+                &format!(
+                    "Ignoring completion notification for unknown elicitation: {elicitation_id}"
+                ),
             );
         }
     }
@@ -967,8 +934,7 @@ impl AppState {
 mod tests {
     use super::{AppState, McpState, McpWriter};
     use crate::services::mcp::types::{
-        McpClientSnapshot, McpServerConnectionType, McpServerSnapshot, McpToolSnapshot,
-        ServerResource,
+        McpServerConnection, McpServerConnectionType, ServerResource,
     };
     use std::sync::Arc;
 
@@ -1003,22 +969,11 @@ mod tests {
     fn resolved_servers_apply_in_one_transition_like_official_flush() {
         let store = crate::state::store::AppStore::new(AppState::default(), None);
         let writer = McpWriter::new(store.clone());
-        let server = |name: &str| McpServerSnapshot {
-            connection_id: None,
-            client: McpClientSnapshot {
-                name: name.to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
-            },
-            config: None,
-            supports_resources: false,
-            tools: Vec::new(),
-            prompts: Vec::new(),
-            resources: Vec::new(),
+        // A resolved server's connection attempt.
+        let server = |name: &str| {
+            crate::services::mcp::client::McpConnectionDiscovery::from(
+                McpServerConnection::connected_for_test(name, stdio_scoped_config(name)),
+            )
         };
 
         let baseline = store.revision();
@@ -1041,7 +996,9 @@ mod tests {
         // CC `:219` `if (updates.length === 0) return` — an empty flush is not
         // a transition at all.
         let after = store.revision();
-        writer.apply_server_updates(Vec::<McpServerSnapshot>::new());
+        writer.apply_server_updates(
+            Vec::<crate::services::mcp::client::McpConnectionDiscovery>::new(),
+        );
         assert_eq!(store.revision(), after);
     }
 
@@ -1049,10 +1006,9 @@ mod tests {
     /// (newClients.length === 0 && stale.length === 0) return prevState`.
     ///
     /// The strict/dynamic startup path seeds pending state synchronously and
-    /// then the async path seeds again with the same configs. The old
-    /// `set_current(pending_mcp_state_from_configs(..))` wrote unconditionally,
-    /// so that second seed produced a revision bump, an `on_change` and a
-    /// listener pass the source never produces.
+    /// then the async path seeds again with the same configs. An
+    /// unconditional write would make that second seed produce a revision
+    /// bump, an `on_change` and a listener pass the source never produces.
     #[test]
     fn reseeding_identical_configs_is_a_same_like_official_initialization_guard() {
         let store = crate::state::store::AppStore::new(AppState::default(), None);
@@ -1097,35 +1053,29 @@ mod tests {
             config("docs-mcp"),
         )]));
         // "docs" resolves with a tool.
-        writer.apply_server_update(McpServerSnapshot {
-            connection_id: None,
-            client: McpClientSnapshot {
-                name: "docs".to_string(),
-                status: McpServerConnectionType::Connected,
-                reconnect_attempt: None,
-                max_reconnect_attempts: None,
-                ide_name: None,
-                server_version: None,
-                error: None,
+        writer.apply_server_update(
+            crate::services::mcp::use_manage_mcp_connections::McpPendingUpdate {
+                // Carry the config forward: `exclude_stale_plugin_clients`
+                // hashes it, and a mismatch legitimately marks the server
+                // stale, which CC re-adds as `pending` (:786-789). This test
+                // is about the merge, not the stale path.
+                server: McpServerConnection::connected_for_test(
+                    "docs",
+                    stdio_scoped_config("docs-mcp"),
+                ),
+                tools: Some(vec![crate::services::mcp::client::mcp_tool_for_test(
+                    "docs",
+                    serde_json::json!({
+                        "name": "search",
+                        "description": "Search docs",
+                        "inputSchema": {"type": "object"},
+                        "annotations": {"readOnlyHint": true}
+                    }),
+                )]),
+                commands: None,
+                resources: None,
             },
-            // Carry the config forward: `exclude_stale_plugin_clients` hashes
-            // it, and a mismatch legitimately marks the server stale, which CC
-            // re-adds as `pending` (:786-789). This test is about the merge,
-            // not the stale path.
-            config: Some(stdio_scoped_config("docs-mcp")),
-            supports_resources: false,
-            tools: vec![McpToolSnapshot {
-                name: "search".to_string(),
-                display_name: None,
-                description: Some("Search docs".to_string()),
-                input_schema: serde_json::json!({"type":"object"}),
-                read_only_hint: true,
-                destructive_hint: false,
-                open_world_hint: false,
-            }],
-            prompts: Vec::new(),
-            resources: Vec::new(),
-        });
+        );
         assert_eq!(writer.current().tools.len(), 1);
 
         // A later seed that adds a DIFFERENT server must not wipe "docs".
@@ -1139,9 +1089,9 @@ mod tests {
         let docs = state
             .clients
             .iter()
-            .find(|server| server.client.name == "docs")
+            .find(|server| server.name() == "docs")
             .expect("docs client survives");
-        assert_eq!(docs.client.status, McpServerConnectionType::Connected);
+        assert_eq!(docs.connection_type(), McpServerConnectionType::Connected);
         assert_eq!(
             state.tools.len(),
             1,
@@ -1150,7 +1100,7 @@ mod tests {
     }
 
     #[test]
-    fn mcp_writer_set_current_preserves_ready_flat_aggregates_without_reprojection() {
+    fn mcp_writer_update_preserves_ready_flat_aggregates_without_reprojection() {
         let store = crate::state::store::AppStore::new(AppState::default(), None);
         let writer = McpWriter::new(store);
         let state = McpState {
@@ -1161,15 +1111,11 @@ mod tests {
                 is_mcp: true,
                 ..Default::default()
             }],
-            commands: vec![crate::commands::Command::from_mcp_prompt(
-                crate::services::mcp::client::McpPromptCommandSnapshot {
-                    name: "mcp__docs__summarize".to_string(),
-                    description: "Summarize docs".to_string(),
-                    has_user_specified_description: true,
-                    user_facing_name: "docs:summarize (MCP)".to_string(),
-                    arg_names: Vec::new(),
-                    source: "mcp",
-                },
+            commands: vec![crate::services::mcp::client::mcp_command_for_test(
+                "docs",
+                "summarize",
+                Some("Summarize docs"),
+                &[],
             )],
             resources: std::collections::BTreeMap::from([(
                 "docs".to_string(),
@@ -1184,7 +1130,11 @@ mod tests {
             ..McpState::default()
         };
 
-        writer.set_current(state);
+        writer.update(|mcp| {
+            mcp.tools = state.tools;
+            mcp.commands = state.commands;
+            mcp.resources = state.resources;
+        });
         let current = writer.current();
         assert_eq!(current.tools[0].name, "mcp__docs__search");
         assert_eq!(current.commands[0].name, "mcp__docs__summarize");

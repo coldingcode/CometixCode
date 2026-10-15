@@ -43,7 +43,6 @@ use crate::utils::settings::{
 };
 use crate::utils::settings::{SettingsJson, ValidationError};
 use crate::utils::status::StartupDiagnosticsSnapshot;
-use crate::utils::status::mcp_client_snapshots_from_config;
 use crate::utils::thinking::{
     ThinkingConfig, parse_js_decimal_i64, should_enable_thinking_by_default,
 };
@@ -610,17 +609,10 @@ pub fn seed_mcp_and_channel_permissions(store: &AppStore, startup: &McpStartupCo
 pub fn build_startup_diagnostics_snapshot(
     settings: &SettingsWithErrors,
 ) -> Arc<StartupDiagnosticsSnapshot> {
-    let global_config = load_global_config();
-    let current_project_config = std::env::current_dir()
-        .ok()
-        .map(|cwd| project_config_for_cwd(&global_config, &cwd))
-        .unwrap_or_default();
-    let mcp_clients = mcp_client_snapshots_from_config(&global_config, &current_project_config);
     Arc::new(StartupDiagnosticsSnapshot {
         settings_errors: settings.errors.clone(),
         installation_diagnostics: Vec::new(),
         doctor_diagnostics: Vec::new(),
-        mcp_clients,
         ide_installation_status: None,
     })
 }
@@ -667,15 +659,16 @@ pub fn initialize_lsp_if_trusted(workspace_trusted: bool) {
 
 /// Register MCP connection handlers (non-test). IDE `selection_changed`
 /// delivery is REPL-owned (CC `useIdeSelection`): the REPL registers its
-/// per-connection sink via `services::mcp::client::register_ide_selection_sink`.
+/// handler on the IDE client itself (`hooks::use_ide_selection`).
 /// Ownership ruling, P5 G10 (2026-08-04). Kept pre-mount, deliberately.
 ///
-/// CC's counterpart is `onConnectionAttempt`
-/// (`useManageMCPConnections.ts:310-322`), a `useCallback` inside the hook —
-/// hook-scoped, created and discarded with the mount. Rust registers a
-/// process-wide handler set instead, because the rmcp transport delivers
-/// connection callbacks through a global sink rather than a closure the caller
-/// threads in.
+/// The connection handlers `onConnectionAttempt` installs
+/// (`useManageMCPConnections.ts:310-763`) are installed on each connection
+/// (`install_connection_handlers`). What stays in this process-wide set is
+/// what CC reaches through the session rather than a connection: the channel
+/// relay callbacks (`channelPermCallbacksRef`, hook-scoped at the source) and
+/// the writer for a tool call's URL elicitation queue push (the caller's
+/// `setAppState`).
 ///
 /// That difference used to carry a real hazard: a connection resolving before
 /// `AppStateProvider` adopted the store would write through this handler while
@@ -2121,9 +2114,9 @@ mod tests {
 
         let state = store.get();
         assert_eq!(state.mcp.clients.len(), 1);
-        assert_eq!(state.mcp.clients[0].client.name, "docs");
+        assert_eq!(state.mcp.clients[0].name(), "docs");
         assert_eq!(
-            state.mcp.clients[0].client.status,
+            state.mcp.clients[0].connection_type(),
             crate::services::mcp::types::McpServerConnectionType::Pending
         );
         assert!(state.mcp.tools.is_empty());

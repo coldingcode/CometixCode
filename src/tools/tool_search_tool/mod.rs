@@ -82,9 +82,10 @@ pub(crate) fn pending_mcp_server_names(
         .clients
         .iter()
         .filter(|server| {
-            server.client.status == crate::services::mcp::types::McpServerConnectionType::Pending
+            server.connection_type()
+                == crate::services::mcp::types::McpServerConnectionType::Pending
         })
-        .map(|server| server.client.name.clone())
+        .map(|server| server.name().to_owned())
         .collect()
 }
 
@@ -665,54 +666,28 @@ mod tests {
 
     #[test]
     fn tool_search_uses_runtime_mcp_tools_and_reports_pending_servers_like_official() {
-        let mut mcp_state = crate::state::app_state_store::McpState {
+        let mcp_state = crate::state::app_state_store::McpState {
             clients: vec![
-                crate::services::mcp::types::McpServerSnapshot {
-                    connection_id: None,
-                    client: crate::services::mcp::types::McpClientSnapshot {
-                        name: "GitHub Server".to_string(),
-                        status: crate::services::mcp::types::McpServerConnectionType::Connected,
-                        reconnect_attempt: None,
-                        max_reconnect_attempts: None,
-                        ide_name: None,
-                        server_version: None,
-                        error: None,
-                    },
-                    config: None,
-                    supports_resources: false,
-                    tools: vec![crate::services::mcp::types::McpToolSnapshot {
-                        name: "Create Issue".to_string(),
-                        display_name: Some("Create Issue".to_string()),
-                        description: Some("Create a GitHub issue".to_string()),
-                        input_schema: serde_json::json!({"type":"object"}),
-                        read_only_hint: false,
-                        destructive_hint: false,
-                        open_world_hint: true,
-                    }],
-                    prompts: Vec::new(),
-                    resources: Vec::new(),
-                },
-                crate::services::mcp::types::McpServerSnapshot {
-                    connection_id: None,
-                    client: crate::services::mcp::types::McpClientSnapshot {
-                        name: "slack".to_string(),
-                        status: crate::services::mcp::types::McpServerConnectionType::Pending,
-                        reconnect_attempt: None,
-                        max_reconnect_attempts: None,
-                        ide_name: None,
-                        server_version: None,
-                        error: None,
-                    },
-                    config: None,
-                    supports_resources: false,
-                    tools: Vec::new(),
-                    prompts: Vec::new(),
-                    resources: Vec::new(),
-                },
+                crate::services::mcp::types::McpServerConnection::connected_for_test(
+                    "GitHub Server",
+                    crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("github"),
+                ),
+                crate::services::mcp::types::McpServerConnection::pending(
+                    "slack",
+                    crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("slack"),
+                ),
             ],
+            tools: vec![crate::services::mcp::client::mcp_tool_for_test(
+                "GitHub Server",
+                serde_json::json!({
+                    "name": "Create Issue",
+                    "description": "Create a GitHub issue",
+                    "inputSchema": {"type": "object"},
+                    "annotations": {"title": "Create Issue", "openWorldHint": true}
+                }),
+            )],
             ..crate::state::app_state_store::McpState::default()
         };
-        crate::services::mcp::client::refresh_flat_mcp_capabilities(&mut mcp_state);
         let tools = vec![super::tool_search_tool_schema()];
 
         let matched = super::tool_search_output_from_tools_and_mcp_state(

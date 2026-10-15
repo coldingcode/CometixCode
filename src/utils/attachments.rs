@@ -1189,23 +1189,25 @@ async fn process_mcp_resource_attachments(
             return None;
         }
         let server = context.mcp_state.clients.iter().find(|server| {
-            server.client.name == server_name
-                && server.client.status
+            server.name() == server_name
+                && server.connection_type()
                     == crate::services::mcp::types::McpServerConnectionType::Connected
         })?;
+        // CC `toolUseContext.options.mcpResources?.[serverName]` only.
         let resource = context
             .mcp_state
             .resources
             .get(server_name)
-            .and_then(|resources| resources.iter().find(|resource| resource.uri == uri))
-            .or_else(|| server.resources.iter().find(|resource| resource.uri == uri))?;
+            .and_then(|resources| resources.iter().find(|resource| resource.uri == uri))?;
         let name = if resource.name.is_empty() {
             uri.to_string()
         } else {
             resource.name.clone()
         };
         let description = resource.description.clone();
-        let content = crate::services::mcp::client::read_mcp_resource(server_name, uri)
+        // CC reads over the AppState client itself (`client.client.readResource`).
+        let client = &server.as_connected()?.client;
+        let content = crate::services::mcp::client::read_mcp_resource(client, uri)
             .await
             .ok()?;
         let attachment = AttachmentMessage::new(serde_json::json!({
@@ -1468,51 +1470,37 @@ pub(crate) fn get_agent_listing_delta_attachment(
     })))
 }
 
-/// Maps to CC `utils/attachments.ts:1559-1587`
-/// `getMcpInstructionsDeltaAttachment(...)` for server-authored instructions.
 /// Maps to: CC `utils/attachments.ts:1559-1586`
-/// `getMcpInstructionsDeltaAttachment`.
+/// `getMcpInstructionsDeltaAttachment(mcpClients, tools, model, messages)`.
 pub(crate) fn get_mcp_instructions_delta_attachment(
-    context: &ToolUseContext,
+    mcp_clients: &[crate::services::mcp::types::McpServerConnection],
+    tools: &[crate::types::tools::Tool],
+    model: &str,
     messages: &[Message],
 ) -> Option<AttachmentMessage> {
+    use crate::utils::mcp_instructions_delta::ClientSideInstruction;
+
     if !crate::utils::mcp_instructions_delta::is_mcp_instructions_delta_enabled() {
         return None;
     }
-    let connected_names = context
-        .mcp_state
-        .clients
-        .iter()
-        .filter(|server| {
-            server.client.status == crate::services::mcp::types::McpServerConnectionType::Connected
-        })
-        .map(|server| server.client.name.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut instructions =
-        crate::services::mcp::client::connected_mcp_server_instructions(&context.mcp_state);
-    let model = context
-        .main_loop_model
-        .clone()
-        .unwrap_or_else(crate::utils::model::model::get_main_loop_model);
-    let chrome_name = crate::utils::claude_in_chrome::common::CLAUDE_IN_CHROME_MCP_SERVER_NAME;
-    if connected_names.contains(chrome_name)
-        && crate::tools::tool_search_tool::prompt::is_tool_search_enabled_optimistic()
-        && crate::tools::tool_search_tool::prompt::model_supports_tool_reference(&model)
-        && crate::tools::tool_search_tool::prompt::is_tool_search_tool_available(&context.tools)
+    // CC `:1567-1580`: the chrome ToolSearch hint is client-authored and
+    // ToolSearch-conditional, passed into the diff as a synthesized entry.
+    let mut client_side = Vec::<ClientSideInstruction>::new();
+    if crate::tools::tool_search_tool::prompt::is_tool_search_enabled_optimistic()
+        && crate::tools::tool_search_tool::prompt::model_supports_tool_reference(model)
+        && crate::tools::tool_search_tool::prompt::is_tool_search_tool_available(tools)
     {
-        let chrome_prompt = crate::utils::claude_in_chrome::prompt::CHROME_TOOL_SEARCH_INSTRUCTIONS;
-        instructions
-            .entry(chrome_name.to_string())
-            .and_modify(|server_prompt| {
-                server_prompt.push_str("\n\n");
-                server_prompt.push_str(chrome_prompt);
-            })
-            .or_insert_with(|| chrome_prompt.to_string());
+        client_side.push(ClientSideInstruction {
+            server_name: crate::utils::claude_in_chrome::common::CLAUDE_IN_CHROME_MCP_SERVER_NAME
+                .to_string(),
+            block: crate::utils::claude_in_chrome::prompt::CHROME_TOOL_SEARCH_INSTRUCTIONS
+                .to_string(),
+        });
     }
     let delta = crate::utils::mcp_instructions_delta::get_mcp_instructions_delta(
-        &connected_names,
-        &instructions,
+        mcp_clients,
         messages,
+        &client_side,
     )?;
     Some(AttachmentMessage::new(serde_json::json!({
         "type": "mcp_instructions_delta",
@@ -1884,7 +1872,12 @@ pub async fn get_attachments(
     if let Some(attachment) = get_agent_listing_delta_attachment(tool_use_context, messages) {
         attachments.push(attachment_continuation(attachment));
     }
-    if let Some(attachment) = get_mcp_instructions_delta_attachment(tool_use_context, messages) {
+    if let Some(attachment) = get_mcp_instructions_delta_attachment(
+        &tool_use_context.mcp_state.clients,
+        &tool_use_context.tools,
+        &model,
+        messages,
+    ) {
         attachments.push(attachment_continuation(attachment));
     }
     attachments.extend(changed_files);
@@ -2658,24 +2651,6 @@ mod tests {
         Diagnostic, DiagnosticFile, DiagnosticPosition, DiagnosticRange,
     };
 
-    struct McpInstructionGuard(&'static str);
-
-    impl McpInstructionGuard {
-        fn set(name: &'static str, instructions: &str) -> Self {
-            crate::services::mcp::client::set_mcp_server_instructions_for_test(
-                name,
-                Some(instructions),
-            );
-            Self(name)
-        }
-    }
-
-    impl Drop for McpInstructionGuard {
-        fn drop(&mut self) {
-            crate::services::mcp::client::set_mcp_server_instructions_for_test(self.0, None);
-        }
-    }
-
     /// Batch-D long-tail #2: the nested payloads typed in this batch must
     /// parse into the typed members (not degrade to `Unknown`) for CC-shaped
     /// wire values, and must re-serialize to the identical wire form.
@@ -3446,17 +3421,19 @@ mod tests {
                 .clone(),
         );
         reset_sent_skill_names_for_test();
+        // An MCP skill: a prompt command marked `loadedFrom: 'mcp'`, named
+        // `name`.
         let make_command = |name: &str| {
-            crate::commands::Command::from_mcp_prompt(
-                crate::services::mcp::client::McpPromptCommandSnapshot {
-                    name: name.to_string(),
-                    description: format!("Use {name}"),
-                    has_user_specified_description: true,
-                    user_facing_name: name.to_string(),
-                    arg_names: Vec::new(),
-                    source: "mcp",
-                },
-            )
+            let mut command = crate::services::mcp::client::mcp_command_for_test(
+                "mcp",
+                name,
+                Some(&format!("Use {name}")),
+                &[],
+            );
+            command.name = name.to_string().into();
+            command.user_facing_name = Some(name.to_string().into());
+            command.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
+            command
         };
         let mut context = ToolUseContext::default();
         context.tools = vec![crate::tools::skill_tool::skill_tool_schema()];
@@ -3510,17 +3487,19 @@ mod tests {
         );
         reset_sent_skill_names_for_test();
 
+        // An MCP skill: a prompt command marked `loadedFrom: 'mcp'`, named
+        // `name`.
         let make_command = |name: &str| {
-            crate::commands::Command::from_mcp_prompt(
-                crate::services::mcp::client::McpPromptCommandSnapshot {
-                    name: name.to_string(),
-                    description: format!("Use {name}"),
-                    has_user_specified_description: true,
-                    user_facing_name: name.to_string(),
-                    arg_names: Vec::new(),
-                    source: "mcp",
-                },
-            )
+            let mut command = crate::services::mcp::client::mcp_command_for_test(
+                "mcp",
+                name,
+                Some(&format!("Use {name}")),
+                &[],
+            );
+            command.name = name.to_string().into();
+            command.user_facing_name = Some(name.to_string().into());
+            command.loaded_from = Some(crate::skills::load_skills_dir::SkillLoadedFrom::Mcp);
+            command
         };
         let mut live_state = crate::state::app_state_store::AppState::default();
         live_state.mcp = std::sync::Arc::new(crate::state::app_state_store::McpState {
@@ -4141,89 +4120,67 @@ mod tests {
         );
     }
 
+    /// CC `getMcpInstructionsDeltaAttachment` reads `instructions` off the
+    /// connected records it is given (`mcpInstructionsDelta.ts:79-82`).
     #[test]
-    fn mcp_instruction_delta_uses_live_initialize_instructions() {
+    fn mcp_instruction_delta_reads_instructions_from_connected_records() {
         let _env_lock = TEST_ENV_LOCK.lock().unwrap();
-        let _instructions_lock = crate::services::mcp::client::TEST_MCP_INSTRUCTIONS_LOCK
-            .lock()
-            .unwrap();
         let _gate = EnvVarGuard::set("CLAUDE_CODE_MCP_INSTR_DELTA", "true");
-        let _instructions =
-            McpInstructionGuard::set("docs", "Use resource templates before tools.");
-        let state = crate::state::app_state_store::McpState {
-            clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: "docs".to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
-            }],
-            ..Default::default()
-        };
-        let mut context = ToolUseContext::default().with_mcp_state(state);
+        let clients = [
+            crate::services::mcp::types::McpServerConnection::connected_with_instructions_for_test(
+                "docs",
+                "Use resource templates before tools.",
+            ),
+        ];
 
         let attachment =
-            get_mcp_instructions_delta_attachment(&context, &[]).expect("instruction delta");
+            get_mcp_instructions_delta_attachment(&clients, &[], "claude-sonnet-4-6", &[])
+                .expect("instruction delta");
         assert_eq!(attachment.attachment_type(), "mcp_instructions_delta");
         assert_eq!(
             attachment.attachment.to_wire()["addedBlocks"][0].as_str(),
             Some("## docs\nUse resource templates before tools.")
+        );
+
+        // The gate is off: no attachment.
+        let _gate = EnvVarGuard::set("CLAUDE_CODE_MCP_INSTR_DELTA", "false");
+        assert!(
+            get_mcp_instructions_delta_attachment(&clients, &[], "claude-sonnet-4-6", &[])
+                .is_none()
         );
     }
 
     #[test]
     fn mcp_instruction_delta_appends_chrome_tool_search_instructions() {
         let _env_lock = TEST_ENV_LOCK.lock().unwrap();
-        let _instructions_lock = crate::services::mcp::client::TEST_MCP_INSTRUCTIONS_LOCK
-            .lock()
-            .unwrap();
         let _gate = EnvVarGuard::set("CLAUDE_CODE_MCP_INSTR_DELTA", "true");
         let _tool_search = EnvVarGuard::set("ENABLE_TOOL_SEARCH", "true");
-        let _instructions = McpInstructionGuard::set("claude-in-chrome", "Server guidance.");
-        let state = crate::state::app_state_store::McpState {
-            clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: "claude-in-chrome".to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Connected,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: None,
-                },
-                config: None,
-                supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
-            }],
-            ..Default::default()
-        };
-        let mut context = ToolUseContext::default()
-            .with_mcp_state(state)
-            .with_main_loop_model("claude-sonnet-4-6")
-            .with_tools(vec![
-                crate::tools::tool_search_tool::tool_search_tool_schema(),
-            ]);
+        let clients = [
+            crate::services::mcp::types::McpServerConnection::connected_with_instructions_for_test(
+                "claude-in-chrome",
+                "Server guidance.",
+            ),
+        ];
+        let tools = [crate::tools::tool_search_tool::tool_search_tool_schema()];
 
         let attachment =
-            get_mcp_instructions_delta_attachment(&context, &[]).expect("chrome delta");
+            get_mcp_instructions_delta_attachment(&clients, &tools, "claude-sonnet-4-6", &[])
+                .expect("chrome delta");
         let wire = attachment.attachment.to_wire();
         let block = wire["addedBlocks"][0].as_str().expect("instruction block");
         assert!(block.starts_with("## claude-in-chrome\nServer guidance."));
         assert!(block.contains("Before using any chrome browser tools"));
         assert!(block.contains("select:mcp__claude-in-chrome__tabs_context_mcp"));
+
+        // ToolSearch off: no client-side block, only the server's own.
+        let _tool_search = EnvVarGuard::set("ENABLE_TOOL_SEARCH", "false");
+        let attachment =
+            get_mcp_instructions_delta_attachment(&clients, &tools, "claude-sonnet-4-6", &[])
+                .expect("server delta");
+        assert_eq!(
+            attachment.attachment.to_wire()["addedBlocks"],
+            serde_json::json!(["## claude-in-chrome\nServer guidance."])
+        );
     }
 
     #[tokio::test]

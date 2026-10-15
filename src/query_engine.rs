@@ -818,7 +818,7 @@ async fn run_query(input: QueryRunInput<'_>) -> Result<QueryEngineOutcome, Strin
         .mcp_state
         .clients
         .iter()
-        .map(|server| server.client.name.as_str())
+        .map(|server| server.name())
         .collect();
     let scratchpad_dir = crate::utils::permissions::filesystem::is_scratchpad_enabled()
         .then(crate::utils::permissions::filesystem::get_scratchpad_dir);
@@ -1408,7 +1408,7 @@ fn resolve_system_prompt(
     model: &str,
     tools: &[crate::types::tools::Tool],
     additional_working_directories: &[String],
-    mcp_clients: &[crate::services::mcp::types::McpServerSnapshot],
+    mcp_clients: &[crate::services::mcp::types::McpServerConnection],
     overrides: &QueryEngineOverrides,
 ) -> Result<
     (

@@ -188,26 +188,30 @@ pub(crate) async fn read_mcp_resource_output(
     let available_servers = state
         .clients
         .iter()
-        .map(|candidate| candidate.client.name.as_str())
+        .map(|candidate| candidate.name())
         .collect::<Vec<_>>();
     let Some(client) = state
         .clients
         .iter()
-        .find(|candidate| candidate.client.name == server)
+        .find(|candidate| candidate.name() == server)
     else {
         return Err(format!(
             "Server \"{server}\" not found. Available servers: {}",
             available_servers.join(", ")
         ));
     };
-    if client.client.status != crate::services::mcp::types::McpServerConnectionType::Connected {
+    let Some(connected) = client.as_connected() else {
         return Err(format!("Server \"{server}\" is not connected"));
-    }
-    if !client.supports_resources {
+    };
+    if connected.capabilities.resources.is_none() {
         return Err(format!("Server \"{server}\" does not support resources"));
     }
 
-    crate::services::mcp::client::read_mcp_resource(server, uri)
+    // CC `ensureConnectedClient(client)` (:94), then the read over it.
+    let connected = crate::services::mcp::client::ensure_connected_client(connected)
+        .await
+        .map_err(|error| error.to_string())?;
+    crate::services::mcp::client::read_mcp_resource(&connected.client, uri)
         .await
         .map(|value| read_mcp_resource_result_from_value(server, value))
         .map_err(|error| error.to_string())
@@ -430,23 +434,11 @@ mod tests {
     #[tokio::test]
     async fn read_mcp_resource_reports_not_connected_like_official() {
         let state = crate::state::app_state_store::McpState {
-            clients: vec![crate::services::mcp::types::McpServerSnapshot {
-                connection_id: None,
-                client: crate::services::mcp::types::McpClientSnapshot {
-                    name: "offline".to_string(),
-                    status: crate::services::mcp::types::McpServerConnectionType::Failed,
-                    reconnect_attempt: None,
-                    max_reconnect_attempts: None,
-                    ide_name: None,
-                    server_version: None,
-                    error: Some("boom".to_string()),
-                },
-                config: None,
-                supports_resources: false,
-                tools: Vec::new(),
-                prompts: Vec::new(),
-                resources: Vec::new(),
-            }],
+            clients: vec![crate::services::mcp::types::McpServerConnection::failed(
+                "offline",
+                crate::services::mcp::types::ScopedMcpServerConfig::stdio_for_test("offline"),
+                Some("boom".to_string()),
+            )],
             ..crate::state::app_state_store::McpState::default()
         };
 

@@ -90,7 +90,6 @@ pub struct XaaConfig {
     pub idp_token_endpoint: String,
 }
 
-#[cfg(feature = "mcp_runtime")]
 mod runtime {
     use super::*;
     use base64::Engine as _;
@@ -325,7 +324,7 @@ mod runtime {
         if !crate::constants::oauth::OAUTH_CREDENTIAL_SIDE_EFFECTS_ENABLED {
             return Err(crate::constants::oauth::OAuthCredentialSideEffectsUnavailable.into());
         }
-        let metadata = manager.discover_metadata().await?;
+        let metadata = manager.resolve_metadata().await?.metadata;
         let issuer = metadata
             .issuer
             .clone()
@@ -657,22 +656,12 @@ mod runtime {
     }
 }
 
-#[cfg(feature = "mcp_runtime")]
 pub use runtime::{
     discover_authorization_server, discover_protected_resource, exchange_jwt_auth_grant,
     perform_cross_app_access, request_jwt_authorization_grant,
 };
 
-#[cfg(not(feature = "mcp_runtime"))]
-pub async fn perform_cross_app_access(
-    _server_url: &str,
-    _config: XaaConfig,
-    _server_name: &str,
-) -> anyhow::Result<XaaResult> {
-    anyhow::bail!("mcp_runtime feature is disabled; MCP XAA is not compiled")
-}
-
-#[cfg(all(test, feature = "mcp_runtime"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
